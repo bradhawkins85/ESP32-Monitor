@@ -54,6 +54,7 @@ struct Service {
   int consecutiveFails;
   bool isUp;
   bool hasBeenUp;
+  bool isPending;
   unsigned long lastCheck;
   String lastError;
   // SNMP fields
@@ -220,6 +221,7 @@ void loadServices() {
     services[serviceCount].consecutiveFails = 0;
     services[serviceCount].isUp = false;
     services[serviceCount].hasBeenUp = false;
+    services[serviceCount].isPending = true;
     services[serviceCount].lastCheck = 0;
     services[serviceCount].lastError = "";
     services[serviceCount].lastPush = 0;
@@ -249,6 +251,7 @@ void initDemoServices() {
   httpSvc.consecutiveFails = 0;
   httpSvc.isUp = false;
   httpSvc.hasBeenUp = false;
+  httpSvc.isPending = true;
   httpSvc.lastCheck = 0;
   services[serviceCount++] = httpSvc;
 
@@ -266,6 +269,7 @@ void initDemoServices() {
   pingSvc.consecutiveFails = 0;
   pingSvc.isUp = false;
   pingSvc.hasBeenUp = false;
+  pingSvc.isPending = true;
   pingSvc.lastCheck = 0;
   services[serviceCount++] = pingSvc;
 
@@ -287,6 +291,7 @@ void initDemoServices() {
   snmpSvc.consecutiveFails = 0;
   snmpSvc.isUp = false;
   snmpSvc.hasBeenUp = false;
+  snmpSvc.isPending = true;
   snmpSvc.lastCheck = 0;
   services[serviceCount++] = snmpSvc;
 }
@@ -343,6 +348,7 @@ void forwardToEmail(String message);
 void forwardToDiscord(String message);
 void forwardToWebhook(String message);
 size_t encryptAndSign(const uint8_t* secret, size_t secretLen, uint8_t* output, size_t maxOutput, const uint8_t* input, size_t inputLen);
+void deriveChannelKey(const char* channelName, const char* channelSecret, uint8_t* hash, uint8_t* key, size_t* keyLen);
 
 // Helper function to get services as JSON string
 String getServicesJson() {
@@ -383,39 +389,82 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
     notification += " - " + message;
   }
   
-  // Prepare MeshCore payload
+  // Derive channel hash and key
+  uint8_t channelHash;
+  uint8_t channelKey[32];
+  size_t channelKeyLen = 0;
+  deriveChannelKey(CHANNEL_NAME, CHANNEL_SECRET, &channelHash, channelKey, &channelKeyLen);
+  
+  // Get MAC address for node name
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char nodeName[18];
+  snprintf(nodeName, sizeof(nodeName), "%02X:%02X:%02X:%02X:%02X:%02X", 
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  
+  // Format message as "nodeName: text" to match MeshCore group message format
+  String formattedMsg = String(nodeName) + ": " + notification;
+  size_t textLen = formattedMsg.length();
+  if (textLen > 220) textLen = 220;  // Leave room for timestamp + txt_type + padding
+  
+  // Build plaintext: [timestamp(4)][txt_type(1)][message]
   uint8_t plaintext[256];
-  size_t msgLen = notification.length();
-  if (msgLen > 250) msgLen = 250;
+  size_t idx = 0;
+  uint32_t timestamp = (uint32_t)time(nullptr);
+  plaintext[idx++] = (uint8_t)(timestamp & 0xFF);
+  plaintext[idx++] = (uint8_t)((timestamp >> 8) & 0xFF);
+  plaintext[idx++] = (uint8_t)((timestamp >> 16) & 0xFF);
+  plaintext[idx++] = (uint8_t)((timestamp >> 24) & 0xFF);
+  plaintext[idx++] = TXT_TYPE_PLAIN;  // txt_type (upper 6 bits), attempt (lower 2 bits) = 0
+  memcpy(&plaintext[idx], formattedMsg.c_str(), textLen);
+  idx += textLen;
   
-  // Build simple text message packet
-  plaintext[0] = PAYLOAD_TYPE_GRP_TXT;
-  plaintext[1] = TXT_TYPE_PLAIN;
-  plaintext[2] = ROUTE_TYPE_FLOOD;
-  plaintext[3] = 0xFF; // Group ID (broadcast)
-  memcpy(plaintext + 4, notification.c_str(), msgLen);
-  
-  // Encrypt and send
-  uint8_t encrypted[256];
-  size_t encLen = encryptAndSign(
-    (const uint8_t*)CHANNEL_SECRET, 
-    strlen(CHANNEL_SECRET),
-    encrypted, 
-    sizeof(encrypted),
-    plaintext, 
-    msgLen + 4
-  );
-  
-  if (encLen > 0) {
-    int state = radio.transmit(encrypted, encLen);
-    if (state == RADIOLIB_ERR_NONE) {
-      Serial.printf("[LoRa] Sent notification: %s\n", notification.c_str());
-    } else {
-      Serial.printf("[LoRa] Failed to send notification: %d\n", state);
-    }
-    // Return to RX mode
-    radio.startReceive();
+  // Encrypt and compute MAC
+  uint8_t macAndCipher[256];
+  size_t macCipherLen = encryptAndSign(channelKey, channelKeyLen, macAndCipher, sizeof(macAndCipher), plaintext, idx);
+  if (macCipherLen == 0) {
+    Serial.println("[LoRa] ERROR: Failed to encrypt notification");
+    return;
   }
+  
+  // Build complete packet: [header][path_len][path][channel_hash][MAC+ciphertext]
+  uint8_t packet[260];
+  size_t pktIdx = 0;
+  
+  // Header: version(0) + payload_type(GRP_TXT=5) + route_type(FLOOD=1)
+  uint8_t header = (uint8_t)((ROUTE_TYPE_FLOOD & 0x03) | ((PAYLOAD_TYPE_GRP_TXT & 0x0F) << 2));
+  packet[pktIdx++] = header;
+  
+  // Path (use node ID from MAC address for tracking)
+  uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+  packet[pktIdx++] = 4;  // path_len
+  packet[pktIdx++] = (uint8_t)(nodeId & 0xFF);
+  packet[pktIdx++] = (uint8_t)((nodeId >> 8) & 0xFF);
+  packet[pktIdx++] = (uint8_t)((nodeId >> 16) & 0xFF);
+  packet[pktIdx++] = (uint8_t)((nodeId >> 24) & 0xFF);
+  
+  // Channel hash (1 byte)
+  packet[pktIdx++] = channelHash;
+  
+  // MAC + ciphertext
+  if (pktIdx + macCipherLen > sizeof(packet)) {
+    Serial.println("[LoRa] ERROR: Packet buffer too small");
+    return;
+  }
+  memcpy(packet + pktIdx, macAndCipher, macCipherLen);
+  pktIdx += macCipherLen;
+  
+  // Transmit
+  int state = radio.transmit(packet, pktIdx);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] Sent notification: %s (timestamp=%u, len=%u)\n", 
+                  notification.c_str(), timestamp, (unsigned int)pktIdx);
+  } else {
+    Serial.printf("[LoRa] Failed to send notification, code: %d\n", state);
+  }
+  
+  // Return to RX mode
+  radio.startReceive();
 #endif
 }
 
@@ -426,22 +475,26 @@ bool checkHttpGet(Service& service) {
     return false;
   }
   HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  http.setReuse(false);
   http.begin(service.url);
+  http.addHeader("Connection", "close");
+  
   int httpCode = http.GET();
   if (httpCode > 0) {
     String payload = http.getString();
+    http.end();
     if (service.expectedResponse == "*" || payload.indexOf(service.expectedResponse) != -1) {
-      service.lastError = "HTTP OK";
-      http.end();
+      service.lastError = "HTTP OK (" + String(httpCode) + ")";
       return true;
     } else {
       service.lastError = "Unexpected response";
-      http.end();
       return false;
     }
   } else {
-    service.lastError = "HTTP error: " + String(httpCode);
     http.end();
+    service.lastError = "HTTP error: " + String(httpCode);
     return false;
   }
 }
@@ -458,23 +511,28 @@ bool checkPing(Service& service) {
     return false;
   }
   
-  // Use ESP32 ping functionality via HTTPClient as a simple connectivity check
-  HTTPClient http;
-  http.setTimeout(5000);
-  String url = "http://" + service.host;
-  if (service.port != 80) {
-    url += ":" + String(service.port);
-  }
+  // Simple TCP connection test to determine reachability
+  // Try common ports or user-specified port
+  int testPort = (service.port > 0) ? service.port : 80;
   
-  http.begin(url);
-  int httpCode = http.GET();
-  http.end();
+  WiFiClient client;
+  client.setTimeout(3000);
   
-  if (httpCode > 0 || httpCode == -1) {
-    // Any response (even errors) means host is reachable
-    service.lastError = "Host reachable (" + ip.toString() + ")";
+  bool reachable = client.connect(ip, testPort, 3000);
+  if (reachable) {
+    client.stop();
+    service.lastError = "Host reachable (" + ip.toString() + ":" + String(testPort) + ")";
     return true;
   } else {
+    // Try alternate port if primary failed and wasn't specified
+    if (service.port == 0 || service.port == 80) {
+      reachable = client.connect(ip, 443, 3000);
+      if (reachable) {
+        client.stop();
+        service.lastError = "Host reachable (" + ip.toString() + ":443)";
+        return true;
+      }
+    }
     service.lastError = "Host unreachable";
     return false;
   }
@@ -495,12 +553,14 @@ bool checkPort(Service& service) {
   WiFiClient client;
   client.setTimeout(5000);
   
-  if (client.connect(ip, service.port)) {
+  if (client.connect(ip, service.port, 5000)) {
     client.stop();
+    delay(10); // Small delay to ensure clean disconnect
     service.lastError = "Port " + String(service.port) + " open";
     return true;
   } else {
-    service.lastError = "Port " + String(service.port) + " closed";
+    client.stop();
+    service.lastError = "Port " + String(service.port) + " closed/filtered";
     return false;
   }
 }
@@ -910,6 +970,7 @@ bool checkUptime(Service& service) {
 // Pass/Fail threshold logic
 void updateServiceStatus(Service& service, bool checkResult) {
   bool wasUp = service.isUp;
+  bool wasPending = service.isPending;
   
   if (checkResult) {
     service.consecutivePasses++;
@@ -917,17 +978,19 @@ void updateServiceStatus(Service& service, bool checkResult) {
     if (service.consecutivePasses >= service.passThreshold) {
       service.isUp = true;
       service.hasBeenUp = true;
+      service.isPending = false;
     }
   } else {
     service.consecutiveFails++;
     service.consecutivePasses = 0;
     if (service.consecutiveFails >= service.failThreshold) {
       service.isUp = false;
+      service.isPending = false;
     }
   }
   
-  // Send LoRa notification on status change
-  if (wasUp != service.isUp) {
+  // Send LoRa notification on status change (but not for initial pending -> up/down transition)
+  if (wasUp != service.isUp && !wasPending) {
     if (service.isUp) {
       Serial.printf("[Status] %s is now UP\n", service.name.c_str());
       sendLoRaNotification(service.name, true, service.lastError);
@@ -935,6 +998,8 @@ void updateServiceStatus(Service& service, bool checkResult) {
       Serial.printf("[Status] %s is now DOWN\n", service.name.c_str());
       sendLoRaNotification(service.name, false, service.lastError);
     }
+  } else if (wasPending && !service.isPending) {
+    Serial.printf("[Status] %s initial state: %s\n", service.name.c_str(), service.isUp ? "UP" : "DOWN");
   }
   
   service.lastCheck = millis();
@@ -1415,6 +1480,7 @@ void setup() {
     html += "<input type='file' name='file' id='fileInput' class='file-input' accept='.json' onchange='this.form.submit()'>";
     html += "<label for='fileInput' class='file-label'>📤 Import Config</label>";
     html += "</form>";
+    html += "<button class='btn btn-secondary' onclick='testNotifications()'>🔔 Test Notifications</button>";
     html += "</div></div>";
     
     html += "</div>";
@@ -1534,6 +1600,9 @@ void setup() {
     html += "const method=idx==='-1'?'POST':'PUT';";
     html += "fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})";
     html += ".then(r=>r.ok?location.reload():alert('Save failed'))};";
+    html += "function testNotifications(){if(confirm('Send test notification on all channels?')){";
+    html += "fetch('/api/test-notification',{method:'POST'})";
+    html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
     html += "setInterval(()=>location.reload(),30000);";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "</script>";
@@ -1745,6 +1814,16 @@ void setup() {
     serviceCount--;
     saveServices();  // Persist to LittleFS
     request->send(200, "text/plain", "Service deleted");
+  });
+
+  // API endpoint to test notifications
+  server.on("/api/test-notification", HTTP_POST, [](AsyncWebServerRequest *request){
+    Serial.println("[API] Test notification requested");
+    
+    // Send test notification on LoRa
+    sendLoRaNotification("Test", true, "This is a test notification from ESP32 Monitor");
+    
+    request->send(200, "text/plain", "Test notification sent on all channels");
   });
 
   server.begin();
