@@ -1,0 +1,42 @@
+; PlatformIO Override Configuration Example
+; Copy this file to platformio_override.ini and customize with your settings
+; platformio_override.ini is git-ignored to protect your secrets
+
+[env:heltec_wireless_stick_lite_v3]
+build_flags = 
+    ; WiFi Configuration
+    -D WIFI_SSID='"Nacho Wi-Fi"'
+    -D WIFI_PASSWORD='"brownCow36"'
+    
+    ; LoRa Configuration
+    -D LORA_FREQ=923.125  ; MHz: 915.0 for US, 868.0 for EU, 433.0 for Asia
+    -D LORA_SPREADING_FACTOR=8  ; 7-12 (lower = faster but shorter range)
+    -D LORA_CODING_RATE=5  ; 5-8 for 4/5 to 4/8 (higher = more error correction)
+    -D LORA_BANDWIDTH=62.5  ; kHz: 125.0, 250.0, or 500.0
+    -D LORA_SYNC_WORD=0x1424  ; MeshCore private sync word (must match transmitter)
+    -D LORA_PREAMBLE_LENGTH=16  ; MeshCore uses 16-symbol preamble
+    -D CHANNEL_NAME='"BCAlerts"'
+    -D CHANNEL_SECRET='"f7d32d9d09982b83c2c1086a5ea2239a"'
+    
+    ; Ntfy Configuration
+    -D NTFY_ENABLED=true
+    -D NTFY_SERVER='"https://ntfy.sh"'
+    -D NTFY_TOPIC='"esp32_uptime"'
+    
+    ; Email Configuration (requires ESP_Mail_Client library)
+    -D EMAIL_ENABLED=false
+    -D SMTP_HOST='"smtp.gmail.com"'
+    -D SMTP_PORT=465
+    -D SMTP_USER='"your_email@gmail.com"'
+    -D SMTP_PASSWORD='"your_app_password"'
+    -D EMAIL_RECIPIENT='"recipient@example.com"'
+    -D EMAIL_SENDER='"esp32@example.com"'
+    
+    ; Discord Configuration
+    -D DISCORD_ENABLED=true
+    -D DISCORD_WEBHOOK_URL='"https://discord.com/api/webhooks/1442768605354918050/QrLFO_FiVg4-Dd3NqKVXFITFDFDJH7yBusmQ-gqMIaND_2ggT-BVCVS_g8qBdgBX6SRI"'
+    
+    ; Generic Webhook Configuration
+    -D WEBHOOK_ENABLED=false
+    -D WEBHOOK_URL='"https://example.com/webhook"'
+    -D WEBHOOK_METHOD='"POST"'
