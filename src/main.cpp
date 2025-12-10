@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <RadioLib.h>
@@ -11,6 +12,7 @@
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
 // #include <ElegantOTA.h>  // Temporarily disabled due to header conflicts
+#include <cstdlib>
 
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
@@ -503,10 +505,372 @@ bool checkPort(Service& service) {
   }
 }
 
-bool checkSnmpGet(Service& service) {
-  // SNMP GET stub (requires SNMP library)
-  service.lastError = "SNMP not implemented";
+bool parseSnmpLength(const uint8_t* data, size_t length, size_t& index, size_t& outLen) {
+  if (index >= length) return false;
+  uint8_t first = data[index++];
+  if ((first & 0x80) == 0) {
+    outLen = first;
+    return index + outLen <= length;
+  }
+
+  uint8_t numBytes = first & 0x7F;
+  if (numBytes == 0 || index + numBytes > length) return false;
+
+  size_t value = 0;
+  for (uint8_t i = 0; i < numBytes; i++) {
+    value = (value << 8) | data[index++];
+  }
+  outLen = value;
+  return index + outLen <= length;
+}
+
+bool encodeOid(const String& oidStr, uint8_t* output, size_t& outLen, size_t maxLen) {
+  int parts[32];
+  int partCount = 0;
+  int start = 0;
+  for (int i = 0; i <= oidStr.length(); i++) {
+    if (i == oidStr.length() || oidStr[i] == '.') {
+      if (partCount >= 32) return false;
+      parts[partCount++] = oidStr.substring(start, i).toInt();
+      start = i + 1;
+    }
+  }
+  if (partCount < 2) return false;
+
+  size_t pos = 0;
+  int firstByte = parts[0] * 40 + parts[1];
+  if (pos >= maxLen) return false;
+  output[pos++] = (uint8_t)firstByte;
+
+  for (int i = 2; i < partCount; i++) {
+    unsigned long value = parts[i];
+    uint8_t temp[5];
+    int tempPos = 0;
+    do {
+      temp[tempPos++] = value & 0x7F;
+      value >>= 7;
+    } while (value > 0 && tempPos < 5);
+
+    if (pos + tempPos > maxLen) return false;
+    for (int j = tempPos - 1; j >= 0; j--) {
+      uint8_t byte = temp[j];
+      if (j != 0) byte |= 0x80;
+      output[pos++] = byte;
+    }
+  }
+
+  outLen = pos;
+  return true;
+}
+
+bool decodeInteger(const uint8_t* data, size_t length, size_t& index, long& valueOut) {
+  if (index >= length || data[index++] != 0x02) return false;
+  size_t len = 0;
+  if (!parseSnmpLength(data, length, index, len) || len > sizeof(long) || index + len > length) return false;
+  long value = 0;
+  for (size_t i = 0; i < len; i++) {
+    value = (value << 8) | data[index++];
+  }
+  valueOut = value;
+  return true;
+}
+
+bool decodeValueString(const uint8_t* data, size_t length, size_t& index, String& valueOut) {
+  if (index >= length) return false;
+  uint8_t type = data[index++];
+  size_t len = 0;
+  if (!parseSnmpLength(data, length, index, len) || index + len > length) return false;
+
+  switch (type) {
+    case 0x02: {  // Integer
+      long intValue = 0;
+      for (size_t i = 0; i < len; i++) {
+        intValue = (intValue << 8) | data[index++];
+      }
+      valueOut = String(intValue);
+      return true;
+    }
+    case 0x04: {  // Octet String
+      valueOut = String();
+      for (size_t i = 0; i < len; i++) valueOut += (char)data[index++];
+      return true;
+    }
+    default: {
+      // Unsupported type: represent as hex string
+      valueOut = "0x";
+      for (size_t i = 0; i < len; i++) {
+        if (data[index + i] < 16) valueOut += "0";
+        valueOut += String(data[index + i], HEX);
+      }
+      index += len;
+      return true;
+    }
+  }
+}
+
+bool parseSnmpResponse(const uint8_t* data, size_t length, long expectedRequestId, String& valueOut, String& errorOut) {
+  size_t index = 0;
+  if (index >= length || data[index++] != 0x30) {
+    errorOut = "Invalid SNMP sequence";
+    return false;
+  }
+  size_t len = 0;
+  if (!parseSnmpLength(data, length, index, len)) {
+    errorOut = "Invalid SNMP length";
+    return false;
+  }
+
+  // Version
+  long version = 0;
+  if (!decodeInteger(data, length, index, version) || version != 0) {
+    errorOut = "Unsupported SNMP version";
+    return false;
+  }
+
+  // Community
+  if (index >= length || data[index++] != 0x04) {
+    errorOut = "Missing community";
+    return false;
+  }
+  size_t communityLen = 0;
+  if (!parseSnmpLength(data, length, index, communityLen) || index + communityLen > length) {
+    errorOut = "Invalid community";
+    return false;
+  }
+  index += communityLen;
+
+  if (index >= length || data[index++] != 0xA2) {
+    errorOut = "Not a GetResponse";
+    return false;
+  }
+
+  size_t pduLen = 0;
+  if (!parseSnmpLength(data, length, index, pduLen) || index + pduLen > length) {
+    errorOut = "Invalid PDU";
+    return false;
+  }
+
+  long requestId = 0;
+  if (!decodeInteger(data, length, index, requestId) || requestId != expectedRequestId) {
+    errorOut = "Request ID mismatch";
+    return false;
+  }
+
+  long errorStatus = 0;
+  if (!decodeInteger(data, length, index, errorStatus)) {
+    errorOut = "Error status missing";
+    return false;
+  }
+  if (errorStatus != 0) {
+    errorOut = "SNMP error status " + String(errorStatus);
+    return false;
+  }
+
+  long errorIndex = 0;
+  if (!decodeInteger(data, length, index, errorIndex)) {
+    errorOut = "Error index missing";
+    return false;
+  }
+
+  // VarBind list
+  if (index >= length || data[index++] != 0x30) {
+    errorOut = "Missing varbind list";
+    return false;
+  }
+  size_t vblLen = 0;
+  if (!parseSnmpLength(data, length, index, vblLen) || index + vblLen > length) {
+    errorOut = "Invalid varbind list";
+    return false;
+  }
+
+  if (index >= length || data[index++] != 0x30) {
+    errorOut = "Missing varbind";
+    return false;
+  }
+  size_t vbLen = 0;
+  if (!parseSnmpLength(data, length, index, vbLen) || index + vbLen > length) {
+    errorOut = "Invalid varbind";
+    return false;
+  }
+
+  // OID
+  if (index >= length || data[index++] != 0x06) {
+    errorOut = "Missing OID";
+    return false;
+  }
+  size_t oidLen = 0;
+  if (!parseSnmpLength(data, length, index, oidLen) || index + oidLen > length) {
+    errorOut = "Invalid OID";
+    return false;
+  }
+  index += oidLen;
+
+  if (!decodeValueString(data, length, index, valueOut)) {
+    errorOut = "Failed to decode value";
+    return false;
+  }
+
+  return true;
+}
+
+bool compareSnmpValue(const String& actual, const String& expected, CompareOp op) {
+  auto parseDouble = [](const String& str, double& out) {
+    const char* cstr = str.c_str();
+    char* endPtr;
+    out = strtod(cstr, &endPtr);
+    return endPtr != cstr && *endPtr == '\0';
+  };
+
+  double actualNum, expectedNum;
+  bool actualIsNum = parseDouble(actual, actualNum);
+  bool expectedIsNum = parseDouble(expected, expectedNum);
+
+  if (actualIsNum && expectedIsNum) {
+    switch (op) {
+      case OP_EQ: return actualNum == expectedNum;
+      case OP_NE: return actualNum != expectedNum;
+      case OP_GT: return actualNum > expectedNum;
+      case OP_LT: return actualNum < expectedNum;
+      case OP_GE: return actualNum >= expectedNum;
+      case OP_LE: return actualNum <= expectedNum;
+      default: return false;
+    }
+  }
+
+  // Fallback to string comparison for equality/non-equality
+  if (op == OP_EQ) return actual == expected;
+  if (op == OP_NE) return actual != expected;
   return false;
+}
+
+bool checkSnmpGet(Service& service) {
+  if (!wifiConnected) {
+    service.lastError = "WiFi not connected";
+    return false;
+  }
+
+  IPAddress ip;
+  if (!WiFi.hostByName(service.host.c_str(), ip)) {
+    service.lastError = "Host not found";
+    return false;
+  }
+
+  uint8_t oidEncoded[64];
+  size_t oidLen = 0;
+  if (!encodeOid(service.snmpOid, oidEncoded, oidLen, sizeof(oidEncoded))) {
+    service.lastError = "Invalid OID";
+    return false;
+  }
+
+  uint8_t packet[256];
+  size_t pos = 0;
+
+  auto startSequence = [&](uint8_t type) {
+    size_t lenPos = pos + 1;
+    packet[pos++] = type;
+    packet[pos++] = 0;  // placeholder for length (<128)
+    return lenPos;
+  };
+
+  auto finishSequence = [&](size_t lenPos) {
+    packet[lenPos] = pos - lenPos - 1;
+  };
+
+  auto writeInteger = [&](long value) -> bool {
+    if (pos + 6 > sizeof(packet)) return false;
+    packet[pos++] = 0x02;
+    packet[pos++] = 4;
+    packet[pos++] = (value >> 24) & 0xFF;
+    packet[pos++] = (value >> 16) & 0xFF;
+    packet[pos++] = (value >> 8) & 0xFF;
+    packet[pos++] = value & 0xFF;
+    return true;
+  };
+
+  // Build SNMP message (assuming lengths < 128)
+  size_t msgLenPos = startSequence(0x30);
+
+  if (!writeInteger(0)) {  // version v1
+    service.lastError = "Failed to encode version";
+    return false;
+  }
+
+  if (pos + 2 + service.snmpCommunity.length() > sizeof(packet)) {
+    service.lastError = "Community too long";
+    return false;
+  }
+  packet[pos++] = 0x04;
+  packet[pos++] = service.snmpCommunity.length();
+  memcpy(packet + pos, service.snmpCommunity.c_str(), service.snmpCommunity.length());
+  pos += service.snmpCommunity.length();
+
+  size_t pduLenPos = startSequence(0xA0);
+
+  long requestId = random(1, 0x7FFFFFFF);
+  if (!writeInteger(requestId)) {
+    service.lastError = "Failed to encode request id";
+    return false;
+  }
+  if (!writeInteger(0) || !writeInteger(0)) {  // error-status, error-index
+    service.lastError = "Failed to encode error fields";
+    return false;
+  }
+
+  size_t vbListLenPos = startSequence(0x30);
+  size_t vbLenPos = startSequence(0x30);
+
+  if (pos + 2 + oidLen + 2 > sizeof(packet)) {
+    service.lastError = "OID too long";
+    return false;
+  }
+  packet[pos++] = 0x06;
+  packet[pos++] = oidLen;
+  memcpy(packet + pos, oidEncoded, oidLen);
+  pos += oidLen;
+  packet[pos++] = 0x05;  // NULL value
+  packet[pos++] = 0x00;
+
+  finishSequence(vbLenPos);
+  finishSequence(vbListLenPos);
+  finishSequence(pduLenPos);
+  finishSequence(msgLenPos);
+
+  WiFiUDP udp;
+  udp.begin(0);
+  if (!udp.beginPacket(ip, 161)) {
+    service.lastError = "Failed to open UDP";
+    return false;
+  }
+  udp.write(packet, pos);
+  udp.endPacket();
+
+  uint8_t response[512];
+  int responseLen = 0;
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    int size = udp.parsePacket();
+    if (size > 0) {
+      responseLen = udp.read(response, min(size, (int)sizeof(response)));
+      break;
+    }
+    delay(50);
+  }
+
+  if (responseLen <= 0) {
+    service.lastError = "SNMP timeout";
+    return false;
+  }
+
+  String value;
+  String parseError;
+  if (!parseSnmpResponse(response, responseLen, requestId, value, parseError)) {
+    service.lastError = parseError;
+    return false;
+  }
+
+  bool comparison = compareSnmpValue(value, service.snmpExpectedValue, service.snmpCompareOp);
+  service.lastError = "SNMP value: " + value;
+  return comparison;
 }
 
 bool checkPush(Service& service) {
