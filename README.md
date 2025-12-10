@@ -29,8 +29,8 @@ An ESP32-based LoRa message receiver for Heltec Wireless Stick Lite v3 that forw
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/bradhawkins85/ESP32-Uptime-Receiver.git
-   cd ESP32-Uptime-Receiver
+   git clone https://github.com/bradhawkins85/ESP32-Monitor.git
+   cd ESP32-Monitor
    ```
 
 2. Install PlatformIO if you haven't already:
@@ -56,7 +56,7 @@ The project uses a `.env` file for secure configuration management. This keeps y
    WIFI_PASSWORD=your_actual_wifi_password
    
    # LoRa/MeshCore Channel Configuration
-   CHANNEL_NAME=BCAlerts
+   CHANNEL_NAME=Alerts
    CHANNEL_SECRET=your_actual_secret_key
    
    # Discord Notification (optional)
