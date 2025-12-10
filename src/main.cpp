@@ -83,6 +83,23 @@ unsigned long lastMessageTime = 0;
 int messageCount = 0;
 unsigned long lastPingTime = 0;
 
+String generatePushToken() {
+  uint32_t seed = esp_random();
+  randomSeed(seed ^ micros());
+  char token[17];
+  const char* hex = "0123456789abcdef";
+  for (int i = 0; i < 16; i++) {
+    token[i] = hex[random(0, 16)];
+  }
+  token[16] = '\0';
+  return String(token);
+}
+
+String getPushUrl(const Service& service) {
+  if (service.pushToken.length() == 0) return "";
+  return String("http://") + WiFi.localIP().toString() + "/push/" + service.pushToken;
+}
+
 // --- Web Server ---
 AsyncWebServer server(80);
 
@@ -92,6 +109,7 @@ bool checkHttpGet(Service& service);
 bool checkPing(Service& service);
 bool checkPort(Service& service);
 bool checkSnmpGet(Service& service);
+bool checkPush(Service& service);
 bool checkUptime(Service& service);
 void updateServiceStatus(Service& service, bool checkResult);
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
@@ -190,6 +208,10 @@ void loadServices() {
     services[serviceCount].uptimeThreshold = svc["uptimeThreshold"].as<int>();
     services[serviceCount].uptimeCompareOp = (CompareOp)svc["uptimeCompareOp"].as<int>();
     services[serviceCount].pushToken = svc["pushToken"].as<String>();
+
+    if (services[serviceCount].type == TYPE_PUSH && services[serviceCount].pushToken.length() == 0) {
+      services[serviceCount].pushToken = generatePushToken();
+    }
     
     // Reset runtime fields
     services[serviceCount].consecutivePasses = 0;
@@ -288,6 +310,9 @@ void checkAllServices() {
           break;
         case TYPE_SNMP_GET:
           result = checkSnmpGet(svc);
+          break;
+        case TYPE_PUSH:
+          result = checkPush(svc);
           break;
         case TYPE_UPTIME:
           result = checkUptime(svc);
@@ -481,6 +506,23 @@ bool checkPort(Service& service) {
 bool checkSnmpGet(Service& service) {
   // SNMP GET stub (requires SNMP library)
   service.lastError = "SNMP not implemented";
+  return false;
+}
+
+bool checkPush(Service& service) {
+  unsigned long now = millis();
+  if (service.lastPush == 0) {
+    service.lastError = "No push received yet";
+    return false;
+  }
+
+  unsigned long since = now - service.lastPush;
+  if (since <= (unsigned long)service.checkInterval) {
+    service.lastError = "Last push " + String(since / 1000) + "s ago";
+    return true;
+  }
+
+  service.lastError = "Push timeout (" + String(since / 1000) + "s ago)";
   return false;
 }
 
@@ -989,6 +1031,12 @@ void setup() {
       html += "</div></div>";
       html += "<span class='service-status " + statusBadgeClass + "'>" + statusText + "</span>";
       html += "<div class='service-info'>Type: " + String(services[i].type) + " | Host: " + services[i].host + "</div>";
+      if (services[i].type == TYPE_PUSH) {
+        String pushUrl = getPushUrl(services[i]);
+        if (pushUrl.length() > 0) {
+          html += "<div class='service-info'>Push URL: " + pushUrl + "</div>";
+        }
+      }
       if (services[i].lastError.length() > 0) {
         html += "<div class='service-error'>" + services[i].lastError + "</div>";
       }
@@ -1012,7 +1060,7 @@ void setup() {
     html += "<div id='serviceModal' class='modal'><div class='modal-content'>";
     html += "<div class='modal-header'><div class='modal-title' id='modalTitle'>Add Service</div>";
     html += "<button class='close-btn' onclick='closeModal()'>×</button></div>";
-    html += "<form id='serviceForm'><input type='hidden' id='serviceIndex' value='-1'>";
+    html += "<form id='serviceForm'><input type='hidden' id='serviceIndex' value='-1'><input type='hidden' id='servicePushToken' value=''>";
     html += "<div class='form-group'><label class='form-label'>Service Name</label>";
     html += "<input type='text' id='serviceName' class='form-input' required></div>";
     html += "<div class='form-row'>";
@@ -1035,8 +1083,8 @@ void setup() {
     html += "<label class='form-label'>Expected Response</label>";
     html += "<input type='text' id='serviceExpectedResponse' class='form-input'></div>";
     html += "<div class='form-group' data-types='4'>";
-    html += "<label class='form-label'>Push Token</label>";
-    html += "<input type='text' id='servicePushToken' class='form-input' placeholder='Secret token from sender'></div>";
+    html += "<label class='form-label'>Push URL (auto-generated)</label>";
+    html += "<input type='text' id='servicePushUrl' class='form-input' placeholder='Generated after saving' readonly></div>";
     html += "<div class='form-group' data-types='2'>";
     html += "<label class='form-label'>SNMP OID</label>";
     html += "<input type='text' id='serviceSnmpOid' class='form-input' placeholder='1.3.6.1...'></div>";
@@ -1070,8 +1118,9 @@ void setup() {
     html += "const services=" + getServicesJson() + ";";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
+    html += "function setPushDetails(token){const hidden=document.getElementById('servicePushToken');const url=document.getElementById('servicePushUrl');hidden.value=token||'';if(token){url.value=location.origin+'/push/'+token;url.placeholder='';}else{url.value='';url.placeholder='Generated after saving';}}";
     html += "function showAddModal(){document.getElementById('modalTitle').textContent='Add Service';";
-    html += "document.getElementById('serviceForm').reset();document.getElementById('serviceIndex').value='-1';";
+    html += "document.getElementById('serviceForm').reset();document.getElementById('serviceIndex').value='-1';setPushDetails('');";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "document.getElementById('serviceModal').classList.add('show')}";
     html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show')}";
@@ -1084,7 +1133,7 @@ void setup() {
     html += "document.getElementById('servicePort').value=s.port||0;";
     html += "document.getElementById('serviceUrl').value=s.url||'';";
     html += "document.getElementById('serviceExpectedResponse').value=s.expectedResponse||'';";
-    html += "document.getElementById('servicePushToken').value=s.pushToken||'';";
+    html += "setPushDetails(s.pushToken||'');";
     html += "document.getElementById('serviceSnmpOid').value=s.snmpOid||'';";
     html += "document.getElementById('serviceSnmpCommunity').value=s.snmpCommunity||'';";
     html += "document.getElementById('serviceSnmpCompareOp').value=s.snmpCompareOp||0;";
@@ -1126,6 +1175,26 @@ void setup() {
     html += "</script>";
     html += "</body></html>";
     request->send(200, "text/html", html);
+  });
+
+  server.on("/push/*", HTTP_ANY, [](AsyncWebServerRequest *request) {
+    String token = request->url().substring(request->url().lastIndexOf('/') + 1);
+    bool matched = false;
+    for (int i = 0; i < serviceCount; i++) {
+      Service& svc = services[i];
+      if (svc.type == TYPE_PUSH && svc.pushToken == token) {
+        matched = true;
+        svc.lastPush = millis();
+        svc.lastError = "Push received";
+        updateServiceStatus(svc, true);
+        request->send(200, "text/plain", "Push acknowledged");
+        return;
+      }
+    }
+
+    if (!matched) {
+      request->send(404, "text/plain", "Push token not found");
+    }
   });
 
   // Export services as JSON
@@ -1244,11 +1313,15 @@ void setup() {
       svc.checkInterval = doc["checkInterval"].as<int>();
       svc.passThreshold = doc["passThreshold"].as<int>();
       svc.failThreshold = doc["failThreshold"].as<int>();
+      if (svc.type == TYPE_PUSH && svc.pushToken.length() == 0) {
+        svc.pushToken = generatePushToken();
+      }
       svc.consecutivePasses = 0;
       svc.consecutiveFails = 0;
       svc.isUp = false;
       svc.hasBeenUp = false;
       svc.lastCheck = 0;
+      svc.lastPush = 0;
       services[serviceCount++] = svc;
       saveServices();  // Persist to LittleFS
       request->send(200, "text/plain", "Service added");
@@ -1277,6 +1350,9 @@ void setup() {
       services[idx].url = doc["url"].as<String>();
       services[idx].expectedResponse = doc["expectedResponse"].as<String>();
       services[idx].pushToken = doc["pushToken"].as<String>();
+      if (services[idx].type == TYPE_PUSH && services[idx].pushToken.length() == 0) {
+        services[idx].pushToken = generatePushToken();
+      }
       services[idx].snmpOid = doc["snmpOid"].as<String>();
       services[idx].snmpCommunity = doc["snmpCommunity"].as<String>();
       services[idx].snmpCompareOp = (CompareOp)doc["snmpCompareOp"].as<int>();
