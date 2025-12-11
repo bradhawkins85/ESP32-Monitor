@@ -338,7 +338,6 @@ void checkAllServices() {
           result = false;
       }
       updateServiceStatus(svc, result);
-      Serial.printf("[Service] %s: %s (%s)\n", svc.name.c_str(), svc.isUp ? "UP" : "DOWN", svc.lastError.c_str());
     }
   }
 }
@@ -1905,6 +1904,63 @@ void setup() {
 
     request->send(200, "text/plain", "Test notification triggered on enabled channels");
   });
+
+  // API endpoint to receive generic webhook messages and fan out to enabled channels
+  server.on("/api/inbound-webhook", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      // Will be handled in body callback; keep handler to satisfy AsyncWebServer signature
+    },
+    nullptr,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      // Accumulate body
+      if (index == 0) {
+        request->_tempObject = new String();
+        static_cast<String*>(request->_tempObject)->reserve(total);
+      }
+      String *body = static_cast<String*>(request->_tempObject);
+      body->concat((const char*)data, len);
+
+      // Final chunk: parse and dispatch
+      if (index + len == total) {
+        StaticJsonDocument<512> doc;
+        DeserializationError err = deserializeJson(doc, *body);
+        delete body;
+        request->_tempObject = nullptr;
+
+        if (err) {
+          request->send(400, "application/json", "{\"error\":\"invalid json\"}");
+          return;
+        }
+
+        String message = doc["message"] | "";
+        String source = doc["source"] | "webhook";
+        if (message.length() == 0) {
+          request->send(400, "application/json", "{\"error\":\"message required\"}");
+          return;
+        }
+
+        String combined = source + ": " + message;
+
+#if LORA_ENABLED
+        sendLoRaNotification(source, true, message);
+#endif
+#if NTFY_ENABLED
+        forwardToNtfy(combined);
+#endif
+#if DISCORD_ENABLED
+        forwardToDiscord(combined);
+#endif
+#if WEBHOOK_ENABLED
+        forwardToWebhook(combined);
+#endif
+#if EMAIL_ENABLED
+        forwardToEmail(combined);
+#endif
+
+        request->send(200, "application/json", "{\"status\":\"ok\"}");
+      }
+    }
+  );
 
   server.begin();
 }
