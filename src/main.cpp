@@ -9,6 +9,15 @@
 #include <mbedtls/sha256.h>
 #include <time.h>
 #include "config.h"
+#include <lwip/inet_chksum.h>
+#include <lwip/ip.h>
+#include <lwip/ip4.h>
+#include <lwip/err.h>
+#include <lwip/icmp.h>
+#include <lwip/sockets.h>
+#include <lwip/sys.h>
+#include <lwip/netdb.h>
+#include <lwip/dns.h>
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
 // #include <ElegantOTA.h>  // Temporarily disabled due to header conflicts
@@ -243,7 +252,7 @@ void initDemoServices() {
   httpSvc.type = TYPE_HTTP_GET;
   httpSvc.url = "http://example.com";
   httpSvc.expectedResponse = "Example Domain";
-  httpSvc.checkInterval = 10000; // ms
+  httpSvc.checkInterval = 10; // seconds
   httpSvc.passThreshold = 1;
   httpSvc.failThreshold = 2;
   httpSvc.enabled = true;
@@ -261,7 +270,7 @@ void initDemoServices() {
   pingSvc.name = "Ping Google";
   pingSvc.type = TYPE_PING;
   pingSvc.host = "8.8.8.8";
-  pingSvc.checkInterval = 15000; // ms
+  pingSvc.checkInterval = 15; // seconds
   pingSvc.passThreshold = 1;
   pingSvc.failThreshold = 2;
   pingSvc.enabled = true;
@@ -283,7 +292,7 @@ void initDemoServices() {
   snmpSvc.snmpCommunity = "public";
   snmpSvc.snmpCompareOp = OP_EQ;
   snmpSvc.snmpExpectedValue = "Linux";
-  snmpSvc.checkInterval = 20000; // ms
+  snmpSvc.checkInterval = 20; // seconds
   snmpSvc.passThreshold = 1;
   snmpSvc.failThreshold = 2;
   snmpSvc.enabled = true;
@@ -303,7 +312,7 @@ void checkAllServices() {
   for (int i = 0; i < serviceCount; i++) {
     Service& svc = services[i];
     if (!svc.enabled) continue;
-    if (svc.lastCheck == 0 || now - svc.lastCheck >= svc.checkInterval) {
+    if (svc.lastCheck == 0 || now - svc.lastCheck >= (unsigned long)svc.checkInterval * 1000) {
       bool result = false;
       switch (svc.type) {
         case TYPE_HTTP_GET:
@@ -499,6 +508,55 @@ bool checkHttpGet(Service& service) {
   }
 }
 
+// Simple ICMP ping implementation using lwIP raw sockets
+bool sendIcmpPing(const IPAddress& ip, uint32_t timeout_ms) {
+  int sock = socket(AF_INET, SOCK_RAW, IP_PROTO_ICMP);
+  if (sock < 0) {
+    return false;
+  }
+  
+  struct timeval timeout;
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = (uint32_t)ip;
+  
+  // Build ICMP echo request
+  struct icmp_echo_hdr {
+    uint8_t type;
+    uint8_t code;
+    uint16_t chksum;
+    uint16_t id;
+    uint16_t seqno;
+  } packet;
+  
+  packet.type = ICMP_ECHO;
+  packet.code = 0;
+  packet.chksum = 0;
+  packet.id = htons(random(0xFFFF));
+  packet.seqno = htons(1);
+  packet.chksum = inet_chksum(&packet, sizeof(packet));
+  
+  // Send ping
+  if (sendto(sock, &packet, sizeof(packet), 0, (struct sockaddr*)&addr, sizeof(addr)) <= 0) {
+    close(sock);
+    return false;
+  }
+  
+  // Wait for reply
+  uint8_t buf[64];
+  struct sockaddr_in from;
+  socklen_t fromlen = sizeof(from);
+  int len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
+  
+  close(sock);
+  return (len > 0);
+}
+
 bool checkPing(Service& service) {
   if (!wifiConnected) {
     service.lastError = "WiFi not connected";
@@ -511,29 +569,22 @@ bool checkPing(Service& service) {
     return false;
   }
   
-  // Simple TCP connection test to determine reachability
-  // Try common ports or user-specified port
-  int testPort = (service.port > 0) ? service.port : 80;
+  // Send 3 ICMP ping packets
+  uint32_t pingCount = 3;
+  uint32_t successCount = 0;
   
-  WiFiClient client;
-  client.setTimeout(3000);
+  for (uint32_t i = 0; i < pingCount; i++) {
+    if (sendIcmpPing(ip, 2000)) {
+      successCount++;
+    }
+    delay(200); // Small delay between pings
+  }
   
-  bool reachable = client.connect(ip, testPort, 3000);
-  if (reachable) {
-    client.stop();
-    service.lastError = "Host reachable (" + ip.toString() + ":" + String(testPort) + ")";
+  if (successCount > 0) {
+    service.lastError = "Ping OK (" + ip.toString() + ", " + String(successCount) + "/" + String(pingCount) + " replies)";
     return true;
   } else {
-    // Try alternate port if primary failed and wasn't specified
-    if (service.port == 0 || service.port == 80) {
-      reachable = client.connect(ip, 443, 3000);
-      if (reachable) {
-        client.stop();
-        service.lastError = "Host reachable (" + ip.toString() + ":443)";
-        return true;
-      }
-    }
-    service.lastError = "Host unreachable";
+    service.lastError = "Ping timeout (" + ip.toString() + ", 0/" + String(pingCount) + " replies)";
     return false;
   }
 }
@@ -941,7 +992,7 @@ bool checkPush(Service& service) {
   }
 
   unsigned long since = now - service.lastPush;
-  if (since <= (unsigned long)service.checkInterval) {
+  if (since <= (unsigned long)service.checkInterval * 1000) {
     service.lastError = "Last push " + String(since / 1000) + "s ago";
     return true;
   }
@@ -1532,8 +1583,8 @@ void setup() {
     html += "<div class='form-group'><label class='form-label'>Compare</label>";
     html += "<select id='serviceUptimeCompareOp' class='form-select'><option value='0'>==</option><option value='1'>!=</option><option value='2'>> </option><option value='3'>< </option><option value='4'>>=</option><option value='5'><=</option></select></div></div>";
     html += "<div class='form-row'>";
-    html += "<div class='form-group'><label class='form-label'>Check Interval (ms)</label>";
-    html += "<input type='number' id='serviceCheckInterval' class='form-input' value='60000'></div>";
+    html += "<div class='form-group'><label class='form-label'>Check Interval (seconds)</label>";
+    html += "<input type='number' id='serviceCheckInterval' class='form-input' value='60'></div>";
     html += "<div class='form-group'><label class='form-label'>Pass Threshold</label>";
     html += "<input type='number' id='servicePassThreshold' class='form-input' value='1'></div></div>";
     html += "<div class='form-group'><label class='form-label'>Fail Threshold</label>";
