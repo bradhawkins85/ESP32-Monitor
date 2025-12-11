@@ -1,6 +1,13 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// Generated overrides from .env (if present)
+#if defined(__has_include)
+#if __has_include("generated_env.h")
+#include "generated_env.h"
+#endif
+#endif
+
 // ============================================
 // Build-time Configuration
 // ============================================
@@ -29,6 +36,10 @@
 
 #ifndef LORA_BANDWIDTH
 #define LORA_BANDWIDTH 125.0  // kHz: 125.0, 250.0, or 500.0
+#endif
+
+#ifndef LORA_ENABLED
+#define LORA_ENABLED true
 #endif
 
 #ifndef LORA_SYNC_WORD
@@ -108,6 +119,22 @@
 #define NTFY_TOPIC "esp32_uptime"
 #endif
 
+#ifndef NTFY_USERNAME
+#define NTFY_USERNAME ""  // Leave empty if not using username/password auth
+#endif
+
+#ifndef NTFY_PASSWORD
+#define NTFY_PASSWORD ""  // Leave empty if not using username/password auth
+#endif
+
+#ifndef NTFY_TOKEN
+#define NTFY_TOKEN ""  // Leave empty if not using token auth (token takes precedence over username/password)
+#endif
+
+#ifndef NTFY_MESH_RELAY
+#define NTFY_MESH_RELAY true  // Relay mesh messages to Ntfy
+#endif
+
 // Email Configuration (SMTP)
 #ifndef EMAIL_ENABLED
 #define EMAIL_ENABLED false
@@ -129,6 +156,10 @@
 #define EMAIL_SENDER "esp32@example.com"
 #endif
 
+#ifndef EMAIL_MESH_RELAY
+#define EMAIL_MESH_RELAY false  // Relay mesh messages to Email
+#endif
+
 // Discord Configuration
 #ifndef DISCORD_ENABLED
 #define DISCORD_ENABLED false
@@ -138,6 +169,10 @@
 #define DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
 #endif
 
+#ifndef DISCORD_MESH_RELAY
+#define DISCORD_MESH_RELAY true  // Relay mesh messages to Discord
+#endif
+
 // Generic Webhook Configuration
 #ifndef WEBHOOK_ENABLED
 #define WEBHOOK_ENABLED false
@@ -145,6 +180,10 @@
 
 #ifndef WEBHOOK_URL
 #define WEBHOOK_URL "https://example.com/webhook"
+#endif
+
+#ifndef WEBHOOK_MESH_RELAY
+#define WEBHOOK_MESH_RELAY false  // Relay mesh messages to Webhook
 #endif
 
 #ifndef WEBHOOK_METHOD

@@ -1245,9 +1245,9 @@ size_t hexToBytes(const char* hex, uint8_t* bytes, size_t maxBytes) {
 void deriveChannelKey(const char* channelName, const char* channelSecret, uint8_t* hash, uint8_t* key, size_t* keyLen) {
   unsigned char secret[32];
   size_t secretLen = 0;
+  size_t secretStrLen = strlen(channelSecret);
   
   // Check if secret is a valid hex PSK (16 or 32 bytes = 32 or 64 hex chars)
-  size_t secretStrLen = strlen(channelSecret);
   if ((secretStrLen == 32 || secretStrLen == 64) && isHexString(channelSecret, secretStrLen)) {
     // Use hex bytes directly as PSK
     uint8_t pskBytes[32];
@@ -1885,12 +1885,25 @@ void setup() {
 
   // API endpoint to test notifications
   server.on("/api/test-notification", HTTP_POST, [](AsyncWebServerRequest *request){
-    Serial.println("[API] Test notification requested");
-    
-    // Send test notification on LoRa
-    sendLoRaNotification("Test", true, "This is a test notification from ESP32 Monitor");
-    
-    request->send(200, "text/plain", "Test notification sent on all channels");
+    const String testMsg = "This is a test notification from ESP32 Monitor";
+
+  #if LORA_ENABLED
+    sendLoRaNotification("Test", true, testMsg);
+  #endif
+  #if NTFY_ENABLED
+    forwardToNtfy(testMsg);
+  #endif
+  #if DISCORD_ENABLED
+    forwardToDiscord(testMsg);
+  #endif
+  #if WEBHOOK_ENABLED
+    forwardToWebhook(testMsg);
+  #endif
+  #if EMAIL_ENABLED
+    forwardToEmail(testMsg);
+  #endif
+
+    request->send(200, "text/plain", "Test notification triggered on enabled channels");
   });
 
   server.begin();
@@ -2112,6 +2125,14 @@ void handleLoRaMessage(String message) {
   size_t encryptedLen = message.length() - idx;
   Serial.printf("Encrypted payload length: %d bytes\n", encryptedLen);
   
+  // Minimum: 2 bytes MAC + 16 bytes ciphertext (one AES block)
+  if (encryptedLen < CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE) {
+    Serial.printf("Packet too short for valid encrypted message (need at least %d bytes, got %d)\n", 
+                  CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE, encryptedLen);
+    Serial.println("This may be a different packet type or corrupted packet");
+    return;
+  }
+  
   uint8_t* encrypted = (uint8_t*)message.c_str() + idx;
   uint8_t decrypted[256];
   
@@ -2120,6 +2141,10 @@ void handleLoRaMessage(String message) {
   
   if (decryptedLen == 0) {
     Serial.println("Decryption or MAC verification failed");
+    Serial.println("This could mean:");
+    Serial.println("  - Packet is not from this channel");
+    Serial.println("  - Sender is using a different CHANNEL_SECRET");
+    Serial.println("  - Packet was corrupted during transmission");
     return;
   }
   
@@ -2192,15 +2217,35 @@ void handleLoRaMessage(String message) {
   String forwardMsg = String(textMessage);
   
   #if NTFY_ENABLED
+  #if NTFY_MESH_RELAY
   forwardToNtfy(forwardMsg);
+  #else
+  Serial.println("Ntfy mesh relay disabled, skipping");
+  #endif
   #endif
   
   #if DISCORD_ENABLED
+  #if DISCORD_MESH_RELAY
   forwardToDiscord(forwardMsg);
+  #else
+  Serial.println("Discord mesh relay disabled, skipping");
+  #endif
   #endif
   
   #if WEBHOOK_ENABLED
+  #if WEBHOOK_MESH_RELAY
   forwardToWebhook(forwardMsg);
+  #else
+  Serial.println("Webhook mesh relay disabled, skipping");
+  #endif
+  #endif
+  
+  #if EMAIL_ENABLED
+  #if EMAIL_MESH_RELAY
+  forwardToEmail(forwardMsg);
+  #else
+  Serial.println("Email mesh relay disabled, skipping");
+  #endif
   #endif
 }
 
@@ -2222,20 +2267,47 @@ void forwardToNtfy(String message) {
   Serial.print("Forwarding to Ntfy: ");
   Serial.println(url);
   
-  http.begin(url);
-  http.addHeader("Content-Type", "text/plain");
+  // Determine if we need secure client for HTTPS
+  WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+  bool isSecure = url.startsWith("https://");
+  
+  if (isSecure) {
+    secureClient.setInsecure();  // Skip certificate validation
+    http.begin(secureClient, url);
+  } else {
+    http.begin(plainClient, url);
+  }
+  
+  // Set headers in the exact order from working code
   http.addHeader("Title", "ESP32 Uptime Alert");
-  http.addHeader("Priority", "default");
   http.addHeader("Tags", "bell");
+  http.addHeader("Content-Type", "text/plain");
+  http.addHeader("X-Message-ID", String(millis()));  // avoid dedup on server
+  
+  // Add authentication - MUST be after begin() and headers
+  String ntfyToken = String(NTFY_TOKEN);
+  String ntfyUsername = String(NTFY_USERNAME);
+  String ntfyPassword = String(NTFY_PASSWORD);
+  
+  if (ntfyToken.length() > 0) {
+    // Token authentication using Bearer header
+    http.addHeader("Authorization", "Bearer " + ntfyToken);
+    Serial.println("Using Ntfy Bearer token authentication");
+  } else if (ntfyUsername.length() > 0 && ntfyPassword.length() > 0) {
+    // Username/password authentication using Basic Auth
+    http.setAuthorization(ntfyUsername.c_str(), ntfyPassword.c_str());
+    Serial.printf("Using Ntfy Basic Auth: user=%s\n", ntfyUsername.c_str());
+  } else {
+    Serial.println("WARNING: No Ntfy authentication configured!");
+  }
   
   int httpResponseCode = http.POST(message);
   
-  if (httpResponseCode > 0) {
-    Serial.print("Ntfy response code: ");
-    Serial.println(httpResponseCode);
+  if (httpResponseCode >= 200 && httpResponseCode < 300) {
+    Serial.printf("Ntfy notification sent: %d\n", httpResponseCode);
   } else {
-    Serial.print("Ntfy error: ");
-    Serial.println(http.errorToString(httpResponseCode));
+    Serial.printf("Ntfy error: %d - %s\n", httpResponseCode, http.errorToString(httpResponseCode).c_str());
   }
   
   http.end();
