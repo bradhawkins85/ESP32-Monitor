@@ -390,9 +390,24 @@ String getServicesJson() {
 void forwardToWebhook(String message);
 size_t encryptAndSign(const uint8_t* secret, size_t secretLen, uint8_t* output, size_t maxOutput, const uint8_t* input, size_t inputLen);
 
+// Global variable to store our node ID for filtering own messages
+uint32_t ourNodeId = 0;
+String ourNodeName = "";
+
+void initNodeIdentity() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  ourNodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+  char nodeName[18];
+  snprintf(nodeName, sizeof(nodeName), "%02X:%02X:%02X:%02X:%02X:%02X", 
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  ourNodeName = String(nodeName);
+  Serial.printf("Node identity: %s (ID: 0x%08X)\n", ourNodeName.c_str(), ourNodeId);
+}
+
 // Send LoRa notification for service status changes
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message) {
-#if LORA_ENABLED && DEVICE_MODE == MODE_TX
+#if LORA_ENABLED
   String notification = "[Monitor] " + serviceName + ": " + (isUp ? "UP" : "DOWN");
   if (message.length() > 0) {
     notification += " - " + message;
@@ -1383,15 +1398,16 @@ void setup() {
   digitalWrite(LORA_VEXT_PIN, LOW);  // LOW = power on
   delay(100);
   
-  // Setup WiFi (needed for RX forwarding and TX NTP sync)
+  // Setup WiFi (needed for forwarding and NTP sync)
   setupWiFi();
   
-#if DEVICE_MODE == MODE_TX
+  // Initialize node identity for filtering own messages
+  initNodeIdentity();
+  
   // Sync time via NTP for proper timestamps
   if (wifiConnected) {
     syncNTP();
   }
-#endif
   
   // Setup LoRa
   setupLoRa();
@@ -1884,8 +1900,7 @@ void setup() {
 // Main Loop
 // ============================================
 void loop() {
-#if DEVICE_MODE == MODE_RX
-  // Check for LoRa packets
+  // Check for LoRa packets (all devices listen)
   String message;
   int state = radio.receive(message);
   
@@ -1926,20 +1941,6 @@ void loop() {
   checkAllServices();
   
   delay(10);
-#else
-  // TX mode - periodic ping messages disabled
-  // Uncomment below to enable periodic test ping messages
-  // unsigned long now = millis();
-  // if (now - lastPingTime >= TX_PING_INTERVAL_MS) {
-  //   sendPingPacket();
-  //   lastPingTime = now;
-  // }
-  
-  // Check all services periodically
-  checkAllServices();
-  
-  delay(10);
-#endif
 }
 
 // ============================================
@@ -2042,18 +2043,15 @@ void setupLoRa() {
   Serial.println(CHANNEL_NAME);
   Serial.println("========================\n");
   
-  // Start listening for packets
-#if DEVICE_MODE == MODE_RX
+  // Start listening for packets (all devices listen and can transmit)
   state = radio.startReceive();
   if (state != RADIOLIB_ERR_NONE) {
     Serial.print("Failed to start receive mode, code ");
     Serial.println(state);
   } else {
     Serial.println("Radio in receive mode, listening for packets...");
+    Serial.println("Device can also transmit notifications when services change state");
   }
-#else
-  Serial.println("Radio ready for TX mode, will send ping frames");
-#endif
 }
 
 // ============================================
@@ -2154,6 +2152,35 @@ void handleLoRaMessage(String message) {
   }
   
   Serial.printf("Decoded message: \"%s\"\n", textMessage);
+  
+  // Check if this is our own message by checking if the message starts with our node name
+  String msgStr = String(textMessage);
+  if (msgStr.startsWith(ourNodeName + ":")) {
+    Serial.println("This is our own message, not forwarding to notification services");
+    Serial.println("=== Packet Processing Complete ===\n");
+    return;
+  }
+  
+  // Also check path for our node ID to detect own messages
+  if (pathLen >= 4) {
+    size_t pathIdx = 2;
+    for (size_t i = 0; i < pathLen; i += 4) {
+      if (pathIdx + 4 <= 2 + pathLen) {
+        uint32_t nodeIdInPath = ((uint8_t)message[pathIdx]) | 
+                                ((uint8_t)message[pathIdx+1] << 8) |
+                                ((uint8_t)message[pathIdx+2] << 16) |
+                                ((uint8_t)message[pathIdx+3] << 24);
+        if (nodeIdInPath == ourNodeId) {
+          Serial.printf("Found our node ID (0x%08X) in path, not forwarding\n", ourNodeId);
+          Serial.println("=== Packet Processing Complete ===\n");
+          return;
+        }
+        pathIdx += 4;
+      }
+    }
+  }
+  
+  Serial.println("Message from another node, forwarding to notification services");
   Serial.println("=== Packet Processing Complete ===\n");
   
   // Forward the decoded message

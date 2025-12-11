@@ -84,13 +84,8 @@
 #define CHANNEL_SECRET "f7d32d9d09982b83c2c1086a5ea2239a"  // Must match transmitter
 #endif
 
-// Operating Mode
-#define MODE_RX 0
-#define MODE_TX 1
-
-#ifndef DEVICE_MODE
-#define DEVICE_MODE MODE_RX  // MODE_RX (listen) or MODE_TX (send pings)
-#endif
+// Operating Mode - All devices now listen and can transmit
+// No need for MODE_RX/MODE_TX distinction anymore
 
 #ifndef TX_PING_INTERVAL_MS
 #define TX_PING_INTERVAL_MS 30000  // How often to send ping in TX mode
