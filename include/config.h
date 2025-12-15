@@ -21,6 +21,15 @@
 #define WIFI_PASSWORD "your_wifi_password"
 #endif
 
+// Admin Authentication (used for UI/API/OTA access)
+#ifndef ADMIN_USERNAME
+#define ADMIN_USERNAME "admin"
+#endif
+
+#ifndef ADMIN_PASSWORD
+#define ADMIN_PASSWORD "admin"
+#endif
+
 // LoRa Configuration
 #ifndef LORA_FREQ
 #define LORA_FREQ 915.0  // MHz: 915.0 for US, 868.0 for EU, 433.0 for Asia

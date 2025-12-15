@@ -40,6 +40,10 @@ string_vars = {
     "WIFI_SSID": os.environ.get("WIFI_SSID", "your_wifi_ssid"),
     "WIFI_PASSWORD": os.environ.get("WIFI_PASSWORD", "your_wifi_password"),
     
+    # Admin Authentication
+    "ADMIN_USERNAME": os.environ.get("ADMIN_USERNAME", "admin"),
+    "ADMIN_PASSWORD": os.environ.get("ADMIN_PASSWORD", "admin"),
+
     # LoRa/MeshCore Channel Configuration
     "CHANNEL_NAME": os.environ.get("CHANNEL_NAME", "BCAlerts"),
     "CHANNEL_SECRET": os.environ.get("CHANNEL_SECRET", ""),

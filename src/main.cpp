@@ -22,6 +22,7 @@
 #include <ESPAsyncWebServer.h>
 // #include <ElegantOTA.h>  // Temporarily disabled due to header conflicts
 #include <cstdlib>
+#include <Update.h>
 
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
@@ -95,6 +96,10 @@ unsigned long lastMessageTime = 0;
 int messageCount = 0;
 unsigned long lastPingTime = 0;
 
+// Simple session tracking for UI/API authentication
+String sessionToken = "";
+unsigned long sessionIssuedAt = 0;
+
 String generatePushToken() {
   uint32_t seed = esp_random();
   randomSeed(seed ^ micros());
@@ -125,6 +130,8 @@ bool checkPush(Service& service);
 bool checkUptime(Service& service);
 void updateServiceStatus(Service& service, bool checkResult);
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
+bool isAuthenticated(AsyncWebServerRequest *request, bool sendUnauthorized = true);
+String generateSessionToken();
 
 // --- Service Persistence ---
 void saveServices() {
@@ -385,6 +392,52 @@ String getServicesJson() {
   }
   json += "]";
   return json;
+}
+
+String generateSessionToken() {
+  const char* hex = "0123456789abcdef";
+  uint32_t seed = esp_random();
+  randomSeed(seed ^ micros());
+  char token[33];
+  for (int i = 0; i < 32; i++) {
+    token[i] = hex[random(0, 16)];
+  }
+  token[32] = '\0';
+  return String(token);
+}
+
+bool isAuthenticated(AsyncWebServerRequest *request, bool sendUnauthorized) {
+  if (sessionToken.length() == 0) {
+    if (sendUnauthorized) {
+      AsyncWebServerResponse *resp = request->beginResponse(401, "text/plain", "Unauthorized");
+      resp->addHeader("WWW-Authenticate", "FormBased realm=\"ESP32 Monitor\"");
+      request->send(resp);
+    }
+    return false;
+  }
+
+  if (!request->hasHeader("Cookie")) {
+    if (sendUnauthorized) request->send(401, "text/plain", "Unauthorized");
+    return false;
+  }
+
+  String cookie = request->header("Cookie");
+  int pos = cookie.indexOf("SESSION=");
+  if (pos < 0) {
+    if (sendUnauthorized) request->send(401, "text/plain", "Unauthorized");
+    return false;
+  }
+
+  int end = cookie.indexOf(';', pos);
+  String token = (end < 0) ? cookie.substring(pos + 8) : cookie.substring(pos + 8, end);
+  token.trim();
+
+  if (token == sessionToken) {
+    return true;
+  }
+
+  if (sendUnauthorized) request->send(401, "text/plain", "Unauthorized");
+  return false;
 }
 void forwardToWebhook(String message);
 size_t encryptAndSign(const uint8_t* secret, size_t secretLen, uint8_t* output, size_t maxOutput, const uint8_t* input, size_t inputLen);
@@ -1428,12 +1481,48 @@ void setup() {
   // Load services from LittleFS (or initialize demo services if file doesn't exist)
   loadServices();
 
+  // Authentication endpoints
+  server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) {
+        request->send(400, "application/json", "{\"error\":\"invalid json\"}");
+        return;
+      }
+
+      String username = doc["username"].as<String>();
+      String password = doc["password"].as<String>();
+
+      if (username == ADMIN_USERNAME && password == ADMIN_PASSWORD) {
+        sessionToken = generateSessionToken();
+        sessionIssuedAt = millis();
+        AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"status\":\"ok\"}");
+        resp->addHeader("Set-Cookie", "SESSION=" + sessionToken + "; Path=/; HttpOnly; SameSite=Lax");
+        resp->addHeader("Cache-Control", "no-store");
+        request->send(resp);
+      } else {
+        request->send(401, "application/json", "{\"error\":\"invalid credentials\"}");
+      }
+  });
+
+  server.on("/api/logout", HTTP_POST, [](AsyncWebServerRequest *request){
+    sessionToken = "";
+    sessionIssuedAt = 0;
+    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"status\":\"logged out\"}");
+    resp->addHeader("Set-Cookie", "SESSION=deleted; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax");
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
+  });
+
   // --- Web Server Endpoints ---
   // ElegantOTA integration
+  // ElegantOTA.setAuth(ADMIN_USERNAME, ADMIN_PASSWORD);  // Protect OTA with admin credentials
   // ElegantOTA.begin(&server);  // Temporarily disabled due to header conflicts
 
   // Status page (modern styled HTML)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bool isAuthed = isAuthenticated(request, false);
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<title>ESP32 Uptime Monitor</title>";
     html += "<style>";
@@ -1474,6 +1563,12 @@ void setup() {
     html += ".stat-card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:12px;padding:20px;text-align:center}";
     html += ".stat-value{font-size:32px;font-weight:700;color:#2d3748;margin-bottom:4px}";
     html += ".stat-label{font-size:12px;color:#718096;text-transform:uppercase;letter-spacing:1px}";
+    html += ".auth-row{margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}";
+    html += ".auth-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}";
+    html += ".auth-form input{padding:8px 10px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px}";
+    html += ".auth-form input:focus{outline:none;border-color:#667eea}";
+    html += ".auth-hint{color:#4a5568;font-size:14px}";
+    html += ".auth-actions{display:flex;gap:10px;align-items:center}";
     html += ".refresh-btn{position:fixed;bottom:24px;right:24px;width:56px;height:56px;border-radius:50%;background:#667eea;color:#fff;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(102,126,234,0.4);transition:all 0.3s ease;display:flex;align-items:center;justify-content:center;font-size:24px}";
     html += ".refresh-btn:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(102,126,234,0.6)}";
     html += "@keyframes spin{to{transform:rotate(360deg)}}";
@@ -1511,7 +1606,11 @@ void setup() {
     html += "</div>";
     
     // Services
-    html += "<div class='card'><div class='card-title'>📊 Services<button class='btn btn-primary' onclick='showAddModal()' style='margin-left:auto'>+ Add Service</button></div>";
+    html += "<div class='card'><div class='card-title'>📊 Services";
+    if (isAuthed) {
+      html += "<button class='btn btn-primary' onclick='showAddModal()' style='margin-left:auto'>+ Add Service</button>";
+    }
+    html += "</div>";
     html += "<div class='services-grid'>";
     for (int i = 0; i < serviceCount; i++) {
       String statusClass = services[i].isUp ? "up" : "down";
@@ -1520,10 +1619,13 @@ void setup() {
       html += "<div class='service-card " + statusClass + "'>";
       html += "<div class='service-header'>";
       html += "<div class='service-name'>" + services[i].name + "</div>";
-      html += "<div class='service-actions'>";
-      html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
-      html += "<button class='icon-btn delete' onclick='deleteService(" + String(i) + ")' title='Delete'>🗑️</button>";
-      html += "</div></div>";
+      if (isAuthed) {
+        html += "<div class='service-actions'>";
+        html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
+        html += "<button class='icon-btn delete' onclick='deleteService(" + String(i) + ")' title='Delete'>🗑️</button>";
+        html += "</div>";
+      }
+      html += "</div>";
       html += "<span class='service-status " + statusBadgeClass + "'>" + statusText + "</span>";
       html += "<div class='service-info'>Type: " + String(services[i].type) + " | Host: " + services[i].host + "</div>";
       if (services[i].type == TYPE_PUSH) {
@@ -1540,13 +1642,23 @@ void setup() {
     html += "</div></div>";
     
     // Actions
-    html += "<div class='card'><div class='card-title'>⚙️ Actions</div><div class='actions'>";
-    html += "<a href='/export' class='btn btn-primary' download='services.json'>📥 Export Config</a>";
-    html += "<form action='/import' method='post' enctype='multipart/form-data' style='display:inline'>";
-    html += "<input type='file' name='file' id='fileInput' class='file-input' accept='.json' onchange='this.form.submit()'>";
-    html += "<label for='fileInput' class='file-label'>📤 Import Config</label>";
-    html += "</form>";
-    html += "<button class='btn btn-secondary' onclick='testNotifications()'>🔔 Test Notifications</button>";
+    html += "<div class='card'><div class='card-title'>⚙️ Actions</div>";
+    if (!isAuthed) {
+      html += "<div class='auth-row'><form id='loginForm' class='auth-form'><input type='text' name='username' placeholder='Username' autocomplete='username' required><input type='password' name='password' placeholder='Password' autocomplete='current-password' required><button class='btn btn-primary' type='submit'>Login</button></form></div>";
+    }
+    html += "<div class='actions'>";
+    if (isAuthed) {
+      html += "<a href='/export' class='btn btn-primary' download='services.json'>📥 Export Config</a>";
+      html += "<form action='/import' method='post' enctype='multipart/form-data' style='display:inline'>";
+      html += "<input type='file' name='file' id='fileInput' class='file-input' accept='.json' onchange='this.form.submit()'>";
+      html += "<label for='fileInput' class='file-label'>📤 Import Config</label>";
+      html += "</form>";
+      html += "<button class='btn btn-secondary' onclick='testNotifications()'>🔔 Test Notifications</button>";
+      html += "<button class='btn btn-secondary' onclick='gotoOta()'>⬆️ OTA Update</button>";
+      html += "<button class='btn btn-secondary' onclick='logout()'>Logout</button>";
+    } else {
+      html += "<div class='auth-hint'>Login to manage services, import/export configuration, trigger tests, or run OTA updates.</div>";
+    }
     html += "</div></div>";
     
     html += "</div>";
@@ -1612,15 +1724,16 @@ void setup() {
     // JavaScript
     html += "<script>";
     html += "const services=" + getServicesJson() + ";";
+    html += "const isAuthed=" + String(isAuthed ? "true" : "false") + ";";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
     html += "function setPushDetails(token){const hidden=document.getElementById('servicePushToken');const url=document.getElementById('servicePushUrl');hidden.value=token||'';if(token){url.value=location.origin+'/push/'+token;url.placeholder='';}else{url.value='';url.placeholder='Generated after saving';}}";
-    html += "function showAddModal(){document.getElementById('modalTitle').textContent='Add Service';";
+    html += "function showAddModal(){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Add Service';";
     html += "document.getElementById('serviceForm').reset();document.getElementById('serviceIndex').value='-1';setPushDetails('');";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "document.getElementById('serviceModal').classList.add('show')}";
     html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show')}";
-    html += "function editService(i){document.getElementById('modalTitle').textContent='Edit Service';";
+    html += "function editService(i){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Edit Service';";
     html += "const s=services[i];document.getElementById('serviceIndex').value=i;";
     html += "document.getElementById('serviceName').value=s.name;";
     html += "document.getElementById('serviceType').value=s.type;";
@@ -1641,9 +1754,9 @@ void setup() {
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
     html += "updateFieldVisibility(s.type);";
     html += "document.getElementById('serviceModal').classList.add('show')}";
-    html += "function deleteService(i){if(confirm('Delete '+services[i].name+'?')){";
-    html += "fetch('/api/service/'+i,{method:'DELETE'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
-    html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();";
+    html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
+    html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
+    html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
     html += "const data={name:document.getElementById('serviceName').value,";
     html += "type:parseInt(document.getElementById('serviceType').value),";
     html += "enabled:document.getElementById('serviceEnabled').value==='true',";
@@ -1664,11 +1777,15 @@ void setup() {
     html += "const idx=document.getElementById('serviceIndex').value;";
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
     html += "const method=idx==='-1'?'POST':'PUT';";
-    html += "fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})";
+    html += "fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data),credentials:'include'})";
     html += ".then(r=>r.ok?location.reload():alert('Save failed'))};";
-    html += "function testNotifications(){if(confirm('Send test notification on all channels?')){";
-    html += "fetch('/api/test-notification',{method:'POST'})";
+    html += "function testNotifications(){if(!isAuthed){alert('Login required');return;}if(confirm('Send test notification on all channels?')){";
+    html += "fetch('/api/test-notification',{method:'POST',credentials:'include'})";
     html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
+    html += "function gotoOta(){if(!isAuthed){alert('Login required');return;}location.href='/ota';}";
+    html += "const loginForm=document.getElementById('loginForm');";
+    html += "if(loginForm){loginForm.addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(loginForm);const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:fd.get('username'),password:fd.get('password')})});if(res.ok){location.reload();}else{alert('Invalid credentials');}});}";
+    html += "function logout(){fetch('/api/logout',{method:'POST',credentials:'include'}).then(()=>location.reload());}";
     html += "setInterval(()=>location.reload(),30000);";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "</script>";
@@ -1698,6 +1815,7 @@ void setup() {
 
   // Export services as JSON
   server.on("/export", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!isAuthenticated(request)) return;
     JsonDocument doc;
     JsonArray array = doc["services"].to<JsonArray>();
     for (int i = 0; i < serviceCount; i++) {
@@ -1731,9 +1849,11 @@ void setup() {
     "/import", 
     HTTP_POST, 
     [](AsyncWebServerRequest *request){
+      if (!isAuthenticated(request)) return;
       request->send(200, "text/html", "Import complete. <a href='/'>Back</a>");
     },
     [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+      if (!isAuthenticated(request, false)) return;
       static String jsonData;
       if (index == 0) jsonData = "";
       for (size_t i = 0; i < len; i++) jsonData += (char)data[i];
@@ -1781,8 +1901,9 @@ void setup() {
   );
 
   // API endpoint to add a new service
-  server.on("/api/service", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
+  server.on("/api/service", HTTP_POST, [](AsyncWebServerRequest *request){ if (!isAuthenticated(request)) return; }, NULL, 
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (!isAuthenticated(request)) return;
       if (serviceCount >= MAX_SERVICES) {
         request->send(400, "text/plain", "Maximum services reached");
         return;
@@ -1827,8 +1948,9 @@ void setup() {
   });
 
   // API endpoint to update a service
-  server.on("/api/service/*", HTTP_PUT, [](AsyncWebServerRequest *request){}, NULL,
+  server.on("/api/service/*", HTTP_PUT, [](AsyncWebServerRequest *request){ if (!isAuthenticated(request)) return; }, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (!isAuthenticated(request)) return;
       String url = request->url();
       int idx = url.substring(url.lastIndexOf('/') + 1).toInt();
       if (idx < 0 || idx >= serviceCount) {
@@ -1867,6 +1989,7 @@ void setup() {
 
   // API endpoint to delete a service
   server.on("/api/service/*", HTTP_DELETE, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
     String url = request->url();
     int idx = url.substring(url.lastIndexOf('/') + 1).toInt();
     if (idx < 0 || idx >= serviceCount) {
@@ -1884,6 +2007,7 @@ void setup() {
 
   // API endpoint to test notifications
   server.on("/api/test-notification", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
     const String testMsg = "This is a test notification from ESP32 Monitor";
 
   #if LORA_ENABLED
@@ -1904,6 +2028,59 @@ void setup() {
 
     request->send(200, "text/plain", "Test notification triggered on enabled channels");
   });
+
+  // OTA update page (protected)
+  server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    page += "<title>OTA Update</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f7fafc;padding:24px;color:#2d3748;}";
+    page += ".card{max-width:520px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 8px 24px rgba(0,0,0,0.08);}";
+    page += "h1{margin:0 0 12px;font-size:24px;}p{margin:0 0 16px;color:#4a5568;}";
+    page += "input[type=file]{width:100%;padding:12px;border:2px dashed #cbd5e0;border-radius:10px;background:#f8fafc;cursor:pointer;margin-bottom:16px;}";
+    page += "button{padding:12px 18px;border:none;border-radius:8px;background:#667eea;color:#fff;font-weight:600;cursor:pointer;}";
+    page += "button:disabled{opacity:0.6;cursor:not-allowed;}";
+    page += "#status{margin-top:12px;font-weight:600;}";
+    page += "</style></head><body><div class='card'><h1>OTA Firmware Update</h1><p>Select a .bin file to upload and flash. Device will reboot after a successful update.</p>";
+    page += "<input type='file' id='file' accept='.bin,.bin.gz'>";
+    page += "<button id='uploadBtn'>Upload & Flash</button><div id='status'></div>";
+    page += "<script>const btn=document.getElementById('uploadBtn');const fileInput=document.getElementById('file');const statusEl=document.getElementById('status');";
+    page += "btn.onclick=async()=>{if(!fileInput.files.length){alert('Choose a firmware file');return;}btn.disabled=true;statusEl.textContent='Uploading...';";
+    page += "const fd=new FormData();fd.append('firmware',fileInput.files[0]);";
+    page += "try{const res=await fetch('/ota/upload',{method:'POST',body:fd,credentials:'include'});const txt=await res.text();statusEl.textContent=txt;if(res.ok){statusEl.textContent+=' Rebooting...';setTimeout(()=>location.href='/',4000);}else{btn.disabled=false;}}catch(e){statusEl.textContent='Upload failed';btn.disabled=false;}};";
+    page += "</script></div></body></html>";
+    request->send(200, "text/html", page);
+  });
+
+  // OTA upload handler
+  server.on(
+    "/ota/upload",
+    HTTP_POST,
+    [](AsyncWebServerRequest *request){
+      if (!isAuthenticated(request)) return;
+      bool ok = !Update.hasError();
+      request->send(ok ? 200 : 500, "text/plain", ok ? "Update successful." : "Update failed.");
+      if (ok) {
+        delay(500);
+        ESP.restart();
+      }
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+      if (!isAuthenticated(request, false)) return;
+      if (index == 0) {
+        if (!Update.begin()) {
+          Update.printError(Serial);
+        }
+      }
+      if (Update.write(data, len) != len) {
+        Update.printError(Serial);
+      }
+      if (final) {
+        if (!Update.end(true)) {
+          Update.printError(Serial);
+        }
+      }
+    }
+  );
 
   // API endpoint to receive generic webhook messages and fan out to enabled channels
   server.on("/api/inbound-webhook", HTTP_POST,
@@ -2151,7 +2328,7 @@ void handleLoRaMessage(String message) {
     return;
   }
   
-  // Skip path
+  // Skip path (pathLen is in bytes)
   size_t idx = 2 + pathLen;
   if (idx >= message.length()) {
     Serial.println("Packet too short for payload");
