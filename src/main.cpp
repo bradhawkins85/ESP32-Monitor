@@ -1444,6 +1444,14 @@ void setup() {
   delay(1000);
   
   Serial.println("ESP32 Uptime Receiver Starting...");
+
+  // Rapid LED flicker to indicate boot
+  pinMode(LED_PIN, OUTPUT);
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(LED_PIN, (i % 2) ? HIGH : LOW);
+    delay(25);
+  }
+  digitalWrite(LED_PIN, LOW);
   
   // Power on the LoRa radio (Vext)
   pinMode(LORA_VEXT_PIN, OUTPUT);
@@ -1725,14 +1733,15 @@ void setup() {
     html += "<script>";
     html += "const services=" + getServicesJson() + ";";
     html += "const isAuthed=" + String(isAuthed ? "true" : "false") + ";";
+    html += "let modalOpen=false;";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
     html += "function setPushDetails(token){const hidden=document.getElementById('servicePushToken');const url=document.getElementById('servicePushUrl');hidden.value=token||'';if(token){url.value=location.origin+'/push/'+token;url.placeholder='';}else{url.value='';url.placeholder='Generated after saving';}}";
     html += "function showAddModal(){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Add Service';";
     html += "document.getElementById('serviceForm').reset();document.getElementById('serviceIndex').value='-1';setPushDetails('');";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
-    html += "document.getElementById('serviceModal').classList.add('show')}";
-    html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show')}";
+    html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
+    html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show');modalOpen=false;}";
     html += "function editService(i){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Edit Service';";
     html += "const s=services[i];document.getElementById('serviceIndex').value=i;";
     html += "document.getElementById('serviceName').value=s.name;";
@@ -1753,7 +1762,7 @@ void setup() {
     html += "document.getElementById('servicePassThreshold').value=s.passThreshold;";
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
     html += "updateFieldVisibility(s.type);";
-    html += "document.getElementById('serviceModal').classList.add('show')}";
+    html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
     html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
     html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
@@ -1778,7 +1787,7 @@ void setup() {
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
     html += "const method=idx==='-1'?'POST':'PUT';";
     html += "fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data),credentials:'include'})";
-    html += ".then(r=>r.ok?location.reload():alert('Save failed'))};";
+    html += ".then(r=>{if(r.ok){location.reload();}else{alert('Save failed');modalOpen=false;}})};";
     html += "function testNotifications(){if(!isAuthed){alert('Login required');return;}if(confirm('Send test notification on all channels?')){";
     html += "fetch('/api/test-notification',{method:'POST',credentials:'include'})";
     html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
@@ -1786,10 +1795,65 @@ void setup() {
     html += "const loginForm=document.getElementById('loginForm');";
     html += "if(loginForm){loginForm.addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(loginForm);const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:fd.get('username'),password:fd.get('password')})});if(res.ok){location.reload();}else{alert('Invalid credentials');}});}";
     html += "function logout(){fetch('/api/logout',{method:'POST',credentials:'include'}).then(()=>location.reload());}";
-    html += "setInterval(()=>location.reload(),30000);";
+    html += "setInterval(()=>{if(!modalOpen) location.reload();},30000);";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "</script>";
     html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // Kiosk view: stats + services only, no actions/controls
+  server.on("/kiosk", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>Kiosk</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:20px;}";
+    html += ".container{max-width:1100px;margin:0 auto;}";
+    html += ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;}";
+    html += ".stat{background:#1e293b;border-radius:12px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,0.2);}";
+    html += ".stat .value{font-size:32px;font-weight:700;color:#f8fafc;}";
+    html += ".stat .label{color:#cbd5e1;font-size:12px;text-transform:uppercase;letter-spacing:1px;}";
+    html += ".services{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;}";
+    html += ".card{background:#1e293b;border-radius:12px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,0.2);border-left:4px solid #334155;}";
+    html += ".card.up{border-left-color:#22c55e;} .card.down{border-left-color:#ef4444;}";
+    html += ".name{font-size:16px;font-weight:700;color:#f8fafc;margin-bottom:6px;}";
+    html += ".meta{color:#cbd5e1;font-size:13px;} .status-badge{display:inline-block;padding:4px 10px;border-radius:12px;font-weight:700;font-size:12px;margin-top:6px;}";
+    html += ".status-up{background:#22c55e33;color:#bbf7d0;} .status-down{background:#ef444433;color:#fecdd3;}";
+    html += "</style></head><body><div class='container'>";
+
+    int upCount = 0, downCount = 0;
+    for (int i = 0; i < serviceCount; i++) {
+      if (services[i].isUp) upCount++; else downCount++;
+    }
+    html += "<div class='stats'>";
+    html += "<div class='stat'><div class='value'>" + String(serviceCount) + "</div><div class='label'>Total</div></div>";
+    html += "<div class='stat'><div class='value' style='color:#22c55e'>" + String(upCount) + "</div><div class='label'>Online</div></div>";
+    html += "<div class='stat'><div class='value' style='color:#ef4444'>" + String(downCount) + "</div><div class='label'>Offline</div></div>";
+    html += "<div class='stat'><div class='value'>" + String(millis() / 1000 / 60) + "m</div><div class='label'>Uptime</div></div>";
+    html += "</div>";
+
+    html += "<div class='services'>";
+    for (int i = 0; i < serviceCount; i++) {
+      String statusClass = services[i].isUp ? "up" : "down";
+      String badge = services[i].isUp ? "<span class='status-badge status-up'>UP</span>" : "<span class='status-badge status-down'>DOWN</span>";
+      html += "<div class='card " + statusClass + "'>";
+      html += "<div class='name'>" + services[i].name + "</div>";
+      html += badge;
+      html += "<div class='meta'>Type: " + String(services[i].type) + "</div>";
+      if (services[i].host.length() > 0) {
+        html += "<div class='meta'>Host: " + services[i].host + "</div>";
+      }
+      if (services[i].type == TYPE_HTTP_GET && services[i].url.length() > 0) {
+        html += "<div class='meta'>URL: " + services[i].url + "</div>";
+      }
+      if (services[i].type == TYPE_PORT && services[i].port > 0) {
+        html += "<div class='meta'>Port: " + String(services[i].port) + "</div>";
+      }
+      if (!services[i].isUp && services[i].lastError.length() > 0) {
+        html += "<div class='meta'>" + services[i].lastError + "</div>";
+      }
+      html += "</div>";
+    }
+    html += "</div>";
+    html += "</div><script>setInterval(()=>location.reload(),20000);</script></body></html>";
     request->send(200, "text/html", html);
   });
 

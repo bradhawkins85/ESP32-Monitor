@@ -39,7 +39,7 @@ string_vars = {
     # WiFi Configuration
     "WIFI_SSID": os.environ.get("WIFI_SSID", "your_wifi_ssid"),
     "WIFI_PASSWORD": os.environ.get("WIFI_PASSWORD", "your_wifi_password"),
-    
+
     # Admin Authentication
     "ADMIN_USERNAME": os.environ.get("ADMIN_USERNAME", "admin"),
     "ADMIN_PASSWORD": os.environ.get("ADMIN_PASSWORD", "admin"),
@@ -71,6 +71,11 @@ string_vars = {
     "WEBHOOK_METHOD": os.environ.get("WEBHOOK_METHOD", "POST"),
 }
 
+# Numeric vars (no quotes)
+int_vars = {
+    "LED_PIN": os.environ.get("LED_PIN", "35"),
+}
+
 # Handle boolean values (no quotes needed for preprocessor)
 bool_defines = {}
 for key, value in bool_vars.items():
@@ -93,6 +98,9 @@ for key, value in string_vars.items():
         print(f"Injecting {key}: original_len={len(os.environ.get(key, ''))}, escaped_len={len(value)}")
     escaped = c_escape(value)
     header_lines.append(f'#define {key} "{escaped}"')
+
+for key, value in int_vars.items():
+    header_lines.append(f'#define {key} {value}')
 
 for key, value in bool_defines.items():
     header_lines.append(f'#define {key} {value}')

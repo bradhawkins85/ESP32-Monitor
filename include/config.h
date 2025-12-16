@@ -21,6 +21,11 @@
 #define WIFI_PASSWORD "your_wifi_password"
 #endif
 
+// Status LED (onboard). Override in .env via ADMIN_LED_PIN if different.
+#ifndef LED_PIN
+#define LED_PIN 35
+#endif
+
 // Admin Authentication (used for UI/API/OTA access)
 #ifndef ADMIN_USERNAME
 #define ADMIN_USERNAME "admin"

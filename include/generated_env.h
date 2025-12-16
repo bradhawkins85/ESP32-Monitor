@@ -21,6 +21,7 @@
 #define SMTP_PASSWORD "your_app_specific_password"
 #define WEBHOOK_URL "https://example.com/webhook"
 #define WEBHOOK_METHOD "POST"
+#define LED_PIN 35
 #define LORA_ENABLED 0
 #define DISCORD_ENABLED 0
 #define NTFY_ENABLED 1
