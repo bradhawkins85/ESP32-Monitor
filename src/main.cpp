@@ -546,7 +546,7 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
 
 // Uptime Monitoring Check Functions
 bool checkHttpGet(Service& service) {
-  if (!wifiConnected) {
+  if (WiFi.status() != WL_CONNECTED) {
     service.lastError = "WiFi not connected";
     return false;
   }
@@ -625,7 +625,7 @@ bool sendIcmpPing(const IPAddress& ip, uint32_t timeout_ms) {
 }
 
 bool checkPing(Service& service) {
-  if (!wifiConnected) {
+  if (WiFi.status() != WL_CONNECTED) {
     service.lastError = "WiFi not connected";
     return false;
   }
@@ -657,7 +657,7 @@ bool checkPing(Service& service) {
 }
 
 bool checkPort(Service& service) {
-  if (!wifiConnected) {
+  if (WiFi.status() != WL_CONNECTED) {
     service.lastError = "WiFi not connected";
     return false;
   }
@@ -922,7 +922,7 @@ bool compareSnmpValue(const String& actual, const String& expected, CompareOp op
 }
 
 bool checkSnmpGet(Service& service) {
-  if (!wifiConnected) {
+  if (WiFi.status() != WL_CONNECTED) {
     service.lastError = "WiFi not connected";
     return false;
   }
@@ -2241,10 +2241,24 @@ void loop() {
     Serial.println(state);
   }
   
-  // Reconnect WiFi if disconnected
-  if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+  // Track and heal WiFi connectivity
+  static unsigned long lastWifiAttempt = 0;
+  wl_status_t wifiStatus = WiFi.status();
+  bool nowConnected = (wifiStatus == WL_CONNECTED);
+
+  if (nowConnected && !wifiConnected) {
+    Serial.println("WiFi reconnected");
+  } else if (!nowConnected && wifiConnected) {
+    Serial.println("WiFi disconnected");
+  }
+
+  wifiConnected = nowConnected;
+
+  if (!wifiConnected && millis() - lastWifiAttempt >= 10000) {
     Serial.println("WiFi disconnected, reconnecting...");
     setupWiFi();
+    lastWifiAttempt = millis();
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
   }
   
   // Check all services periodically
@@ -2261,6 +2275,8 @@ void setupWiFi() {
   Serial.println(WIFI_SSID);
   
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
   int attempts = 0;
@@ -2506,7 +2522,7 @@ void handleLoRaMessage(String message) {
   Serial.println("=== Packet Processing Complete ===\n");
   
   // Forward the decoded message
-  if (!wifiConnected) {
+  if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected, cannot forward message");
     return;
   }
