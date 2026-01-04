@@ -9,6 +9,7 @@
 #include <mbedtls/sha256.h>
 #include <time.h>
 #include "config.h"
+#include <driver/adc.h>
 #include <lwip/inet_chksum.h>
 #include <lwip/ip.h>
 #include <lwip/ip4.h>
@@ -95,6 +96,75 @@ bool wifiConnected = false;
 unsigned long lastMessageTime = 0;
 int messageCount = 0;
 unsigned long lastPingTime = 0;
+
+// Battery monitoring (Heltec Wireless Stick Lite V3 VBAT on GPIO1)
+struct BatteryStats {
+  float voltage;
+  int percent;
+  bool valid;
+};
+
+BatteryStats lastBatteryStats = {0.0f, 0, false};
+unsigned long lastBatterySampleMs = 0;
+const unsigned long BATTERY_REFRESH_MS = 10000;  // Re-sample every 10s to limit ADC noise
+
+void initBatteryMonitor() {
+#ifdef BATTERY_READ_CONTROL_PIN
+  pinMode(BATTERY_READ_CONTROL_PIN, OUTPUT);
+  digitalWrite(BATTERY_READ_CONTROL_PIN, LOW);
+  delay(10); // Wait for voltage to stabilize
+#endif
+
+#ifdef BATTERY_ADC_PIN
+  pinMode(BATTERY_ADC_PIN, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  adcAttachPin(BATTERY_ADC_PIN);
+#endif
+}
+
+BatteryStats sampleBatteryStats() {
+#ifdef BATTERY_READ_CONTROL_PIN
+  pinMode(BATTERY_READ_CONTROL_PIN, OUTPUT);
+  digitalWrite(BATTERY_READ_CONTROL_PIN, LOW);
+  delay(20); // Allow voltage to stabilize
+#endif
+
+#ifdef BATTERY_ADC_PIN
+  uint32_t mvSum = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++) {
+    mvSum += analogReadMilliVolts(BATTERY_ADC_PIN);
+    delay(2);  // Short delay to stabilize successive ADC readings
+  }
+
+#ifdef BATTERY_READ_CONTROL_PIN
+  // digitalWrite(BATTERY_READ_CONTROL_PIN, HIGH); // Disable to save power?
+#endif
+
+  float avgMv = mvSum / (float)BATTERY_SAMPLES;
+  float voltage = (avgMv / 1000.0f) * BATTERY_DIVIDER_RATIO;
+  
+  // Debug battery reading
+  Serial.printf("Battery: Raw=%0.1fmV, Voltage=%0.3fV (Pin 37=LOW)\n", avgMv, voltage);
+
+  float bounded = constrain(voltage, BATTERY_EMPTY_V, BATTERY_FULL_V);
+  int percent = (int)((bounded - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V) * 100.0f + 0.5f);
+  percent = constrain(percent, 0, 100);
+
+  return {voltage, percent, true};
+#else
+  return {0.0f, 0, false};
+#endif
+}
+
+BatteryStats getBatteryStats() {
+  unsigned long now = millis();
+  if (!lastBatteryStats.valid || now - lastBatterySampleMs > BATTERY_REFRESH_MS) {
+    lastBatteryStats = sampleBatteryStats();
+    lastBatterySampleMs = now;
+  }
+  return lastBatteryStats;
+}
 
 // Simple session tracking for UI/API authentication
 String sessionToken = "";
@@ -1452,6 +1522,8 @@ void setup() {
     delay(25);
   }
   digitalWrite(LED_PIN, LOW);
+
+  initBatteryMonitor();
   
   // Power on the LoRa radio (Vext)
   pinMode(LORA_VEXT_PIN, OUTPUT);
@@ -1606,11 +1678,15 @@ void setup() {
     for (int i = 0; i < serviceCount; i++) {
       if (services[i].isUp) upCount++; else downCount++;
     }
+    BatteryStats battery = getBatteryStats();
+    String batteryValue = battery.valid ? String(battery.percent) + "% (" + String(battery.voltage, 2) + "V)" : "N/A";
+    String batteryColor = battery.valid ? (battery.percent >= 50 ? "#48bb78" : (battery.percent >= 20 ? "#d69e2e" : "#f56565")) : "#718096";
     html += "<div class='stats'>";
     html += "<div class='stat-card'><div class='stat-value'>" + String(serviceCount) + "</div><div class='stat-label'>Total Services</div></div>";
     html += "<div class='stat-card'><div class='stat-value' style='color:#48bb78'>" + String(upCount) + "</div><div class='stat-label'>Online</div></div>";
     html += "<div class='stat-card'><div class='stat-value' style='color:#f56565'>" + String(downCount) + "</div><div class='stat-label'>Offline</div></div>";
     html += "<div class='stat-card'><div class='stat-value'>" + String(millis() / 1000 / 60) + "m</div><div class='stat-label'>Uptime</div></div>";
+    html += "<div class='stat-card'><div class='stat-value' style='color:" + batteryColor + "'>" + batteryValue + "</div><div class='stat-label'>Battery</div></div>";
     html += "</div>";
     
     // Services
@@ -1823,11 +1899,15 @@ void setup() {
     for (int i = 0; i < serviceCount; i++) {
       if (services[i].isUp) upCount++; else downCount++;
     }
+    BatteryStats battery = getBatteryStats();
+    String batteryValue = battery.valid ? String(battery.percent) + "% (" + String(battery.voltage, 2) + "V)" : "N/A";
+    String batteryColor = battery.valid ? (battery.percent >= 50 ? "#22c55e" : (battery.percent >= 20 ? "#eab308" : "#ef4444")) : "#cbd5e1";
     html += "<div class='stats'>";
     html += "<div class='stat'><div class='value'>" + String(serviceCount) + "</div><div class='label'>Total</div></div>";
     html += "<div class='stat'><div class='value' style='color:#22c55e'>" + String(upCount) + "</div><div class='label'>Online</div></div>";
     html += "<div class='stat'><div class='value' style='color:#ef4444'>" + String(downCount) + "</div><div class='label'>Offline</div></div>";
     html += "<div class='stat'><div class='value'>" + String(millis() / 1000 / 60) + "m</div><div class='label'>Uptime</div></div>";
+    html += "<div class='stat'><div class='value' style='color:" + batteryColor + "'>" + batteryValue + "</div><div class='label'>Battery</div></div>";
     html += "</div>";
 
     html += "<div class='services'>";

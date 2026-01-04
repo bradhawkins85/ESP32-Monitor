@@ -26,6 +26,32 @@
 #define LED_PIN 35
 #endif
 
+// Battery monitor (Heltec WSL3 VBAT is available on GPIO1)
+// Note: Vext (GPIO 36) and ADC_CTRL (GPIO 37) must be LOW to read battery.
+#ifndef BATTERY_ADC_PIN
+#define BATTERY_ADC_PIN 1
+#endif
+
+#ifndef BATTERY_READ_CONTROL_PIN
+#define BATTERY_READ_CONTROL_PIN 37
+#endif
+
+#ifndef BATTERY_DIVIDER_RATIO
+#define BATTERY_DIVIDER_RATIO 5.04f  // Calibrated from 5.00f (4.09V -> 4.12V)
+#endif
+
+#ifndef BATTERY_FULL_V
+#define BATTERY_FULL_V 4.20f
+#endif
+
+#ifndef BATTERY_EMPTY_V
+#define BATTERY_EMPTY_V 3.30f
+#endif
+
+#ifndef BATTERY_SAMPLES
+#define BATTERY_SAMPLES 8
+#endif
+
 // Admin Authentication (used for UI/API/OTA access)
 #ifndef ADMIN_USERNAME
 #define ADMIN_USERNAME "admin"
@@ -94,7 +120,7 @@
 #endif
 
 #ifndef LORA_VEXT_PIN
-#define LORA_VEXT_PIN 21
+#define LORA_VEXT_PIN 36
 #endif
 
 #ifndef LORA_TCXO_VOLTAGE
