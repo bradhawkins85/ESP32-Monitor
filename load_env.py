@@ -74,6 +74,14 @@ string_vars = {
 # Numeric vars (no quotes)
 int_vars = {
     "LED_PIN": os.environ.get("LED_PIN", "35"),
+    "LORA_SPREADING_FACTOR": os.environ.get("LORA_SPREADING_FACTOR", "7"),
+    "LORA_CODING_RATE": os.environ.get("LORA_CODING_RATE", "5"),
+}
+
+# Float vars (no quotes)
+float_vars = {
+    "LORA_FREQ": os.environ.get("LORA_FREQ", "915.0"),
+    "LORA_BANDWIDTH": os.environ.get("LORA_BANDWIDTH", "125.0"),
 }
 
 # Handle boolean values (no quotes needed for preprocessor)
@@ -100,6 +108,9 @@ for key, value in string_vars.items():
     header_lines.append(f'#define {key} "{escaped}"')
 
 for key, value in int_vars.items():
+    header_lines.append(f'#define {key} {value}')
+
+for key, value in float_vars.items():
     header_lines.append(f'#define {key} {value}')
 
 for key, value in bool_defines.items():

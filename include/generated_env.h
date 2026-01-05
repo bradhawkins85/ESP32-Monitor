@@ -22,6 +22,10 @@
 #define WEBHOOK_URL "https://example.com/webhook"
 #define WEBHOOK_METHOD "POST"
 #define LED_PIN 35
+#define LORA_SPREADING_FACTOR 8
+#define LORA_CODING_RATE 5
+#define LORA_FREQ 923.125
+#define LORA_BANDWIDTH 62.5
 #define LORA_ENABLED 1
 #define DISCORD_ENABLED 0
 #define NTFY_ENABLED 1

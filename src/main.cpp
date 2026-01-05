@@ -97,6 +97,245 @@ unsigned long lastMessageTime = 0;
 int messageCount = 0;
 unsigned long lastPingTime = 0;
 
+// Scheduled reboot (used when settings require restart)
+bool pendingRestart = false;
+unsigned long restartAtMs = 0;
+
+// ============================================
+// Runtime Settings (defaults from .env at build time; overrides from /settings)
+// ============================================
+struct Settings {
+  // WiFi
+  String wifiSsid;
+  String wifiPassword;
+
+  // Admin
+  String adminUsername;
+  String adminPassword;
+
+  // LoRa / MeshCore channel
+  String channelName;
+  String channelSecret;
+
+  // LoRa radio parameters
+  bool loraEnabled;
+  float loraFreq;
+  float loraBandwidth;
+  int loraSpreadingFactor;
+  int loraCodingRate;
+
+  // Ntfy
+  bool ntfyEnabled;
+  bool ntfyMeshRelay;
+  String ntfyServer;
+  String ntfyTopic;
+  String ntfyUsername;
+  String ntfyPassword;
+  String ntfyToken;
+
+  // Discord
+  bool discordEnabled;
+  bool discordMeshRelay;
+  String discordWebhookUrl;
+
+  // Webhook
+  bool webhookEnabled;
+  bool webhookMeshRelay;
+  String webhookUrl;
+  String webhookMethod;
+
+  // Email (placeholder)
+  bool emailEnabled;
+  bool emailMeshRelay;
+  String smtpHost;
+  int smtpPort;
+  String emailRecipient;
+  String emailSender;
+  String smtpUser;
+  String smtpPassword;
+};
+
+Settings settings;
+
+Settings defaultSettingsFromBuild() {
+  Settings s;
+  s.wifiSsid = String(WIFI_SSID);
+  s.wifiPassword = String(WIFI_PASSWORD);
+
+  s.adminUsername = String(ADMIN_USERNAME);
+  s.adminPassword = String(ADMIN_PASSWORD);
+
+  s.channelName = String(CHANNEL_NAME);
+  s.channelSecret = String(CHANNEL_SECRET);
+
+  s.loraEnabled = (LORA_ENABLED != 0);
+  s.loraFreq = (float)LORA_FREQ;
+  s.loraBandwidth = (float)LORA_BANDWIDTH;
+  s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
+  s.loraCodingRate = (int)LORA_CODING_RATE;
+
+  s.ntfyEnabled = (NTFY_ENABLED != 0);
+  s.ntfyMeshRelay = (NTFY_MESH_RELAY != 0);
+  s.ntfyServer = String(NTFY_SERVER);
+  s.ntfyTopic = String(NTFY_TOPIC);
+  s.ntfyUsername = String(NTFY_USERNAME);
+  s.ntfyPassword = String(NTFY_PASSWORD);
+  s.ntfyToken = String(NTFY_TOKEN);
+
+  s.discordEnabled = (DISCORD_ENABLED != 0);
+  s.discordMeshRelay = (DISCORD_MESH_RELAY != 0);
+  s.discordWebhookUrl = String(DISCORD_WEBHOOK_URL);
+
+  s.webhookEnabled = (WEBHOOK_ENABLED != 0);
+  s.webhookMeshRelay = (WEBHOOK_MESH_RELAY != 0);
+  s.webhookUrl = String(WEBHOOK_URL);
+  s.webhookMethod = String(WEBHOOK_METHOD);
+
+  s.emailEnabled = (EMAIL_ENABLED != 0);
+  s.emailMeshRelay = (EMAIL_MESH_RELAY != 0);
+  s.smtpHost = String(SMTP_HOST);
+  s.smtpPort = String(SMTP_PORT).toInt();
+  s.emailRecipient = String(EMAIL_RECIPIENT);
+  s.emailSender = String(EMAIL_SENDER);
+  s.smtpUser = String(SMTP_USER);
+  s.smtpPassword = String(SMTP_PASSWORD);
+  return s;
+}
+
+static const char* SETTINGS_FILE = "/settings.json";
+
+void applySettingsDefaults() {
+  settings = defaultSettingsFromBuild();
+}
+
+void loadSettingsOverrides() {
+  if (!LittleFS.exists(SETTINGS_FILE)) {
+    return;
+  }
+
+  File file = LittleFS.open(SETTINGS_FILE, "r");
+  if (!file) {
+    Serial.println("Failed to open settings.json");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, file);
+  file.close();
+  if (err) {
+    Serial.printf("Failed to parse settings.json: %s\n", err.c_str());
+    return;
+  }
+
+  // Strings
+  if (doc["WIFI_SSID"].is<String>()) settings.wifiSsid = doc["WIFI_SSID"].as<String>();
+  if (doc["WIFI_PASSWORD"].is<String>()) settings.wifiPassword = doc["WIFI_PASSWORD"].as<String>();
+  if (doc["ADMIN_USERNAME"].is<String>()) settings.adminUsername = doc["ADMIN_USERNAME"].as<String>();
+  if (doc["ADMIN_PASSWORD"].is<String>()) settings.adminPassword = doc["ADMIN_PASSWORD"].as<String>();
+  if (doc["CHANNEL_NAME"].is<String>()) settings.channelName = doc["CHANNEL_NAME"].as<String>();
+  if (doc["CHANNEL_SECRET"].is<String>()) settings.channelSecret = doc["CHANNEL_SECRET"].as<String>();
+
+  // LoRa radio parameters
+  if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
+  if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
+  if (doc["LORA_FREQ"].is<double>()) settings.loraFreq = (float)doc["LORA_FREQ"].as<double>();
+  if (doc["LORA_FREQ"].is<String>()) settings.loraFreq = doc["LORA_FREQ"].as<String>().toFloat();
+
+  if (doc["LORA_BANDWIDTH"].is<float>()) settings.loraBandwidth = doc["LORA_BANDWIDTH"].as<float>();
+  if (doc["LORA_BANDWIDTH"].is<double>()) settings.loraBandwidth = (float)doc["LORA_BANDWIDTH"].as<double>();
+  if (doc["LORA_BANDWIDTH"].is<String>()) settings.loraBandwidth = doc["LORA_BANDWIDTH"].as<String>().toFloat();
+
+  if (doc["LORA_SPREADING_FACTOR"].is<int>()) settings.loraSpreadingFactor = doc["LORA_SPREADING_FACTOR"].as<int>();
+  if (doc["LORA_SPREADING_FACTOR"].is<String>()) settings.loraSpreadingFactor = doc["LORA_SPREADING_FACTOR"].as<String>().toInt();
+
+  if (doc["LORA_CODING_RATE"].is<int>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<int>();
+  if (doc["LORA_CODING_RATE"].is<String>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<String>().toInt();
+
+  if (doc["NTFY_SERVER"].is<String>()) settings.ntfyServer = doc["NTFY_SERVER"].as<String>();
+  if (doc["NTFY_TOPIC"].is<String>()) settings.ntfyTopic = doc["NTFY_TOPIC"].as<String>();
+  if (doc["NTFY_USERNAME"].is<String>()) settings.ntfyUsername = doc["NTFY_USERNAME"].as<String>();
+  if (doc["NTFY_PASSWORD"].is<String>()) settings.ntfyPassword = doc["NTFY_PASSWORD"].as<String>();
+  if (doc["NTFY_TOKEN"].is<String>()) settings.ntfyToken = doc["NTFY_TOKEN"].as<String>();
+
+  if (doc["DISCORD_WEBHOOK_URL"].is<String>()) settings.discordWebhookUrl = doc["DISCORD_WEBHOOK_URL"].as<String>();
+  if (doc["WEBHOOK_URL"].is<String>()) settings.webhookUrl = doc["WEBHOOK_URL"].as<String>();
+  if (doc["WEBHOOK_METHOD"].is<String>()) settings.webhookMethod = doc["WEBHOOK_METHOD"].as<String>();
+
+  if (doc["SMTP_HOST"].is<String>()) settings.smtpHost = doc["SMTP_HOST"].as<String>();
+  if (doc["SMTP_PORT"].is<int>()) settings.smtpPort = doc["SMTP_PORT"].as<int>();
+  if (doc["SMTP_PORT"].is<String>()) settings.smtpPort = doc["SMTP_PORT"].as<String>().toInt();
+  if (doc["EMAIL_RECIPIENT"].is<String>()) settings.emailRecipient = doc["EMAIL_RECIPIENT"].as<String>();
+  if (doc["EMAIL_SENDER"].is<String>()) settings.emailSender = doc["EMAIL_SENDER"].as<String>();
+  if (doc["SMTP_USER"].is<String>()) settings.smtpUser = doc["SMTP_USER"].as<String>();
+  if (doc["SMTP_PASSWORD"].is<String>()) settings.smtpPassword = doc["SMTP_PASSWORD"].as<String>();
+
+  // Booleans
+  if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
+  if (doc["NTFY_MESH_RELAY"].is<bool>()) settings.ntfyMeshRelay = doc["NTFY_MESH_RELAY"].as<bool>();
+  if (doc["DISCORD_ENABLED"].is<bool>()) settings.discordEnabled = doc["DISCORD_ENABLED"].as<bool>();
+  if (doc["DISCORD_MESH_RELAY"].is<bool>()) settings.discordMeshRelay = doc["DISCORD_MESH_RELAY"].as<bool>();
+  if (doc["WEBHOOK_ENABLED"].is<bool>()) settings.webhookEnabled = doc["WEBHOOK_ENABLED"].as<bool>();
+  if (doc["WEBHOOK_MESH_RELAY"].is<bool>()) settings.webhookMeshRelay = doc["WEBHOOK_MESH_RELAY"].as<bool>();
+  if (doc["EMAIL_ENABLED"].is<bool>()) settings.emailEnabled = doc["EMAIL_ENABLED"].as<bool>();
+  if (doc["EMAIL_MESH_RELAY"].is<bool>()) settings.emailMeshRelay = doc["EMAIL_MESH_RELAY"].as<bool>();
+}
+
+bool saveSettingsOverrides() {
+  File file = LittleFS.open(SETTINGS_FILE, "w");
+  if (!file) {
+    Serial.println("Failed to open settings.json for writing");
+    return false;
+  }
+
+  JsonDocument doc;
+  doc["WIFI_SSID"] = settings.wifiSsid;
+  doc["WIFI_PASSWORD"] = settings.wifiPassword;
+  doc["ADMIN_USERNAME"] = settings.adminUsername;
+  doc["ADMIN_PASSWORD"] = settings.adminPassword;
+  doc["CHANNEL_NAME"] = settings.channelName;
+  doc["CHANNEL_SECRET"] = settings.channelSecret;
+
+  doc["LORA_ENABLED"] = settings.loraEnabled;
+  doc["LORA_FREQ"] = settings.loraFreq;
+  doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
+  doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
+  doc["LORA_CODING_RATE"] = settings.loraCodingRate;
+
+  doc["NTFY_ENABLED"] = settings.ntfyEnabled;
+  doc["NTFY_MESH_RELAY"] = settings.ntfyMeshRelay;
+  doc["NTFY_SERVER"] = settings.ntfyServer;
+  doc["NTFY_TOPIC"] = settings.ntfyTopic;
+  doc["NTFY_USERNAME"] = settings.ntfyUsername;
+  doc["NTFY_PASSWORD"] = settings.ntfyPassword;
+  doc["NTFY_TOKEN"] = settings.ntfyToken;
+
+  doc["DISCORD_ENABLED"] = settings.discordEnabled;
+  doc["DISCORD_MESH_RELAY"] = settings.discordMeshRelay;
+  doc["DISCORD_WEBHOOK_URL"] = settings.discordWebhookUrl;
+
+  doc["WEBHOOK_ENABLED"] = settings.webhookEnabled;
+  doc["WEBHOOK_MESH_RELAY"] = settings.webhookMeshRelay;
+  doc["WEBHOOK_URL"] = settings.webhookUrl;
+  doc["WEBHOOK_METHOD"] = settings.webhookMethod;
+
+  doc["EMAIL_ENABLED"] = settings.emailEnabled;
+  doc["EMAIL_MESH_RELAY"] = settings.emailMeshRelay;
+  doc["SMTP_HOST"] = settings.smtpHost;
+  doc["SMTP_PORT"] = settings.smtpPort;
+  doc["EMAIL_RECIPIENT"] = settings.emailRecipient;
+  doc["EMAIL_SENDER"] = settings.emailSender;
+  doc["SMTP_USER"] = settings.smtpUser;
+  doc["SMTP_PASSWORD"] = settings.smtpPassword;
+
+  if (serializeJson(doc, file) == 0) {
+    file.close();
+    Serial.println("Failed to write settings.json");
+    return false;
+  }
+  file.close();
+  return true;
+}
+
 // Battery monitoring (Heltec Wireless Stick Lite V3 VBAT on GPIO1)
 struct BatteryStats {
   float voltage;
@@ -529,7 +768,7 @@ void initNodeIdentity() {
 
 // Send LoRa notification for service status changes
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message) {
-#if LORA_ENABLED
+  if (!settings.loraEnabled) return;
   String notification = "[Monitor] " + serviceName + ": " + (isUp ? "UP" : "DOWN");
   if (message.length() > 0) {
     notification += " - " + message;
@@ -539,7 +778,7 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   uint8_t channelHash;
   uint8_t channelKey[32];
   size_t channelKeyLen = 0;
-  deriveChannelKey(CHANNEL_NAME, CHANNEL_SECRET, &channelHash, channelKey, &channelKeyLen);
+  deriveChannelKey(settings.channelName.c_str(), settings.channelSecret.c_str(), &channelHash, channelKey, &channelKeyLen);
   
   // Get MAC address for node name
   uint8_t mac[6];
@@ -611,7 +850,6 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   
   // Return to RX mode
   radio.startReceive();
-#endif
 }
 
 // Uptime Monitoring Check Functions
@@ -1432,7 +1670,7 @@ void sendPingPacket() {
   size_t channelKeyLen = 0;
   static uint32_t pingCounter = 0;
 
-  deriveChannelKey(CHANNEL_NAME, CHANNEL_SECRET, &channelHash, channelKey, &channelKeyLen);
+  deriveChannelKey(settings.channelName.c_str(), settings.channelSecret.c_str(), &channelHash, channelKey, &channelKeyLen);
 
   // Get MAC address for logging
   uint8_t mac[6];
@@ -1495,7 +1733,7 @@ void sendPingPacket() {
   pktIdx += macCipherLen;
 
   Serial.printf("Sending ping on channel %s from %s: '%s' (timestamp=%u, len=%u)\n", 
-                CHANNEL_NAME, nodeName, message.c_str(), timestamp, (unsigned int)pktIdx);
+                settings.channelName.c_str(), nodeName, message.c_str(), timestamp, (unsigned int)pktIdx);
 
   int state = radio.transmit(packet, pktIdx);
   if (state == RADIOLIB_ERR_NONE) {
@@ -1529,6 +1767,22 @@ void setup() {
   pinMode(LORA_VEXT_PIN, OUTPUT);
   digitalWrite(LORA_VEXT_PIN, LOW);  // LOW = power on
   delay(100);
+
+  // Initialize LittleFS early (settings/services depend on it)
+  if (!LittleFS.begin(false)) {
+    Serial.println("LittleFS mount failed! Attempting to format...");
+    if (LittleFS.begin(true)) {
+      Serial.println("LittleFS formatted and mounted successfully.");
+    } else {
+      Serial.println("LittleFS format failed!");
+    }
+  } else {
+    Serial.println("LittleFS mounted successfully.");
+  }
+
+  // Load runtime settings: build-time defaults (.env) + optional overrides (/settings.json)
+  applySettingsDefaults();
+  loadSettingsOverrides();
   
   // Setup WiFi (needed for forwarding and NTP sync)
   setupWiFi();
@@ -1542,21 +1796,13 @@ void setup() {
   }
   
   // Setup LoRa
-  setupLoRa();
+  if (settings.loraEnabled) {
+    setupLoRa();
+  } else {
+    Serial.println("LoRa disabled by settings; skipping radio init");
+  }
   
   Serial.println("System Ready");
-
-  // Initialize LittleFS
-  if (!LittleFS.begin(false)) {
-    Serial.println("LittleFS mount failed! Attempting to format...");
-    if (LittleFS.begin(true)) {
-      Serial.println("LittleFS formatted and mounted successfully.");
-    } else {
-      Serial.println("LittleFS format failed!");
-    }
-  } else {
-    Serial.println("LittleFS mounted successfully.");
-  }
 
   // Load services from LittleFS (or initialize demo services if file doesn't exist)
   loadServices();
@@ -1574,7 +1820,7 @@ void setup() {
       String username = doc["username"].as<String>();
       String password = doc["password"].as<String>();
 
-      if (username == ADMIN_USERNAME && password == ADMIN_PASSWORD) {
+      if (username == settings.adminUsername && password == settings.adminPassword) {
         sessionToken = generateSessionToken();
         sessionIssuedAt = millis();
         AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"status\":\"ok\"}");
@@ -1593,6 +1839,294 @@ void setup() {
     resp->addHeader("Set-Cookie", "SESSION=deleted; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax");
     resp->addHeader("Cache-Control", "no-store");
     request->send(resp);
+  });
+
+  // Settings API (protected)
+  server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    JsonDocument doc;
+    doc["WIFI_SSID"] = settings.wifiSsid;
+    doc["ADMIN_USERNAME"] = settings.adminUsername;
+    doc["CHANNEL_NAME"] = settings.channelName;
+
+    doc["LORA_ENABLED"] = settings.loraEnabled;
+    doc["LORA_FREQ"] = settings.loraFreq;
+    doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
+    doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
+    doc["LORA_CODING_RATE"] = settings.loraCodingRate;
+
+    doc["NTFY_ENABLED"] = settings.ntfyEnabled;
+    doc["NTFY_MESH_RELAY"] = settings.ntfyMeshRelay;
+    doc["NTFY_SERVER"] = settings.ntfyServer;
+    doc["NTFY_TOPIC"] = settings.ntfyTopic;
+    doc["NTFY_USERNAME"] = settings.ntfyUsername;
+
+    doc["DISCORD_ENABLED"] = settings.discordEnabled;
+    doc["DISCORD_MESH_RELAY"] = settings.discordMeshRelay;
+
+    doc["WEBHOOK_ENABLED"] = settings.webhookEnabled;
+    doc["WEBHOOK_MESH_RELAY"] = settings.webhookMeshRelay;
+    doc["WEBHOOK_METHOD"] = settings.webhookMethod;
+
+    doc["EMAIL_ENABLED"] = settings.emailEnabled;
+    doc["EMAIL_MESH_RELAY"] = settings.emailMeshRelay;
+    doc["SMTP_HOST"] = settings.smtpHost;
+    doc["SMTP_PORT"] = settings.smtpPort;
+    doc["EMAIL_RECIPIENT"] = settings.emailRecipient;
+    doc["EMAIL_SENDER"] = settings.emailSender;
+    doc["SMTP_USER"] = settings.smtpUser;
+
+    String json;
+    serializeJson(doc, json);
+    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", json);
+    resp->addHeader("Cache-Control", "no-store");
+    request->send(resp);
+  });
+
+  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+  }, nullptr,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (!isAuthenticated(request)) return;
+      if (index == 0) {
+        String *body = new String();
+        body->reserve(total);
+        request->_tempObject = body;
+      }
+
+      String *body = static_cast<String *>(request->_tempObject);
+      if (!body) {
+        request->send(500, "application/json", "{\"error\":\"server error\"}");
+        return;
+      }
+
+      body->concat(reinterpret_cast<const char *>(data), len);
+      if (index + len < total) return;
+
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, *body);
+      delete body;
+      request->_tempObject = nullptr;
+
+      if (err) {
+        request->send(400, "application/json", "{\"error\":\"invalid json\"}");
+        return;
+      }
+
+      Settings before = settings;
+
+      // Strings
+      if (doc["WIFI_SSID"].is<String>()) settings.wifiSsid = doc["WIFI_SSID"].as<String>();
+      if (doc["WIFI_PASSWORD"].is<String>()) {
+        String v = doc["WIFI_PASSWORD"].as<String>();
+        if (v.length() > 0) settings.wifiPassword = v;
+      }
+      if (doc["ADMIN_USERNAME"].is<String>()) settings.adminUsername = doc["ADMIN_USERNAME"].as<String>();
+      if (doc["ADMIN_PASSWORD"].is<String>()) {
+        String v = doc["ADMIN_PASSWORD"].as<String>();
+        if (v.length() > 0) settings.adminPassword = v;
+      }
+      if (doc["CHANNEL_NAME"].is<String>()) settings.channelName = doc["CHANNEL_NAME"].as<String>();
+      if (doc["CHANNEL_SECRET"].is<String>()) {
+        String v = doc["CHANNEL_SECRET"].as<String>();
+        if (v.length() > 0) settings.channelSecret = v;
+      }
+
+      if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
+
+      // LoRa radio parameters
+      if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
+      if (doc["LORA_FREQ"].is<double>()) settings.loraFreq = (float)doc["LORA_FREQ"].as<double>();
+      if (doc["LORA_FREQ"].is<String>()) settings.loraFreq = doc["LORA_FREQ"].as<String>().toFloat();
+
+      if (doc["LORA_BANDWIDTH"].is<float>()) settings.loraBandwidth = doc["LORA_BANDWIDTH"].as<float>();
+      if (doc["LORA_BANDWIDTH"].is<double>()) settings.loraBandwidth = (float)doc["LORA_BANDWIDTH"].as<double>();
+      if (doc["LORA_BANDWIDTH"].is<String>()) settings.loraBandwidth = doc["LORA_BANDWIDTH"].as<String>().toFloat();
+
+      if (doc["LORA_SPREADING_FACTOR"].is<int>()) settings.loraSpreadingFactor = doc["LORA_SPREADING_FACTOR"].as<int>();
+      if (doc["LORA_SPREADING_FACTOR"].is<String>()) settings.loraSpreadingFactor = doc["LORA_SPREADING_FACTOR"].as<String>().toInt();
+
+      if (doc["LORA_CODING_RATE"].is<int>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<int>();
+      if (doc["LORA_CODING_RATE"].is<String>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<String>().toInt();
+
+      if (doc["NTFY_SERVER"].is<String>()) settings.ntfyServer = doc["NTFY_SERVER"].as<String>();
+      if (doc["NTFY_TOPIC"].is<String>()) settings.ntfyTopic = doc["NTFY_TOPIC"].as<String>();
+      if (doc["NTFY_USERNAME"].is<String>()) settings.ntfyUsername = doc["NTFY_USERNAME"].as<String>();
+      if (doc["NTFY_PASSWORD"].is<String>()) {
+        String v = doc["NTFY_PASSWORD"].as<String>();
+        if (v.length() > 0) settings.ntfyPassword = v;
+      }
+      if (doc["NTFY_TOKEN"].is<String>()) {
+        String v = doc["NTFY_TOKEN"].as<String>();
+        if (v.length() > 0) settings.ntfyToken = v;
+      }
+
+      if (doc["DISCORD_WEBHOOK_URL"].is<String>()) {
+        String v = doc["DISCORD_WEBHOOK_URL"].as<String>();
+        if (v.length() > 0) settings.discordWebhookUrl = v;
+      }
+
+      if (doc["WEBHOOK_URL"].is<String>()) {
+        String v = doc["WEBHOOK_URL"].as<String>();
+        if (v.length() > 0) settings.webhookUrl = v;
+      }
+      if (doc["WEBHOOK_METHOD"].is<String>()) settings.webhookMethod = doc["WEBHOOK_METHOD"].as<String>();
+
+      if (doc["SMTP_HOST"].is<String>()) settings.smtpHost = doc["SMTP_HOST"].as<String>();
+      if (doc["SMTP_PORT"].is<int>()) settings.smtpPort = doc["SMTP_PORT"].as<int>();
+      if (doc["SMTP_PORT"].is<String>()) settings.smtpPort = doc["SMTP_PORT"].as<String>().toInt();
+      if (doc["EMAIL_RECIPIENT"].is<String>()) settings.emailRecipient = doc["EMAIL_RECIPIENT"].as<String>();
+      if (doc["EMAIL_SENDER"].is<String>()) settings.emailSender = doc["EMAIL_SENDER"].as<String>();
+      if (doc["SMTP_USER"].is<String>()) settings.smtpUser = doc["SMTP_USER"].as<String>();
+      if (doc["SMTP_PASSWORD"].is<String>()) {
+        String v = doc["SMTP_PASSWORD"].as<String>();
+        if (v.length() > 0) settings.smtpPassword = v;
+      }
+
+      // Booleans
+      if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
+      if (doc["NTFY_MESH_RELAY"].is<bool>()) settings.ntfyMeshRelay = doc["NTFY_MESH_RELAY"].as<bool>();
+      if (doc["DISCORD_ENABLED"].is<bool>()) settings.discordEnabled = doc["DISCORD_ENABLED"].as<bool>();
+      if (doc["DISCORD_MESH_RELAY"].is<bool>()) settings.discordMeshRelay = doc["DISCORD_MESH_RELAY"].as<bool>();
+      if (doc["WEBHOOK_ENABLED"].is<bool>()) settings.webhookEnabled = doc["WEBHOOK_ENABLED"].as<bool>();
+      if (doc["WEBHOOK_MESH_RELAY"].is<bool>()) settings.webhookMeshRelay = doc["WEBHOOK_MESH_RELAY"].as<bool>();
+      if (doc["EMAIL_ENABLED"].is<bool>()) settings.emailEnabled = doc["EMAIL_ENABLED"].as<bool>();
+      if (doc["EMAIL_MESH_RELAY"].is<bool>()) settings.emailMeshRelay = doc["EMAIL_MESH_RELAY"].as<bool>();
+
+      // Normalize
+      if (settings.webhookMethod.length() == 0) settings.webhookMethod = "POST";
+
+      if (settings.loraFreq <= 0.0f) settings.loraFreq = (float)LORA_FREQ;
+      if (settings.loraBandwidth <= 0.0f) settings.loraBandwidth = (float)LORA_BANDWIDTH;
+      if (settings.loraSpreadingFactor <= 0) settings.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
+      if (settings.loraCodingRate <= 0) settings.loraCodingRate = (int)LORA_CODING_RATE;
+
+      if (!saveSettingsOverrides()) {
+        request->send(500, "application/json", "{\"error\":\"failed to save\"}");
+        return;
+      }
+
+      // Apply changes that can be applied live (WiFi)
+      bool wifiChanged = (before.wifiSsid != settings.wifiSsid) || (before.wifiPassword != settings.wifiPassword);
+      if (wifiChanged) {
+        Serial.println("Settings updated: WiFi changed; reconnecting...");
+        setupWiFi();
+      }
+
+      // LoRa settings require reboot (RadioLib init happens at boot)
+      float freqDiff = settings.loraFreq - before.loraFreq;
+      if (freqDiff < 0) freqDiff = -freqDiff;
+      float bwDiff = settings.loraBandwidth - before.loraBandwidth;
+      if (bwDiff < 0) bwDiff = -bwDiff;
+      bool loraChanged = (before.loraEnabled != settings.loraEnabled) ||
+                        (freqDiff > 0.0001f) ||
+                        (bwDiff > 0.0001f) ||
+                        (before.loraSpreadingFactor != settings.loraSpreadingFactor) ||
+                        (before.loraCodingRate != settings.loraCodingRate);
+      if (loraChanged) {
+        Serial.println("Settings updated: LoRa settings changed; scheduling reboot...");
+        pendingRestart = true;
+        restartAtMs = millis() + 1500;
+      }
+
+      request->send(200, "application/json", loraChanged ? "{\"status\":\"ok\",\"rebooting\":true}" : "{\"status\":\"ok\"}");
+    }
+  );
+
+  // Settings page (protected)
+  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    page += "<title>Settings</title><style>";
+    page += "*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f7fafc;padding:20px;color:#2d3748}";
+    page += ".container{max-width:900px;margin:0 auto}.card{background:#fff;border-radius:14px;padding:22px;box-shadow:0 8px 24px rgba(0,0,0,0.08);margin-bottom:16px}";
+    page += "h1{font-size:22px;margin-bottom:10px}h2{font-size:16px;margin:18px 0 10px;color:#4a5568}";
+    page += ".row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fg{margin-bottom:12px}.lbl{display:block;font-weight:600;margin-bottom:6px;font-size:13px;color:#2d3748}";
+    page += "input,select{width:100%;padding:10px 12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px}input:focus,select:focus{outline:none;border-color:#667eea}";
+    page += ".btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.btn{padding:10px 14px;border:none;border-radius:10px;cursor:pointer;font-weight:700}";
+    page += ".primary{background:#667eea;color:#fff}.secondary{background:#e2e8f0;color:#2d3748}.hint{font-size:12px;color:#718096;margin-top:6px}";
+    page += "@media(max-width:700px){.row{grid-template-columns:1fr}}";
+    page += "</style></head><body><div class='container'>";
+    page += "<div class='card'><h1>Settings</h1><div class='hint'>Saved settings override build-time .env defaults. Passwords/tokens are never displayed; leaving them blank keeps the existing value.</div></div>";
+
+    page += "<div class='card'><h2>WiFi</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>SSID</label><input id='WIFI_SSID' value='" + settings.wifiSsid + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Password</label><input id='WIFI_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>Admin</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Username</label><input id='ADMIN_USERNAME' value='" + settings.adminUsername + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Password</label><input id='ADMIN_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>LoRa / MeshCore</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Channel Name</label><input id='CHANNEL_NAME' value='" + settings.channelName + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Channel Secret</label><input id='CHANNEL_SECRET' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "<div class='fg'><label class='lbl'>LoRa Enabled</label><select id='LORA_ENABLED'><option value='true'" + String(settings.loraEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Frequency (MHz)</label><input id='LORA_FREQ' type='number' step='0.001' value='" + String(settings.loraFreq, 3) + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Bandwidth (kHz)</label><input id='LORA_BANDWIDTH' type='number' step='0.1' value='" + String(settings.loraBandwidth, 1) + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Spreading Factor</label><input id='LORA_SPREADING_FACTOR' type='number' min='6' max='12' step='1' value='" + String(settings.loraSpreadingFactor) + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Coding Rate (4/x)</label><input id='LORA_CODING_RATE' type='number' min='5' max='8' step='1' value='" + String(settings.loraCodingRate) + "'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>Ntfy</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='NTFY_ENABLED'><option value='true'" + String(settings.ntfyEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='NTFY_MESH_RELAY'><option value='true'" + String(settings.ntfyMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Server</label><input id='NTFY_SERVER' value='" + settings.ntfyServer + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Topic</label><input id='NTFY_TOPIC' value='" + settings.ntfyTopic + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Username</label><input id='NTFY_USERNAME' value='" + settings.ntfyUsername + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Password</label><input id='NTFY_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "<div class='fg'><label class='lbl'>Token</label><input id='NTFY_TOKEN' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>Discord</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='DISCORD_ENABLED'><option value='true'" + String(settings.discordEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.discordEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='DISCORD_MESH_RELAY'><option value='true'" + String(settings.discordMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.discordMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>Webhook URL</label><input id='DISCORD_WEBHOOK_URL' value='" + settings.discordWebhookUrl + "'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>Webhook</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='WEBHOOK_ENABLED'><option value='true'" + String(settings.webhookEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.webhookEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='WEBHOOK_MESH_RELAY'><option value='true'" + String(settings.webhookMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.webhookMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Method</label><select id='WEBHOOK_METHOD'><option value='POST'" + String(settings.webhookMethod == "POST" ? " selected" : "") + ">POST</option><option value='PUT'" + String(settings.webhookMethod == "PUT" ? " selected" : "") + ">PUT</option></select></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>URL</label><input id='WEBHOOK_URL' value='" + settings.webhookUrl + "'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>Email</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='EMAIL_ENABLED'><option value='true'" + String(settings.emailEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.emailEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='EMAIL_MESH_RELAY'><option value='true'" + String(settings.emailMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.emailMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>SMTP Host</label><input id='SMTP_HOST' value='" + settings.smtpHost + "'></div>";
+    page += "<div class='fg'><label class='lbl'>SMTP Port</label><input id='SMTP_PORT' value='" + String(settings.smtpPort) + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Recipient</label><input id='EMAIL_RECIPIENT' value='" + settings.emailRecipient + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Sender</label><input id='EMAIL_SENDER' value='" + settings.emailSender + "'></div>";
+    page += "<div class='fg'><label class='lbl'>SMTP User</label><input id='SMTP_USER' value='" + settings.smtpUser + "'></div>";
+    page += "<div class='fg'><label class='lbl'>SMTP Password</label><input id='SMTP_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><div class='btns'>";
+    page += "<button class='btn primary' onclick='save()'>Save</button>";
+    page += "<button class='btn secondary' onclick='location.href=\"/\"'>Back</button>";
+    page += "</div><div class='hint'>WiFi changes reconnect automatically. LoRa changes reboot the device automatically.</div></div>";
+
+    page += "</div><script>";
+    page += "function val(id){return document.getElementById(id).value;}";
+    page += "function boolVal(id){return document.getElementById(id).value==='true';}";
+    page += "async function save(){const payload={";
+    page += "WIFI_SSID:val('WIFI_SSID'),WIFI_PASSWORD:val('WIFI_PASSWORD'),";
+    page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),";
+    page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),";
+    page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),";
+    page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
+    page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
+    page += "WEBHOOK_ENABLED:boolVal('WEBHOOK_ENABLED'),WEBHOOK_MESH_RELAY:boolVal('WEBHOOK_MESH_RELAY'),WEBHOOK_URL:val('WEBHOOK_URL'),WEBHOOK_METHOD:val('WEBHOOK_METHOD'),";
+    page += "EMAIL_ENABLED:boolVal('EMAIL_ENABLED'),EMAIL_MESH_RELAY:boolVal('EMAIL_MESH_RELAY'),SMTP_HOST:val('SMTP_HOST'),SMTP_PORT:val('SMTP_PORT'),EMAIL_RECIPIENT:val('EMAIL_RECIPIENT'),EMAIL_SENDER:val('EMAIL_SENDER'),SMTP_USER:val('SMTP_USER'),SMTP_PASSWORD:val('SMTP_PASSWORD')";
+    page += "};";
+    page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
+    page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
+    page += "}";
+    page += "</script></body></html>";
+    request->send(200, "text/html", page);
   });
 
   // --- Web Server Endpoints ---
@@ -1671,7 +2205,7 @@ void setup() {
     html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.modal-content{padding:24px}}";
     html += "</style></head><body>";
     html += "<div class='container'>";
-    html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div></div>";
+    html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:6px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div></div>";
     
     // Stats cards
     int upCount = 0, downCount = 0;
@@ -1739,6 +2273,7 @@ void setup() {
       html += "</form>";
       html += "<button class='btn btn-secondary' onclick='testNotifications()'>🔔 Test Notifications</button>";
       html += "<button class='btn btn-secondary' onclick='gotoOta()'>⬆️ OTA Update</button>";
+      html += "<button class='btn btn-secondary' onclick='gotoSettings()'>⚙️ Settings</button>";
       html += "<button class='btn btn-secondary' onclick='logout()'>Logout</button>";
     } else {
       html += "<div class='auth-hint'>Login to manage services, import/export configuration, trigger tests, or run OTA updates.</div>";
@@ -1867,7 +2402,8 @@ void setup() {
     html += "function testNotifications(){if(!isAuthed){alert('Login required');return;}if(confirm('Send test notification on all channels?')){";
     html += "fetch('/api/test-notification',{method:'POST',credentials:'include'})";
     html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
-    html += "function gotoOta(){if(!isAuthed){alert('Login required');return;}location.href='/ota';}";
+    html += "function gotoOta(){if(!isAuthed){alert('Login required');return;}window.open('/ota','_blank');}";
+    html += "function gotoSettings(){if(!isAuthed){alert('Login required');return;}window.open('/settings','_blank');}";
     html += "const loginForm=document.getElementById('loginForm');";
     html += "if(loginForm){loginForm.addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(loginForm);const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:fd.get('username'),password:fd.get('password')})});if(res.ok){location.reload();}else{alert('Invalid credentials');}});}";
     html += "function logout(){fetch('/api/logout',{method:'POST',credentials:'include'}).then(()=>location.reload());}";
@@ -2153,22 +2689,11 @@ void setup() {
   server.on("/api/test-notification", HTTP_POST, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
     const String testMsg = "This is a test notification from ESP32 Monitor";
-
-  #if LORA_ENABLED
     sendLoRaNotification("Test", true, testMsg);
-  #endif
-  #if NTFY_ENABLED
-    forwardToNtfy(testMsg);
-  #endif
-  #if DISCORD_ENABLED
-    forwardToDiscord(testMsg);
-  #endif
-  #if WEBHOOK_ENABLED
-    forwardToWebhook(testMsg);
-  #endif
-  #if EMAIL_ENABLED
-    forwardToEmail(testMsg);
-  #endif
+    if (settings.ntfyEnabled) forwardToNtfy(testMsg);
+    if (settings.discordEnabled) forwardToDiscord(testMsg);
+    if (settings.webhookEnabled) forwardToWebhook(testMsg);
+    if (settings.emailEnabled) forwardToEmail(testMsg);
 
     request->send(200, "text/plain", "Test notification triggered on enabled channels");
   });
@@ -2262,21 +2787,12 @@ void setup() {
 
         String combined = source + ": " + message;
 
-#if LORA_ENABLED
         sendLoRaNotification(source, true, message);
-#endif
-#if NTFY_ENABLED
-        forwardToNtfy(combined);
-#endif
-#if DISCORD_ENABLED
-        forwardToDiscord(combined);
-#endif
-#if WEBHOOK_ENABLED
-        forwardToWebhook(combined);
-#endif
-#if EMAIL_ENABLED
-        forwardToEmail(combined);
-#endif
+
+  if (settings.ntfyEnabled) forwardToNtfy(combined);
+  if (settings.discordEnabled) forwardToDiscord(combined);
+  if (settings.webhookEnabled) forwardToWebhook(combined);
+  if (settings.emailEnabled) forwardToEmail(combined);
 
         request->send(200, "application/json", "{\"status\":\"ok\"}");
       }
@@ -2290,6 +2806,17 @@ void setup() {
 // Main Loop
 // ============================================
 void loop() {
+  if (pendingRestart && millis() >= restartAtMs) {
+    Serial.println("Rebooting now...");
+    delay(50);
+    ESP.restart();
+  }
+
+  if (!settings.loraEnabled) {
+    delay(50);
+    return;
+  }
+
   // Check for LoRa packets (all devices listen)
   String message;
   int state = radio.receive(message);
@@ -2352,12 +2879,12 @@ void loop() {
 // ============================================
 void setupWiFi() {
   Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+  Serial.println(settings.wifiSsid);
   
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -2419,7 +2946,7 @@ void setupLoRa() {
   
   // Initialize the radio with basic settings
   // Use default sync word (0x12) and preamble (8) to start
-  int state = radio.begin(LORA_FREQ, LORA_BANDWIDTH, LORA_SPREADING_FACTOR, LORA_CODING_RATE, 
+  int state = radio.begin(settings.loraFreq, settings.loraBandwidth, settings.loraSpreadingFactor, settings.loraCodingRate, 
                           0x12, 22, 8, LORA_TCXO_VOLTAGE);
   
   if (state == RADIOLIB_ERR_NONE) {
@@ -2436,17 +2963,17 @@ void setupLoRa() {
   
   Serial.println("\n=== LoRa Configuration ===");
   Serial.print("Frequency: ");
-  Serial.print(LORA_FREQ);
+  Serial.print(settings.loraFreq);
   Serial.println(" MHz");
   Serial.print("Spreading Factor: SF");
-  Serial.println(LORA_SPREADING_FACTOR);
+  Serial.println(settings.loraSpreadingFactor);
   Serial.print("Bandwidth: ");
-  Serial.print(LORA_BANDWIDTH);
+  Serial.print(settings.loraBandwidth);
   Serial.println(" kHz");
   Serial.print("Coding Rate: 4/");
-  Serial.println(LORA_CODING_RATE);
+  Serial.println(settings.loraCodingRate);
   Serial.print("Channel: ");
-  Serial.println(CHANNEL_NAME);
+  Serial.println(settings.channelName);
   Serial.println("========================\n");
   
   // Start listening for packets (all devices listen and can transmit)
@@ -2503,7 +3030,7 @@ void handleLoRaMessage(String message) {
   uint8_t channelHash;
   uint8_t channelKey[32];
   size_t channelKeyLen;
-  deriveChannelKey(CHANNEL_NAME, CHANNEL_SECRET, &channelHash, channelKey, &channelKeyLen);
+  deriveChannelKey(settings.channelName.c_str(), settings.channelSecret.c_str(), &channelHash, channelKey, &channelKeyLen);
   
   Serial.printf("Expected channel hash: 0x%02X\n", channelHash);
   
@@ -2608,38 +3135,30 @@ void handleLoRaMessage(String message) {
   }
   
   String forwardMsg = String(textMessage);
-  
-  #if NTFY_ENABLED
-  #if NTFY_MESH_RELAY
-  forwardToNtfy(forwardMsg);
-  #else
-  Serial.println("Ntfy mesh relay disabled, skipping");
-  #endif
-  #endif
-  
-  #if DISCORD_ENABLED
-  #if DISCORD_MESH_RELAY
-  forwardToDiscord(forwardMsg);
-  #else
-  Serial.println("Discord mesh relay disabled, skipping");
-  #endif
-  #endif
-  
-  #if WEBHOOK_ENABLED
-  #if WEBHOOK_MESH_RELAY
-  forwardToWebhook(forwardMsg);
-  #else
-  Serial.println("Webhook mesh relay disabled, skipping");
-  #endif
-  #endif
-  
-  #if EMAIL_ENABLED
-  #if EMAIL_MESH_RELAY
-  forwardToEmail(forwardMsg);
-  #else
-  Serial.println("Email mesh relay disabled, skipping");
-  #endif
-  #endif
+
+  if (settings.ntfyEnabled && settings.ntfyMeshRelay) {
+    forwardToNtfy(forwardMsg);
+  } else if (settings.ntfyEnabled && !settings.ntfyMeshRelay) {
+    Serial.println("Ntfy mesh relay disabled, skipping");
+  }
+
+  if (settings.discordEnabled && settings.discordMeshRelay) {
+    forwardToDiscord(forwardMsg);
+  } else if (settings.discordEnabled && !settings.discordMeshRelay) {
+    Serial.println("Discord mesh relay disabled, skipping");
+  }
+
+  if (settings.webhookEnabled && settings.webhookMeshRelay) {
+    forwardToWebhook(forwardMsg);
+  } else if (settings.webhookEnabled && !settings.webhookMeshRelay) {
+    Serial.println("Webhook mesh relay disabled, skipping");
+  }
+
+  if (settings.emailEnabled && settings.emailMeshRelay) {
+    forwardToEmail(forwardMsg);
+  } else if (settings.emailEnabled && !settings.emailMeshRelay) {
+    Serial.println("Email mesh relay disabled, skipping");
+  }
 }
 
 // ============================================
@@ -2654,8 +3173,12 @@ bool verifyMessage(String message) {
 // Forward to Ntfy
 // ============================================
 void forwardToNtfy(String message) {
+  if (!settings.ntfyEnabled) {
+    Serial.println("Ntfy disabled, skipping");
+    return;
+  }
   HTTPClient http;
-  String url = String(NTFY_SERVER) + "/" + String(NTFY_TOPIC);
+  String url = settings.ntfyServer + "/" + settings.ntfyTopic;
   
   Serial.print("Forwarding to Ntfy: ");
   Serial.println(url);
@@ -2679,9 +3202,9 @@ void forwardToNtfy(String message) {
   http.addHeader("X-Message-ID", String(millis()));  // avoid dedup on server
   
   // Add authentication - MUST be after begin() and headers
-  String ntfyToken = String(NTFY_TOKEN);
-  String ntfyUsername = String(NTFY_USERNAME);
-  String ntfyPassword = String(NTFY_PASSWORD);
+  String ntfyToken = settings.ntfyToken;
+  String ntfyUsername = settings.ntfyUsername;
+  String ntfyPassword = settings.ntfyPassword;
   
   if (ntfyToken.length() > 0) {
     // Token authentication using Bearer header
@@ -2721,10 +3244,18 @@ void forwardToEmail(String message) {
 // Forward to Discord
 // ============================================
 void forwardToDiscord(String message) {
+  if (!settings.discordEnabled) {
+    Serial.println("Discord disabled, skipping");
+    return;
+  }
+  if (settings.discordWebhookUrl.length() == 0) {
+    Serial.println("Discord webhook URL empty, skipping");
+    return;
+  }
   HTTPClient http;
   
   Serial.print("Forwarding to Discord: ");
-  Serial.println(DISCORD_WEBHOOK_URL);
+  Serial.println(settings.discordWebhookUrl);
   
   // Create JSON payload
   JsonDocument doc;
@@ -2734,7 +3265,7 @@ void forwardToDiscord(String message) {
   String payload;
   serializeJson(doc, payload);
   
-  http.begin(DISCORD_WEBHOOK_URL);
+  http.begin(settings.discordWebhookUrl);
   http.addHeader("Content-Type", "application/json");
   
   int httpResponseCode = http.POST(payload);
@@ -2754,10 +3285,18 @@ void forwardToDiscord(String message) {
 // Forward to Generic Webhook
 // ============================================
 void forwardToWebhook(String message) {
+  if (!settings.webhookEnabled) {
+    Serial.println("Webhook disabled, skipping");
+    return;
+  }
+  if (settings.webhookUrl.length() == 0) {
+    Serial.println("Webhook URL empty, skipping");
+    return;
+  }
   HTTPClient http;
   
   Serial.print("Forwarding to webhook: ");
-  Serial.println(WEBHOOK_URL);
+  Serial.println(settings.webhookUrl);
   
   // Create JSON payload
   JsonDocument doc;
@@ -2770,13 +3309,15 @@ void forwardToWebhook(String message) {
   String payload;
   serializeJson(doc, payload);
   
-  http.begin(WEBHOOK_URL);
+  http.begin(settings.webhookUrl);
   http.addHeader("Content-Type", "application/json");
   
   int httpResponseCode;
-  if (String(WEBHOOK_METHOD) == "POST") {
+  String method = settings.webhookMethod;
+  method.toUpperCase();
+  if (method == "POST") {
     httpResponseCode = http.POST(payload);
-  } else if (String(WEBHOOK_METHOD) == "PUT") {
+  } else if (method == "PUT") {
     httpResponseCode = http.PUT(payload);
   } else {
     httpResponseCode = http.POST(payload);
