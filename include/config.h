@@ -21,6 +21,16 @@
 #define WIFI_PASSWORD "your_wifi_password"
 #endif
 
+// Captive portal hotspot (starts when STA WiFi can't connect)
+// Hotspot SSID is generated per-device as: ESP32NM-<MAC>
+#ifndef HOTSPOT_IP
+#define HOTSPOT_IP "192.168.4.1"
+#endif
+
+#ifndef HOTSPOT_PASSWORD
+#define HOTSPOT_PASSWORD "esp32monitor"
+#endif
+
 // Status LED (onboard). Override in .env via ADMIN_LED_PIN if different.
 #ifndef LED_PIN
 #define LED_PIN 35
@@ -80,6 +90,10 @@
 
 #ifndef LORA_ENABLED
 #define LORA_ENABLED true
+#endif
+
+#ifndef LORA_IP_ALERTS
+#define LORA_IP_ALERTS true
 #endif
 
 #ifndef LORA_SYNC_WORD
@@ -151,6 +165,10 @@
 #define NTFY_ENABLED true
 #endif
 
+#ifndef NTFY_IP_ALERTS
+#define NTFY_IP_ALERTS true
+#endif
+
 #ifndef NTFY_SERVER
 #define NTFY_SERVER "https://ntfy.sh"
 #endif
@@ -180,6 +198,10 @@
 #define EMAIL_ENABLED false
 #endif
 
+#ifndef EMAIL_IP_ALERTS
+#define EMAIL_IP_ALERTS true
+#endif
+
 #ifndef SMTP_HOST
 #define SMTP_HOST "smtp.gmail.com"
 #endif
@@ -205,6 +227,10 @@
 #define DISCORD_ENABLED false
 #endif
 
+#ifndef DISCORD_IP_ALERTS
+#define DISCORD_IP_ALERTS true
+#endif
+
 #ifndef DISCORD_WEBHOOK_URL
 #define DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
 #endif
@@ -216,6 +242,10 @@
 // Generic Webhook Configuration
 #ifndef WEBHOOK_ENABLED
 #define WEBHOOK_ENABLED false
+#endif
+
+#ifndef WEBHOOK_IP_ALERTS
+#define WEBHOOK_IP_ALERTS true
 #endif
 
 #ifndef WEBHOOK_URL

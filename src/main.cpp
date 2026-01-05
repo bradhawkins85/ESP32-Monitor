@@ -24,6 +24,8 @@
 // #include <ElegantOTA.h>  // Temporarily disabled due to header conflicts
 #include <cstdlib>
 #include <Update.h>
+#include <DNSServer.h>
+#include <esp_system.h>
 
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
@@ -119,6 +121,7 @@ struct Settings {
 
   // LoRa radio parameters
   bool loraEnabled;
+  bool loraIpAlerts;
   float loraFreq;
   float loraBandwidth;
   int loraSpreadingFactor;
@@ -127,6 +130,7 @@ struct Settings {
   // Ntfy
   bool ntfyEnabled;
   bool ntfyMeshRelay;
+  bool ntfyIpAlerts;
   String ntfyServer;
   String ntfyTopic;
   String ntfyUsername;
@@ -136,17 +140,20 @@ struct Settings {
   // Discord
   bool discordEnabled;
   bool discordMeshRelay;
+  bool discordIpAlerts;
   String discordWebhookUrl;
 
   // Webhook
   bool webhookEnabled;
   bool webhookMeshRelay;
+  bool webhookIpAlerts;
   String webhookUrl;
   String webhookMethod;
 
   // Email (placeholder)
   bool emailEnabled;
   bool emailMeshRelay;
+  bool emailIpAlerts;
   String smtpHost;
   int smtpPort;
   String emailRecipient;
@@ -169,6 +176,7 @@ Settings defaultSettingsFromBuild() {
   s.channelSecret = String(CHANNEL_SECRET);
 
   s.loraEnabled = (LORA_ENABLED != 0);
+  s.loraIpAlerts = (LORA_IP_ALERTS != 0);
   s.loraFreq = (float)LORA_FREQ;
   s.loraBandwidth = (float)LORA_BANDWIDTH;
   s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
@@ -176,6 +184,7 @@ Settings defaultSettingsFromBuild() {
 
   s.ntfyEnabled = (NTFY_ENABLED != 0);
   s.ntfyMeshRelay = (NTFY_MESH_RELAY != 0);
+  s.ntfyIpAlerts = (NTFY_IP_ALERTS != 0);
   s.ntfyServer = String(NTFY_SERVER);
   s.ntfyTopic = String(NTFY_TOPIC);
   s.ntfyUsername = String(NTFY_USERNAME);
@@ -184,15 +193,18 @@ Settings defaultSettingsFromBuild() {
 
   s.discordEnabled = (DISCORD_ENABLED != 0);
   s.discordMeshRelay = (DISCORD_MESH_RELAY != 0);
+  s.discordIpAlerts = (DISCORD_IP_ALERTS != 0);
   s.discordWebhookUrl = String(DISCORD_WEBHOOK_URL);
 
   s.webhookEnabled = (WEBHOOK_ENABLED != 0);
   s.webhookMeshRelay = (WEBHOOK_MESH_RELAY != 0);
+  s.webhookIpAlerts = (WEBHOOK_IP_ALERTS != 0);
   s.webhookUrl = String(WEBHOOK_URL);
   s.webhookMethod = String(WEBHOOK_METHOD);
 
   s.emailEnabled = (EMAIL_ENABLED != 0);
   s.emailMeshRelay = (EMAIL_MESH_RELAY != 0);
+  s.emailIpAlerts = (EMAIL_IP_ALERTS != 0);
   s.smtpHost = String(SMTP_HOST);
   s.smtpPort = String(SMTP_PORT).toInt();
   s.emailRecipient = String(EMAIL_RECIPIENT);
@@ -237,6 +249,7 @@ void loadSettingsOverrides() {
 
   // LoRa radio parameters
   if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
+  if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
   if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
   if (doc["LORA_FREQ"].is<double>()) settings.loraFreq = (float)doc["LORA_FREQ"].as<double>();
   if (doc["LORA_FREQ"].is<String>()) settings.loraFreq = doc["LORA_FREQ"].as<String>().toFloat();
@@ -272,12 +285,16 @@ void loadSettingsOverrides() {
   // Booleans
   if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
   if (doc["NTFY_MESH_RELAY"].is<bool>()) settings.ntfyMeshRelay = doc["NTFY_MESH_RELAY"].as<bool>();
+  if (doc["NTFY_IP_ALERTS"].is<bool>()) settings.ntfyIpAlerts = doc["NTFY_IP_ALERTS"].as<bool>();
   if (doc["DISCORD_ENABLED"].is<bool>()) settings.discordEnabled = doc["DISCORD_ENABLED"].as<bool>();
   if (doc["DISCORD_MESH_RELAY"].is<bool>()) settings.discordMeshRelay = doc["DISCORD_MESH_RELAY"].as<bool>();
+  if (doc["DISCORD_IP_ALERTS"].is<bool>()) settings.discordIpAlerts = doc["DISCORD_IP_ALERTS"].as<bool>();
   if (doc["WEBHOOK_ENABLED"].is<bool>()) settings.webhookEnabled = doc["WEBHOOK_ENABLED"].as<bool>();
   if (doc["WEBHOOK_MESH_RELAY"].is<bool>()) settings.webhookMeshRelay = doc["WEBHOOK_MESH_RELAY"].as<bool>();
+  if (doc["WEBHOOK_IP_ALERTS"].is<bool>()) settings.webhookIpAlerts = doc["WEBHOOK_IP_ALERTS"].as<bool>();
   if (doc["EMAIL_ENABLED"].is<bool>()) settings.emailEnabled = doc["EMAIL_ENABLED"].as<bool>();
   if (doc["EMAIL_MESH_RELAY"].is<bool>()) settings.emailMeshRelay = doc["EMAIL_MESH_RELAY"].as<bool>();
+  if (doc["EMAIL_IP_ALERTS"].is<bool>()) settings.emailIpAlerts = doc["EMAIL_IP_ALERTS"].as<bool>();
 }
 
 bool saveSettingsOverrides() {
@@ -296,6 +313,7 @@ bool saveSettingsOverrides() {
   doc["CHANNEL_SECRET"] = settings.channelSecret;
 
   doc["LORA_ENABLED"] = settings.loraEnabled;
+  doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
   doc["LORA_FREQ"] = settings.loraFreq;
   doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
   doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
@@ -303,6 +321,7 @@ bool saveSettingsOverrides() {
 
   doc["NTFY_ENABLED"] = settings.ntfyEnabled;
   doc["NTFY_MESH_RELAY"] = settings.ntfyMeshRelay;
+  doc["NTFY_IP_ALERTS"] = settings.ntfyIpAlerts;
   doc["NTFY_SERVER"] = settings.ntfyServer;
   doc["NTFY_TOPIC"] = settings.ntfyTopic;
   doc["NTFY_USERNAME"] = settings.ntfyUsername;
@@ -311,15 +330,18 @@ bool saveSettingsOverrides() {
 
   doc["DISCORD_ENABLED"] = settings.discordEnabled;
   doc["DISCORD_MESH_RELAY"] = settings.discordMeshRelay;
+  doc["DISCORD_IP_ALERTS"] = settings.discordIpAlerts;
   doc["DISCORD_WEBHOOK_URL"] = settings.discordWebhookUrl;
 
   doc["WEBHOOK_ENABLED"] = settings.webhookEnabled;
   doc["WEBHOOK_MESH_RELAY"] = settings.webhookMeshRelay;
+  doc["WEBHOOK_IP_ALERTS"] = settings.webhookIpAlerts;
   doc["WEBHOOK_URL"] = settings.webhookUrl;
   doc["WEBHOOK_METHOD"] = settings.webhookMethod;
 
   doc["EMAIL_ENABLED"] = settings.emailEnabled;
   doc["EMAIL_MESH_RELAY"] = settings.emailMeshRelay;
+  doc["EMAIL_IP_ALERTS"] = settings.emailIpAlerts;
   doc["SMTP_HOST"] = settings.smtpHost;
   doc["SMTP_PORT"] = settings.smtpPort;
   doc["EMAIL_RECIPIENT"] = settings.emailRecipient;
@@ -428,6 +450,237 @@ String getPushUrl(const Service& service) {
 
 // --- Web Server ---
 AsyncWebServer server(80);
+
+// --- Captive portal ---
+DNSServer dnsServer;
+bool captivePortalActive = false;
+String captiveApSsid;
+IPAddress captiveApIp;
+IPAddress captiveApNetmask(255, 255, 255, 0);
+
+// One-time notification after captive WiFi provisioning
+static const char* WIFI_PROVISION_FLAG_FILE = "/wifi_provisioned.flag";
+static bool pendingWifiProvisionNotify = false;
+static String pendingWifiProvisionNotifyMessage;
+
+// Notify on IP changes (persist last known IP across reboots)
+static const char* LAST_IP_FILE = "/last_ip.txt";
+static String lastKnownStaIp = "";
+static bool lastKnownStaIpLoaded = false;
+
+static String macWithColons();
+void forwardToNtfy(String message);
+void forwardToEmail(String message);
+void forwardToDiscord(String message);
+void forwardToWebhook(String message);
+void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
+
+static bool loraReady = false;
+static bool pendingLoRaNotify = false;
+static String pendingLoRaNotifyMessage;
+
+static void loadLastKnownStaIp() {
+  if (!LittleFS.exists(LAST_IP_FILE)) {
+    lastKnownStaIp = "";
+    lastKnownStaIpLoaded = true;
+    return;
+  }
+
+  File f = LittleFS.open(LAST_IP_FILE, "r");
+  if (!f) {
+    Serial.println("[WiFi] Failed to open last IP file");
+    lastKnownStaIp = "";
+    lastKnownStaIpLoaded = true;
+    return;
+  }
+
+  lastKnownStaIp = f.readStringUntil('\n');
+  lastKnownStaIp.trim();
+  f.close();
+  lastKnownStaIpLoaded = true;
+}
+
+static void saveLastKnownStaIp(const String &ip) {
+  File f = LittleFS.open(LAST_IP_FILE, "w");
+  if (!f) {
+    Serial.println("[WiFi] Failed to write last IP file");
+    return;
+  }
+  f.println(ip);
+  f.close();
+}
+
+static void notifyIpChangeIfNeeded(const String &newIp, const String &reason) {
+  if (newIp.length() == 0 || newIp == "0.0.0.0") return;
+
+  // If this is our first ever observed IP (no persisted baseline), notify once as "assigned".
+  if (!lastKnownStaIpLoaded) {
+    lastKnownStaIpLoaded = true;
+    lastKnownStaIp = "";
+  }
+
+  if (newIp == lastKnownStaIp) return;
+
+  String oldIp = lastKnownStaIp;
+  lastKnownStaIp = newIp;
+  saveLastKnownStaIp(newIp);
+
+  String ssid = WiFi.SSID();
+  ssid.trim();
+
+  String msg;
+  if (oldIp.length() == 0) {
+    msg = "IP address assigned\n";
+    if (ssid.length() > 0) msg += "SSID: " + ssid + "\n";
+    msg += "MAC: " + macWithColons() + "\n";
+    msg += "IP: " + newIp;
+  } else {
+    msg = "IP address changed\n";
+    if (ssid.length() > 0) msg += "SSID: " + ssid + "\n";
+    msg += "MAC: " + macWithColons() + "\n";
+    msg += "Old IP: " + oldIp + "\n";
+    msg += "New IP: " + newIp;
+  }
+  if (reason.length() > 0) msg += "\nReason: " + reason;
+
+  Serial.println("[WiFi] IP changed; sending notifications");
+  if (settings.ntfyEnabled && settings.ntfyIpAlerts) forwardToNtfy(msg);
+  if (settings.discordEnabled && settings.discordIpAlerts) forwardToDiscord(msg);
+  if (settings.webhookEnabled && settings.webhookIpAlerts) forwardToWebhook(msg);
+  if (settings.emailEnabled && settings.emailIpAlerts) forwardToEmail(msg);
+
+  if (settings.loraEnabled && settings.loraIpAlerts) {
+    if (loraReady) {
+      sendLoRaNotification("WiFi", true, msg);
+    } else {
+      pendingLoRaNotify = true;
+      pendingLoRaNotifyMessage = msg;
+    }
+  }
+}
+
+static bool parseIp4(const String &ipStr, IPAddress &out) {
+  int parts[4] = {-1, -1, -1, -1};
+  int part = 0;
+  String token = "";
+  for (size_t i = 0; i < ipStr.length(); i++) {
+    char c = ipStr[i];
+    if (c == '.') {
+      if (part > 3) return false;
+      parts[part++] = token.toInt();
+      token = "";
+    } else {
+      token += c;
+    }
+  }
+  if (part != 3) return false;
+  parts[part] = token.toInt();
+  for (int i = 0; i < 4; i++) {
+    if (parts[i] < 0 || parts[i] > 255) return false;
+  }
+  out = IPAddress(parts[0], parts[1], parts[2], parts[3]);
+  return true;
+}
+
+static String macNoColons() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char buf[13];
+  snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+static String macWithColons() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+static void writeWifiProvisionFlag(const String &ssid) {
+  File f = LittleFS.open(WIFI_PROVISION_FLAG_FILE, "w");
+  if (!f) {
+    Serial.println("[CaptivePortal] Failed to write wifi provision flag");
+    return;
+  }
+  f.println(ssid);
+  f.close();
+}
+
+static bool consumeWifiProvisionFlag(String &outSsid) {
+  if (!LittleFS.exists(WIFI_PROVISION_FLAG_FILE)) return false;
+  File f = LittleFS.open(WIFI_PROVISION_FLAG_FILE, "r");
+  if (!f) {
+    Serial.println("[WiFi] Failed to read wifi provision flag");
+    LittleFS.remove(WIFI_PROVISION_FLAG_FILE);
+    return true;
+  }
+  outSsid = f.readStringUntil('\n');
+  outSsid.trim();
+  f.close();
+  LittleFS.remove(WIFI_PROVISION_FLAG_FILE);
+  return true;
+}
+
+static String captivePortalHtml() {
+  String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>WiFi Setup</title><style>";
+  page += "*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f7fafc;margin:0;padding:24px;color:#2d3748}";
+  page += ".card{max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:22px;box-shadow:0 8px 24px rgba(0,0,0,0.08)}";
+  page += "h1{margin:0 0 8px;font-size:22px}p{margin:0 0 16px;color:#4a5568;font-size:13px;line-height:1.4}";
+  page += "label{display:block;font-weight:700;margin:10px 0 6px;font-size:13px}";
+  page += "input{width:100%;padding:10px 12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px}input:focus{outline:none;border-color:#667eea}";
+  page += "button{margin-top:14px;width:100%;padding:12px 14px;border:none;border-radius:10px;background:#667eea;color:#fff;font-weight:800;cursor:pointer}";
+  page += ".muted{opacity:0.85}code{background:#edf2f7;padding:2px 6px;border-radius:6px}";
+  page += "</style></head><body><div class='card'>";
+  page += "<h1>WiFi Setup</h1>";
+  page += "<p class='muted'>This device couldn't connect to the configured WiFi. Enter WiFi credentials below and the device will reboot.</p>";
+  page += "<p class='muted'>Hotspot: <code>" + captiveApSsid + "</code> · Portal IP: <code>" + captiveApIp.toString() + "</code></p>";
+  page += "<form method='post' action='/captive/save'>";
+  page += "<label for='ssid'>WiFi SSID</label>";
+  page += "<input id='ssid' name='ssid' value='" + settings.wifiSsid + "' required>";
+  page += "<label for='password'>WiFi Password</label>";
+  page += "<input id='password' name='password' type='password' value='' placeholder='(leave blank for open networks)'>";
+  page += "<button type='submit'>Save & Reboot</button>";
+  page += "</form>";
+  page += "</div></body></html>";
+  return page;
+}
+
+static void startCaptivePortal() {
+  if (captivePortalActive) return;
+
+  IPAddress ip;
+  if (!parseIp4(String(HOTSPOT_IP), ip)) {
+    ip = IPAddress(192, 168, 4, 1);
+  }
+  captiveApIp = ip;
+  captiveApSsid = String("ESP32NM-") + macNoColons();
+
+  WiFi.disconnect(true);
+  delay(50);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(captiveApIp, captiveApIp, captiveApNetmask);
+
+  String apPass = String(HOTSPOT_PASSWORD);
+  bool ok;
+  if (apPass.length() >= 8) {
+    ok = WiFi.softAP(captiveApSsid.c_str(), apPass.c_str());
+  } else {
+    Serial.println("[CaptivePortal] HOTSPOT_PASSWORD too short (<8). Starting open AP.");
+    ok = WiFi.softAP(captiveApSsid.c_str());
+  }
+
+  if (!ok) {
+    Serial.println("[CaptivePortal] Failed to start SoftAP");
+    return;
+  }
+
+  dnsServer.start(53, "*", captiveApIp);
+  captivePortalActive = true;
+  Serial.printf("[CaptivePortal] Started SSID=%s IP=%s\n", captiveApSsid.c_str(), captiveApIp.toString().c_str());
+}
 
 // --- Function Declarations ---
 void initDemoServices();
@@ -1780,6 +2033,9 @@ void setup() {
     Serial.println("LittleFS mounted successfully.");
   }
 
+  // Load last-known STA IP for IP-change notifications
+  loadLastKnownStaIp();
+
   // Load runtime settings: build-time defaults (.env) + optional overrides (/settings.json)
   applySettingsDefaults();
   loadSettingsOverrides();
@@ -1798,7 +2054,21 @@ void setup() {
   // Setup LoRa
   if (settings.loraEnabled) {
     setupLoRa();
+    loraReady = true;
+
+    if (pendingWifiProvisionNotify && pendingWifiProvisionNotifyMessage.length() > 0) {
+      sendLoRaNotification("WiFi", true, pendingWifiProvisionNotifyMessage);
+      pendingWifiProvisionNotify = false;
+      pendingWifiProvisionNotifyMessage = "";
+    }
+
+    if (pendingLoRaNotify && pendingLoRaNotifyMessage.length() > 0) {
+      sendLoRaNotification("WiFi", true, pendingLoRaNotifyMessage);
+      pendingLoRaNotify = false;
+      pendingLoRaNotifyMessage = "";
+    }
   } else {
+    loraReady = false;
     Serial.println("LoRa disabled by settings; skipping radio init");
   }
   
@@ -1850,6 +2120,7 @@ void setup() {
     doc["CHANNEL_NAME"] = settings.channelName;
 
     doc["LORA_ENABLED"] = settings.loraEnabled;
+    doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
     doc["LORA_FREQ"] = settings.loraFreq;
     doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
     doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
@@ -1857,19 +2128,23 @@ void setup() {
 
     doc["NTFY_ENABLED"] = settings.ntfyEnabled;
     doc["NTFY_MESH_RELAY"] = settings.ntfyMeshRelay;
+    doc["NTFY_IP_ALERTS"] = settings.ntfyIpAlerts;
     doc["NTFY_SERVER"] = settings.ntfyServer;
     doc["NTFY_TOPIC"] = settings.ntfyTopic;
     doc["NTFY_USERNAME"] = settings.ntfyUsername;
 
     doc["DISCORD_ENABLED"] = settings.discordEnabled;
     doc["DISCORD_MESH_RELAY"] = settings.discordMeshRelay;
+    doc["DISCORD_IP_ALERTS"] = settings.discordIpAlerts;
 
     doc["WEBHOOK_ENABLED"] = settings.webhookEnabled;
     doc["WEBHOOK_MESH_RELAY"] = settings.webhookMeshRelay;
+    doc["WEBHOOK_IP_ALERTS"] = settings.webhookIpAlerts;
     doc["WEBHOOK_METHOD"] = settings.webhookMethod;
 
     doc["EMAIL_ENABLED"] = settings.emailEnabled;
     doc["EMAIL_MESH_RELAY"] = settings.emailMeshRelay;
+    doc["EMAIL_IP_ALERTS"] = settings.emailIpAlerts;
     doc["SMTP_HOST"] = settings.smtpHost;
     doc["SMTP_PORT"] = settings.smtpPort;
     doc["EMAIL_RECIPIENT"] = settings.emailRecipient;
@@ -1933,6 +2208,7 @@ void setup() {
       }
 
       if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
+      if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
 
       // LoRa radio parameters
       if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
@@ -1986,12 +2262,16 @@ void setup() {
       // Booleans
       if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
       if (doc["NTFY_MESH_RELAY"].is<bool>()) settings.ntfyMeshRelay = doc["NTFY_MESH_RELAY"].as<bool>();
+      if (doc["NTFY_IP_ALERTS"].is<bool>()) settings.ntfyIpAlerts = doc["NTFY_IP_ALERTS"].as<bool>();
       if (doc["DISCORD_ENABLED"].is<bool>()) settings.discordEnabled = doc["DISCORD_ENABLED"].as<bool>();
       if (doc["DISCORD_MESH_RELAY"].is<bool>()) settings.discordMeshRelay = doc["DISCORD_MESH_RELAY"].as<bool>();
+      if (doc["DISCORD_IP_ALERTS"].is<bool>()) settings.discordIpAlerts = doc["DISCORD_IP_ALERTS"].as<bool>();
       if (doc["WEBHOOK_ENABLED"].is<bool>()) settings.webhookEnabled = doc["WEBHOOK_ENABLED"].as<bool>();
       if (doc["WEBHOOK_MESH_RELAY"].is<bool>()) settings.webhookMeshRelay = doc["WEBHOOK_MESH_RELAY"].as<bool>();
+      if (doc["WEBHOOK_IP_ALERTS"].is<bool>()) settings.webhookIpAlerts = doc["WEBHOOK_IP_ALERTS"].as<bool>();
       if (doc["EMAIL_ENABLED"].is<bool>()) settings.emailEnabled = doc["EMAIL_ENABLED"].as<bool>();
       if (doc["EMAIL_MESH_RELAY"].is<bool>()) settings.emailMeshRelay = doc["EMAIL_MESH_RELAY"].as<bool>();
+      if (doc["EMAIL_IP_ALERTS"].is<bool>()) settings.emailIpAlerts = doc["EMAIL_IP_ALERTS"].as<bool>();
 
       // Normalize
       if (settings.webhookMethod.length() == 0) settings.webhookMethod = "POST";
@@ -2063,6 +2343,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Channel Name</label><input id='CHANNEL_NAME' value='" + settings.channelName + "'></div>";
     page += "<div class='fg'><label class='lbl'>Channel Secret</label><input id='CHANNEL_SECRET' type='password' value='' placeholder='(unchanged)'></div>";
     page += "<div class='fg'><label class='lbl'>LoRa Enabled</label><select id='LORA_ENABLED'><option value='true'" + String(settings.loraEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='LORA_IP_ALERTS'><option value='true'" + String(settings.loraIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Frequency (MHz)</label><input id='LORA_FREQ' type='number' step='0.001' value='" + String(settings.loraFreq, 3) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Bandwidth (kHz)</label><input id='LORA_BANDWIDTH' type='number' step='0.1' value='" + String(settings.loraBandwidth, 1) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Spreading Factor</label><input id='LORA_SPREADING_FACTOR' type='number' min='6' max='12' step='1' value='" + String(settings.loraSpreadingFactor) + "'></div>";
@@ -2072,6 +2353,7 @@ void setup() {
     page += "<div class='card'><h2>Ntfy</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Enabled</label><select id='NTFY_ENABLED'><option value='true'" + String(settings.ntfyEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='NTFY_MESH_RELAY'><option value='true'" + String(settings.ntfyMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='NTFY_IP_ALERTS'><option value='true'" + String(settings.ntfyIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Server</label><input id='NTFY_SERVER' value='" + settings.ntfyServer + "'></div>";
     page += "<div class='fg'><label class='lbl'>Topic</label><input id='NTFY_TOPIC' value='" + settings.ntfyTopic + "'></div>";
     page += "<div class='fg'><label class='lbl'>Username</label><input id='NTFY_USERNAME' value='" + settings.ntfyUsername + "'></div>";
@@ -2082,12 +2364,14 @@ void setup() {
     page += "<div class='card'><h2>Discord</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Enabled</label><select id='DISCORD_ENABLED'><option value='true'" + String(settings.discordEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.discordEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='DISCORD_MESH_RELAY'><option value='true'" + String(settings.discordMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.discordMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='DISCORD_IP_ALERTS'><option value='true'" + String(settings.discordIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.discordIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>Webhook URL</label><input id='DISCORD_WEBHOOK_URL' value='" + settings.discordWebhookUrl + "'></div>";
     page += "</div></div>";
 
     page += "<div class='card'><h2>Webhook</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Enabled</label><select id='WEBHOOK_ENABLED'><option value='true'" + String(settings.webhookEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.webhookEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='WEBHOOK_MESH_RELAY'><option value='true'" + String(settings.webhookMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.webhookMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='WEBHOOK_IP_ALERTS'><option value='true'" + String(settings.webhookIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.webhookIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Method</label><select id='WEBHOOK_METHOD'><option value='POST'" + String(settings.webhookMethod == "POST" ? " selected" : "") + ">POST</option><option value='PUT'" + String(settings.webhookMethod == "PUT" ? " selected" : "") + ">PUT</option></select></div>";
     page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>URL</label><input id='WEBHOOK_URL' value='" + settings.webhookUrl + "'></div>";
     page += "</div></div>";
@@ -2095,6 +2379,7 @@ void setup() {
     page += "<div class='card'><h2>Email</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Enabled</label><select id='EMAIL_ENABLED'><option value='true'" + String(settings.emailEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.emailEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='EMAIL_MESH_RELAY'><option value='true'" + String(settings.emailMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.emailMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='EMAIL_IP_ALERTS'><option value='true'" + String(settings.emailIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.emailIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>SMTP Host</label><input id='SMTP_HOST' value='" + settings.smtpHost + "'></div>";
     page += "<div class='fg'><label class='lbl'>SMTP Port</label><input id='SMTP_PORT' value='" + String(settings.smtpPort) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Recipient</label><input id='EMAIL_RECIPIENT' value='" + settings.emailRecipient + "'></div>";
@@ -2115,12 +2400,12 @@ void setup() {
     page += "WIFI_SSID:val('WIFI_SSID'),WIFI_PASSWORD:val('WIFI_PASSWORD'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),";
-    page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),";
+    page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
-    page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
-    page += "WEBHOOK_ENABLED:boolVal('WEBHOOK_ENABLED'),WEBHOOK_MESH_RELAY:boolVal('WEBHOOK_MESH_RELAY'),WEBHOOK_URL:val('WEBHOOK_URL'),WEBHOOK_METHOD:val('WEBHOOK_METHOD'),";
-    page += "EMAIL_ENABLED:boolVal('EMAIL_ENABLED'),EMAIL_MESH_RELAY:boolVal('EMAIL_MESH_RELAY'),SMTP_HOST:val('SMTP_HOST'),SMTP_PORT:val('SMTP_PORT'),EMAIL_RECIPIENT:val('EMAIL_RECIPIENT'),EMAIL_SENDER:val('EMAIL_SENDER'),SMTP_USER:val('SMTP_USER'),SMTP_PASSWORD:val('SMTP_PASSWORD')";
+    page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
+    page += "WEBHOOK_ENABLED:boolVal('WEBHOOK_ENABLED'),WEBHOOK_MESH_RELAY:boolVal('WEBHOOK_MESH_RELAY'),WEBHOOK_IP_ALERTS:boolVal('WEBHOOK_IP_ALERTS'),WEBHOOK_URL:val('WEBHOOK_URL'),WEBHOOK_METHOD:val('WEBHOOK_METHOD'),";
+    page += "EMAIL_ENABLED:boolVal('EMAIL_ENABLED'),EMAIL_MESH_RELAY:boolVal('EMAIL_MESH_RELAY'),EMAIL_IP_ALERTS:boolVal('EMAIL_IP_ALERTS'),SMTP_HOST:val('SMTP_HOST'),SMTP_PORT:val('SMTP_PORT'),EMAIL_RECIPIENT:val('EMAIL_RECIPIENT'),EMAIL_SENDER:val('EMAIL_SENDER'),SMTP_USER:val('SMTP_USER'),SMTP_PASSWORD:val('SMTP_PASSWORD')";
     page += "};";
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
@@ -2136,6 +2421,10 @@ void setup() {
 
   // Status page (modern styled HTML)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (captivePortalActive) {
+      request->send(200, "text/html", captivePortalHtml());
+      return;
+    }
     bool isAuthed = isAuthenticated(request, false);
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<title>ESP32 Uptime Monitor</title>";
@@ -2412,6 +2701,66 @@ void setup() {
     html += "</script>";
     html += "</body></html>";
     request->send(200, "text/html", html);
+  });
+
+  // Captive portal save (no auth)
+  server.on("/captive/save", HTTP_POST, [](AsyncWebServerRequest *request){
+    String ssid = "";
+    String password = "";
+    if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
+    if (request->hasParam("password", true)) password = request->getParam("password", true)->value();
+
+    ssid.trim();
+    if (ssid.length() == 0) {
+      request->send(400, "text/html", "<html><body>SSID is required. <a href='/'>Back</a></body></html>");
+      return;
+    }
+
+    settings.wifiSsid = ssid;
+    settings.wifiPassword = password;
+    saveSettingsOverrides();
+
+    // Mark that WiFi was provisioned via captive portal; we will notify after the next successful STA connect.
+    writeWifiProvisionFlag(ssid);
+
+    pendingRestart = true;
+    restartAtMs = millis() + 1500;
+
+    request->send(200, "text/html",
+      "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Saved</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f7fafc;padding:24px;color:#2d3748}"
+      ".card{max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:22px;box-shadow:0 8px 24px rgba(0,0,0,0.08)}"
+      "</style></head><body><div class='card'><h2>Saved</h2><p>Rebooting to connect to WiFi...</p></div></body></html>");
+  });
+
+  // Common OS captive portal probe endpoints
+  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    else request->send(204);
+  });
+  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    else request->send(404);
+  });
+  server.on("/fwlink", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    else request->send(404);
+  });
+
+  // Windows captive portal checks
+  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    else request->send(404);
+  });
+  server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    else request->send(404);
+  });
+
+  // Apple/macOS/iOS captive portal checks
+  server.on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    else request->send(404);
   });
 
   // Kiosk view: stats + services only, no actions/controls
@@ -2799,6 +3148,15 @@ void setup() {
     }
   );
 
+  server.onNotFound([](AsyncWebServerRequest *request){
+    if (captivePortalActive) {
+      // Redirect any unknown path to the portal page (helps trigger OS captive portal UX)
+      request->redirect(String("http://") + captiveApIp.toString() + "/");
+      return;
+    }
+    request->send(404, "text/plain", "Not found");
+  });
+
   server.begin();
 }
 
@@ -2806,6 +3164,10 @@ void setup() {
 // Main Loop
 // ============================================
 void loop() {
+  if (captivePortalActive) {
+    dnsServer.processNextRequest();
+  }
+
   if (pendingRestart && millis() >= restartAtMs) {
     Serial.println("Rebooting now...");
     delay(50);
@@ -2848,24 +3210,36 @@ void loop() {
     Serial.println(state);
   }
   
-  // Track and heal WiFi connectivity
-  static unsigned long lastWifiAttempt = 0;
-  wl_status_t wifiStatus = WiFi.status();
-  bool nowConnected = (wifiStatus == WL_CONNECTED);
+  // Track and heal WiFi connectivity.
+  // If the captive portal is active, avoid reconnect loops that would switch WiFi mode back to STA and kill the AP.
+  if (!captivePortalActive) {
+    static unsigned long lastWifiAttempt = 0;
+    static unsigned long lastIpCheck = 0;
+    wl_status_t wifiStatus = WiFi.status();
+    bool nowConnected = (wifiStatus == WL_CONNECTED);
 
-  if (nowConnected && !wifiConnected) {
-    Serial.println("WiFi reconnected");
-  } else if (!nowConnected && wifiConnected) {
-    Serial.println("WiFi disconnected");
-  }
+    if (nowConnected && !wifiConnected) {
+      Serial.println("WiFi reconnected");
+    } else if (!nowConnected && wifiConnected) {
+      Serial.println("WiFi disconnected");
+    }
 
-  wifiConnected = nowConnected;
+    wifiConnected = nowConnected;
 
-  if (!wifiConnected && millis() - lastWifiAttempt >= 10000) {
-    Serial.println("WiFi disconnected, reconnecting...");
-    setupWiFi();
-    lastWifiAttempt = millis();
-    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (!wifiConnected && millis() - lastWifiAttempt >= 10000) {
+      Serial.println("WiFi disconnected, reconnecting...");
+      setupWiFi();
+      lastWifiAttempt = millis();
+      wifiConnected = (WiFi.status() == WL_CONNECTED);
+    }
+
+    // Detect DHCP renewals / IP changes while connected
+    if (wifiConnected && millis() - lastIpCheck >= 5000) {
+      lastIpCheck = millis();
+      notifyIpChangeIfNeeded(WiFi.localIP().toString(), "dhcp/renew");
+    }
+  } else {
+    wifiConnected = false;
   }
   
   // Check all services periodically
@@ -2878,6 +3252,11 @@ void loop() {
 // WiFi Setup
 // ============================================
 void setupWiFi() {
+  if (captivePortalActive) {
+    Serial.println("WiFi connect skipped: captive portal active");
+    return;
+  }
+
   Serial.print("Connecting to WiFi: ");
   Serial.println(settings.wifiSsid);
   
@@ -2898,9 +3277,36 @@ void setupWiFi() {
     Serial.println("\nWiFi connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+
+    // Notify if the IP differs from the persisted value.
+    notifyIpChangeIfNeeded(WiFi.localIP().toString(), "reconnect");
+
+    // If WiFi was provisioned via captive portal, send a one-time notification with device details.
+    String provisionedSsid;
+    if (consumeWifiProvisionFlag(provisionedSsid)) {
+      String mac = macWithColons();
+      String ip = WiFi.localIP().toString();
+      String msg = "WiFi configured successfully\n";
+      if (provisionedSsid.length() > 0) msg += "SSID: " + provisionedSsid + "\n";
+      msg += "MAC: " + mac + "\n";
+      msg += "IP: " + ip;
+
+      Serial.println("[WiFi] Captive provisioning complete; sending notifications");
+
+      // Internet-based notification providers
+      if (settings.ntfyEnabled) forwardToNtfy(msg);
+      if (settings.discordEnabled) forwardToDiscord(msg);
+      if (settings.webhookEnabled) forwardToWebhook(msg);
+      if (settings.emailEnabled) forwardToEmail(msg);
+
+      // Defer LoRa notification until after the radio is initialized
+      pendingWifiProvisionNotify = true;
+      pendingWifiProvisionNotifyMessage = msg;
+    }
   } else {
     wifiConnected = false;
     Serial.println("\nWiFi connection failed!");
+    startCaptivePortal();
   }
 }
 

@@ -25,10 +25,15 @@ except FileNotFoundError:
 # Separate boolean flags from string values
 bool_vars = {
     "LORA_ENABLED": os.environ.get("LORA_ENABLED", "true"),
+    "LORA_IP_ALERTS": os.environ.get("LORA_IP_ALERTS", "true"),
     "DISCORD_ENABLED": os.environ.get("DISCORD_ENABLED", "false"),
+    "DISCORD_IP_ALERTS": os.environ.get("DISCORD_IP_ALERTS", "true"),
     "NTFY_ENABLED": os.environ.get("NTFY_ENABLED", "true"),
+    "NTFY_IP_ALERTS": os.environ.get("NTFY_IP_ALERTS", "true"),
     "EMAIL_ENABLED": os.environ.get("EMAIL_ENABLED", "false"),
+    "EMAIL_IP_ALERTS": os.environ.get("EMAIL_IP_ALERTS", "true"),
     "WEBHOOK_ENABLED": os.environ.get("WEBHOOK_ENABLED", "false"),
+    "WEBHOOK_IP_ALERTS": os.environ.get("WEBHOOK_IP_ALERTS", "true"),
     "NTFY_MESH_RELAY": os.environ.get("NTFY_MESH_RELAY", "true"),
     "DISCORD_MESH_RELAY": os.environ.get("DISCORD_MESH_RELAY", "true"),
     "WEBHOOK_MESH_RELAY": os.environ.get("WEBHOOK_MESH_RELAY", "false"),
@@ -39,6 +44,10 @@ string_vars = {
     # WiFi Configuration
     "WIFI_SSID": os.environ.get("WIFI_SSID", "your_wifi_ssid"),
     "WIFI_PASSWORD": os.environ.get("WIFI_PASSWORD", "your_wifi_password"),
+
+    # Captive Portal Hotspot
+    "HOTSPOT_IP": os.environ.get("HOTSPOT_IP", "192.168.4.1"),
+    "HOTSPOT_PASSWORD": os.environ.get("HOTSPOT_PASSWORD", "esp32monitor"),
 
     # Admin Authentication
     "ADMIN_USERNAME": os.environ.get("ADMIN_USERNAME", "admin"),
