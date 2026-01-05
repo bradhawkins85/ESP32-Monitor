@@ -34,10 +34,13 @@ bool_vars = {
     "EMAIL_IP_ALERTS": os.environ.get("EMAIL_IP_ALERTS", "true"),
     "WEBHOOK_ENABLED": os.environ.get("WEBHOOK_ENABLED", "false"),
     "WEBHOOK_IP_ALERTS": os.environ.get("WEBHOOK_IP_ALERTS", "true"),
+    "MQTT_ENABLED": os.environ.get("MQTT_ENABLED", "false"),
+    "MQTT_IP_ALERTS": os.environ.get("MQTT_IP_ALERTS", "true"),
     "NTFY_MESH_RELAY": os.environ.get("NTFY_MESH_RELAY", "true"),
     "DISCORD_MESH_RELAY": os.environ.get("DISCORD_MESH_RELAY", "true"),
     "WEBHOOK_MESH_RELAY": os.environ.get("WEBHOOK_MESH_RELAY", "false"),
     "EMAIL_MESH_RELAY": os.environ.get("EMAIL_MESH_RELAY", "false"),
+    "MQTT_MESH_RELAY": os.environ.get("MQTT_MESH_RELAY", "false"),
 }
 
 string_vars = {
@@ -78,6 +81,13 @@ string_vars = {
     # Generic Webhook Configuration
     "WEBHOOK_URL": os.environ.get("WEBHOOK_URL", ""),
     "WEBHOOK_METHOD": os.environ.get("WEBHOOK_METHOD", "POST"),
+
+    # MQTT Configuration
+    "MQTT_BROKER": os.environ.get("MQTT_BROKER", ""),
+    "MQTT_PORT": os.environ.get("MQTT_PORT", "1883"),
+    "MQTT_TOPIC": os.environ.get("MQTT_TOPIC", "esp32-monitor/alerts"),
+    "MQTT_USERNAME": os.environ.get("MQTT_USERNAME", ""),
+    "MQTT_PASSWORD": os.environ.get("MQTT_PASSWORD", ""),
 }
 
 # Numeric vars (no quotes)
@@ -85,6 +95,7 @@ int_vars = {
     "LED_PIN": os.environ.get("LED_PIN", "35"),
     "LORA_SPREADING_FACTOR": os.environ.get("LORA_SPREADING_FACTOR", "7"),
     "LORA_CODING_RATE": os.environ.get("LORA_CODING_RATE", "5"),
+    "MQTT_QOS": os.environ.get("MQTT_QOS", "0"),
 }
 
 # Float vars (no quotes)

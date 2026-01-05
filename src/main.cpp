@@ -26,6 +26,7 @@
 #include <Update.h>
 #include <DNSServer.h>
 #include <esp_system.h>
+#include <AsyncMqttClient.h>
 
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
@@ -160,6 +161,17 @@ struct Settings {
   String emailSender;
   String smtpUser;
   String smtpPassword;
+
+  // MQTT
+  bool mqttEnabled;
+  bool mqttMeshRelay;
+  bool mqttIpAlerts;
+  String mqttBroker;
+  int mqttPort;
+  String mqttTopic;
+  int mqttQos;
+  String mqttUsername;
+  String mqttPassword;
 };
 
 Settings settings;
@@ -211,6 +223,19 @@ Settings defaultSettingsFromBuild() {
   s.emailSender = String(EMAIL_SENDER);
   s.smtpUser = String(SMTP_USER);
   s.smtpPassword = String(SMTP_PASSWORD);
+
+  s.mqttEnabled = (MQTT_ENABLED != 0);
+  s.mqttMeshRelay = (MQTT_MESH_RELAY != 0);
+  s.mqttIpAlerts = (MQTT_IP_ALERTS != 0);
+  s.mqttBroker = String(MQTT_BROKER);
+  s.mqttPort = String(MQTT_PORT).toInt();
+  if (s.mqttPort <= 0) s.mqttPort = 1883;
+  s.mqttTopic = String(MQTT_TOPIC);
+  s.mqttQos = String(MQTT_QOS).toInt();
+  if (s.mqttQos < 0) s.mqttQos = 0;
+  if (s.mqttQos > 2) s.mqttQos = 2;
+  s.mqttUsername = String(MQTT_USERNAME);
+  s.mqttPassword = String(MQTT_PASSWORD);
   return s;
 }
 
@@ -282,6 +307,16 @@ void loadSettingsOverrides() {
   if (doc["SMTP_USER"].is<String>()) settings.smtpUser = doc["SMTP_USER"].as<String>();
   if (doc["SMTP_PASSWORD"].is<String>()) settings.smtpPassword = doc["SMTP_PASSWORD"].as<String>();
 
+  // MQTT strings
+  if (doc["MQTT_BROKER"].is<String>()) settings.mqttBroker = doc["MQTT_BROKER"].as<String>();
+  if (doc["MQTT_PORT"].is<int>()) settings.mqttPort = doc["MQTT_PORT"].as<int>();
+  if (doc["MQTT_PORT"].is<String>()) settings.mqttPort = doc["MQTT_PORT"].as<String>().toInt();
+  if (doc["MQTT_TOPIC"].is<String>()) settings.mqttTopic = doc["MQTT_TOPIC"].as<String>();
+  if (doc["MQTT_QOS"].is<int>()) settings.mqttQos = doc["MQTT_QOS"].as<int>();
+  if (doc["MQTT_QOS"].is<String>()) settings.mqttQos = doc["MQTT_QOS"].as<String>().toInt();
+  if (doc["MQTT_USERNAME"].is<String>()) settings.mqttUsername = doc["MQTT_USERNAME"].as<String>();
+  if (doc["MQTT_PASSWORD"].is<String>()) settings.mqttPassword = doc["MQTT_PASSWORD"].as<String>();
+
   // Booleans
   if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
   if (doc["NTFY_MESH_RELAY"].is<bool>()) settings.ntfyMeshRelay = doc["NTFY_MESH_RELAY"].as<bool>();
@@ -295,6 +330,15 @@ void loadSettingsOverrides() {
   if (doc["EMAIL_ENABLED"].is<bool>()) settings.emailEnabled = doc["EMAIL_ENABLED"].as<bool>();
   if (doc["EMAIL_MESH_RELAY"].is<bool>()) settings.emailMeshRelay = doc["EMAIL_MESH_RELAY"].as<bool>();
   if (doc["EMAIL_IP_ALERTS"].is<bool>()) settings.emailIpAlerts = doc["EMAIL_IP_ALERTS"].as<bool>();
+
+  if (doc["MQTT_ENABLED"].is<bool>()) settings.mqttEnabled = doc["MQTT_ENABLED"].as<bool>();
+  if (doc["MQTT_MESH_RELAY"].is<bool>()) settings.mqttMeshRelay = doc["MQTT_MESH_RELAY"].as<bool>();
+  if (doc["MQTT_IP_ALERTS"].is<bool>()) settings.mqttIpAlerts = doc["MQTT_IP_ALERTS"].as<bool>();
+
+  // Normalize
+  if (settings.mqttPort <= 0) settings.mqttPort = 1883;
+  if (settings.mqttQos < 0) settings.mqttQos = 0;
+  if (settings.mqttQos > 2) settings.mqttQos = 2;
 }
 
 bool saveSettingsOverrides() {
@@ -349,6 +393,16 @@ bool saveSettingsOverrides() {
   doc["SMTP_USER"] = settings.smtpUser;
   doc["SMTP_PASSWORD"] = settings.smtpPassword;
 
+  doc["MQTT_ENABLED"] = settings.mqttEnabled;
+  doc["MQTT_MESH_RELAY"] = settings.mqttMeshRelay;
+  doc["MQTT_IP_ALERTS"] = settings.mqttIpAlerts;
+  doc["MQTT_BROKER"] = settings.mqttBroker;
+  doc["MQTT_PORT"] = settings.mqttPort;
+  doc["MQTT_TOPIC"] = settings.mqttTopic;
+  doc["MQTT_QOS"] = settings.mqttQos;
+  doc["MQTT_USERNAME"] = settings.mqttUsername;
+  doc["MQTT_PASSWORD"] = settings.mqttPassword;
+
   if (serializeJson(doc, file) == 0) {
     file.close();
     Serial.println("Failed to write settings.json");
@@ -356,6 +410,156 @@ bool saveSettingsOverrides() {
   }
   file.close();
   return true;
+}
+
+// ============================================
+// MQTT
+// ============================================
+extern bool captivePortalActive;
+static String macNoColons();
+
+static AsyncMqttClient mqttClient;
+static bool mqttConnecting = false;
+static unsigned long mqttLastConnectAttemptMs = 0;
+
+static const size_t MQTT_DEDUP_SIZE = 32;
+static String mqttRecentMessageIds[MQTT_DEDUP_SIZE];
+static uint8_t mqttRecentMessageIdsHead = 0;
+
+static bool mqttRecentlyPublished(const String &messageId) {
+  if (messageId.length() == 0) return false;
+  for (size_t i = 0; i < MQTT_DEDUP_SIZE; i++) {
+    if (mqttRecentMessageIds[i] == messageId) return true;
+  }
+  return false;
+}
+
+static void mqttRememberPublished(const String &messageId) {
+  if (messageId.length() == 0) return;
+  mqttRecentMessageIds[mqttRecentMessageIdsHead] = messageId;
+  mqttRecentMessageIdsHead = (uint8_t)((mqttRecentMessageIdsHead + 1) % MQTT_DEDUP_SIZE);
+}
+
+static String mqttClientId() {
+  return String("ESP32NM-") + macNoColons();
+}
+
+static void applyMqttConfigFromSettings() {
+  mqttClient.setServer(settings.mqttBroker.c_str(), (uint16_t)settings.mqttPort);
+  mqttClient.setClientId(mqttClientId().c_str());
+  if (settings.mqttUsername.length() > 0) {
+    mqttClient.setCredentials(settings.mqttUsername.c_str(), settings.mqttPassword.c_str());
+  } else {
+    mqttClient.setCredentials(nullptr, nullptr);
+  }
+  mqttClient.setKeepAlive(15);
+}
+
+static bool ensureMqttConnected() {
+  if (!settings.mqttEnabled) return false;
+  if (captivePortalActive) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (settings.mqttBroker.length() == 0) return false;
+  if (settings.mqttPort <= 0) return false;
+
+  if (mqttClient.connected()) return true;
+  if (mqttConnecting) return false;
+
+  unsigned long now = millis();
+  if (now - mqttLastConnectAttemptMs < 10000) return false;
+  mqttLastConnectAttemptMs = now;
+
+  applyMqttConfigFromSettings();
+
+  Serial.printf("[MQTT] Connecting to %s:%d as %s\n", settings.mqttBroker.c_str(), settings.mqttPort, mqttClientId().c_str());
+  mqttConnecting = true;
+  mqttClient.connect();
+  return false;
+}
+
+static void mqttOnConnect(bool sessionPresent) {
+  (void)sessionPresent;
+  mqttConnecting = false;
+  Serial.println("[MQTT] Connected");
+}
+
+static void mqttOnDisconnect(AsyncMqttClientDisconnectReason reason) {
+  mqttConnecting = false;
+  Serial.printf("[MQTT] Disconnected (reason=%d)\n", (int)reason);
+}
+
+static void initMqttClientOnce() {
+  static bool inited = false;
+  if (inited) return;
+  inited = true;
+  mqttClient.onConnect(mqttOnConnect);
+  mqttClient.onDisconnect(mqttOnDisconnect);
+}
+
+static String sha256HexShort(const String &input, size_t hexChars) {
+  unsigned char out[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char*)input.c_str(), input.length());
+  mbedtls_sha256_finish(&ctx, out);
+  mbedtls_sha256_free(&ctx);
+
+  static const char* hex = "0123456789abcdef";
+  String s;
+  s.reserve(64);
+  for (size_t i = 0; i < 32; i++) {
+    s += hex[(out[i] >> 4) & 0x0F];
+    s += hex[out[i] & 0x0F];
+  }
+  if (hexChars > 64) hexChars = 64;
+  return s.substring(0, (int)hexChars);
+}
+
+static String messageIdForBody(const String &body) {
+  // Stable ID derived from message content; avoids duplicates on repeated sends.
+  return sha256HexShort(body, 16);
+}
+
+static String addMessageIdPrefix(const String &body, const String &messageId) {
+  if (messageId.length() == 0) return body;
+  return String("MessageID: ") + messageId + "\n" + body;
+}
+
+void forwardToMqtt(String message);
+
+void forwardToMqtt(String message) {
+  initMqttClientOnce();
+
+  String messageId = messageIdForBody(message);
+  if (mqttRecentlyPublished(messageId)) {
+    Serial.println("[MQTT] Duplicate MessageID; skipping publish");
+    return;
+  }
+
+  if (!settings.mqttEnabled) {
+    Serial.println("MQTT disabled, skipping");
+    return;
+  }
+  if (settings.mqttTopic.length() == 0) {
+    Serial.println("MQTT topic empty, skipping");
+    return;
+  }
+  if (settings.mqttQos < 0) settings.mqttQos = 0;
+  if (settings.mqttQos > 2) settings.mqttQos = 2;
+  if (!ensureMqttConnected()) {
+    Serial.println("MQTT not connected, skipping publish");
+    return;
+  }
+
+  String payload = addMessageIdPrefix(message, messageId);
+  uint16_t pid = mqttClient.publish(settings.mqttTopic.c_str(), (uint8_t)settings.mqttQos, false, payload.c_str(), payload.length());
+  if (pid > 0 || settings.mqttQos == 0) {
+    mqttRememberPublished(messageId);
+    Serial.printf("[MQTT] Published to %s (qos=%d)\n", settings.mqttTopic.c_str(), settings.mqttQos);
+  } else {
+    Serial.println("[MQTT] Publish failed");
+  }
 }
 
 // Battery monitoring (Heltec Wireless Stick Lite V3 VBAT on GPIO1)
@@ -473,7 +677,19 @@ void forwardToNtfy(String message);
 void forwardToEmail(String message);
 void forwardToDiscord(String message);
 void forwardToWebhook(String message);
+void forwardToMqtt(String message);
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
+
+static void fanOutInternetNotificationsWithId(const String &message) {
+  String messageId = messageIdForBody(message);
+  String bodyWithId = addMessageIdPrefix(message, messageId);
+
+  if (settings.ntfyEnabled) forwardToNtfy(bodyWithId);
+  if (settings.discordEnabled) forwardToDiscord(bodyWithId);
+  if (settings.webhookEnabled) forwardToWebhook(bodyWithId);
+  if (settings.emailEnabled) forwardToEmail(bodyWithId);
+  if (settings.mqttEnabled) forwardToMqtt(message);  // forwardToMqtt adds its own MessageID prefix and de-dups
+}
 
 static bool loraReady = false;
 static bool pendingLoRaNotify = false;
@@ -544,10 +760,13 @@ static void notifyIpChangeIfNeeded(const String &newIp, const String &reason) {
   if (reason.length() > 0) msg += "\nReason: " + reason;
 
   Serial.println("[WiFi] IP changed; sending notifications");
-  if (settings.ntfyEnabled && settings.ntfyIpAlerts) forwardToNtfy(msg);
-  if (settings.discordEnabled && settings.discordIpAlerts) forwardToDiscord(msg);
-  if (settings.webhookEnabled && settings.webhookIpAlerts) forwardToWebhook(msg);
-  if (settings.emailEnabled && settings.emailIpAlerts) forwardToEmail(msg);
+  String messageId = messageIdForBody(msg);
+  String bodyWithId = addMessageIdPrefix(msg, messageId);
+  if (settings.ntfyEnabled && settings.ntfyIpAlerts) forwardToNtfy(bodyWithId);
+  if (settings.discordEnabled && settings.discordIpAlerts) forwardToDiscord(bodyWithId);
+  if (settings.webhookEnabled && settings.webhookIpAlerts) forwardToWebhook(bodyWithId);
+  if (settings.emailEnabled && settings.emailIpAlerts) forwardToEmail(bodyWithId);
+  if (settings.mqttEnabled && settings.mqttIpAlerts) forwardToMqtt(msg);
 
   if (settings.loraEnabled && settings.loraIpAlerts) {
     if (loraReady) {
@@ -1026,6 +1245,9 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   if (message.length() > 0) {
     notification += " - " + message;
   }
+
+  String messageId = messageIdForBody(notification);
+  notification = "[MessageID:" + messageId + "] " + notification;
   
   // Derive channel hash and key
   uint8_t channelHash;
@@ -2151,6 +2373,15 @@ void setup() {
     doc["EMAIL_SENDER"] = settings.emailSender;
     doc["SMTP_USER"] = settings.smtpUser;
 
+    doc["MQTT_ENABLED"] = settings.mqttEnabled;
+    doc["MQTT_MESH_RELAY"] = settings.mqttMeshRelay;
+    doc["MQTT_IP_ALERTS"] = settings.mqttIpAlerts;
+    doc["MQTT_BROKER"] = settings.mqttBroker;
+    doc["MQTT_PORT"] = settings.mqttPort;
+    doc["MQTT_TOPIC"] = settings.mqttTopic;
+    doc["MQTT_QOS"] = settings.mqttQos;
+    doc["MQTT_USERNAME"] = settings.mqttUsername;
+
     String json;
     serializeJson(doc, json);
     AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", json);
@@ -2259,6 +2490,18 @@ void setup() {
         if (v.length() > 0) settings.smtpPassword = v;
       }
 
+      if (doc["MQTT_BROKER"].is<String>()) settings.mqttBroker = doc["MQTT_BROKER"].as<String>();
+      if (doc["MQTT_PORT"].is<int>()) settings.mqttPort = doc["MQTT_PORT"].as<int>();
+      if (doc["MQTT_PORT"].is<String>()) settings.mqttPort = doc["MQTT_PORT"].as<String>().toInt();
+      if (doc["MQTT_TOPIC"].is<String>()) settings.mqttTopic = doc["MQTT_TOPIC"].as<String>();
+      if (doc["MQTT_QOS"].is<int>()) settings.mqttQos = doc["MQTT_QOS"].as<int>();
+      if (doc["MQTT_QOS"].is<String>()) settings.mqttQos = doc["MQTT_QOS"].as<String>().toInt();
+      if (doc["MQTT_USERNAME"].is<String>()) settings.mqttUsername = doc["MQTT_USERNAME"].as<String>();
+      if (doc["MQTT_PASSWORD"].is<String>()) {
+        String v = doc["MQTT_PASSWORD"].as<String>();
+        if (v.length() > 0) settings.mqttPassword = v;
+      }
+
       // Booleans
       if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
       if (doc["NTFY_MESH_RELAY"].is<bool>()) settings.ntfyMeshRelay = doc["NTFY_MESH_RELAY"].as<bool>();
@@ -2273,8 +2516,16 @@ void setup() {
       if (doc["EMAIL_MESH_RELAY"].is<bool>()) settings.emailMeshRelay = doc["EMAIL_MESH_RELAY"].as<bool>();
       if (doc["EMAIL_IP_ALERTS"].is<bool>()) settings.emailIpAlerts = doc["EMAIL_IP_ALERTS"].as<bool>();
 
+      if (doc["MQTT_ENABLED"].is<bool>()) settings.mqttEnabled = doc["MQTT_ENABLED"].as<bool>();
+      if (doc["MQTT_MESH_RELAY"].is<bool>()) settings.mqttMeshRelay = doc["MQTT_MESH_RELAY"].as<bool>();
+      if (doc["MQTT_IP_ALERTS"].is<bool>()) settings.mqttIpAlerts = doc["MQTT_IP_ALERTS"].as<bool>();
+
       // Normalize
       if (settings.webhookMethod.length() == 0) settings.webhookMethod = "POST";
+
+      if (settings.mqttPort <= 0) settings.mqttPort = 1883;
+      if (settings.mqttQos < 0) settings.mqttQos = 0;
+      if (settings.mqttQos > 2) settings.mqttQos = 2;
 
       if (settings.loraFreq <= 0.0f) settings.loraFreq = (float)LORA_FREQ;
       if (settings.loraBandwidth <= 0.0f) settings.loraBandwidth = (float)LORA_BANDWIDTH;
@@ -2291,6 +2542,19 @@ void setup() {
       if (wifiChanged) {
         Serial.println("Settings updated: WiFi changed; reconnecting...");
         setupWiFi();
+      }
+
+      bool mqttChanged = (before.mqttEnabled != settings.mqttEnabled) ||
+                         (before.mqttBroker != settings.mqttBroker) ||
+                         (before.mqttPort != settings.mqttPort) ||
+                         (before.mqttTopic != settings.mqttTopic) ||
+                         (before.mqttQos != settings.mqttQos) ||
+                         (before.mqttUsername != settings.mqttUsername) ||
+                         (before.mqttPassword != settings.mqttPassword);
+      if (mqttChanged) {
+        if (mqttClient.connected()) mqttClient.disconnect();
+        mqttLastConnectAttemptMs = 0;
+        applyMqttConfigFromSettings();
       }
 
       // LoRa settings require reboot (RadioLib init happens at boot)
@@ -2388,6 +2652,18 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>SMTP Password</label><input id='SMTP_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
     page += "</div></div>";
 
+    page += "<div class='card'><h2>MQTT</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='MQTT_ENABLED'><option value='true'" + String(settings.mqttEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.mqttEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='MQTT_MESH_RELAY'><option value='true'" + String(settings.mqttMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.mqttMeshRelay ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='MQTT_IP_ALERTS'><option value='true'" + String(settings.mqttIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.mqttIpAlerts ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Broker</label><input id='MQTT_BROKER' value='" + settings.mqttBroker + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Port</label><input id='MQTT_PORT' value='" + String(settings.mqttPort) + "'></div>";
+    page += "<div class='fg'><label class='lbl'>QoS</label><select id='MQTT_QOS'><option value='0'" + String(settings.mqttQos == 0 ? " selected" : "") + ">0</option><option value='1'" + String(settings.mqttQos == 1 ? " selected" : "") + ">1</option><option value='2'" + String(settings.mqttQos == 2 ? " selected" : "") + ">2</option></select></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>Topic</label><input id='MQTT_TOPIC' value='" + settings.mqttTopic + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Username</label><input id='MQTT_USERNAME' value='" + settings.mqttUsername + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Password</label><input id='MQTT_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "</div></div>";
+
     page += "<div class='card'><div class='btns'>";
     page += "<button class='btn primary' onclick='save()'>Save</button>";
     page += "<button class='btn secondary' onclick='location.href=\"/\"'>Back</button>";
@@ -2406,6 +2682,8 @@ void setup() {
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
     page += "WEBHOOK_ENABLED:boolVal('WEBHOOK_ENABLED'),WEBHOOK_MESH_RELAY:boolVal('WEBHOOK_MESH_RELAY'),WEBHOOK_IP_ALERTS:boolVal('WEBHOOK_IP_ALERTS'),WEBHOOK_URL:val('WEBHOOK_URL'),WEBHOOK_METHOD:val('WEBHOOK_METHOD'),";
     page += "EMAIL_ENABLED:boolVal('EMAIL_ENABLED'),EMAIL_MESH_RELAY:boolVal('EMAIL_MESH_RELAY'),EMAIL_IP_ALERTS:boolVal('EMAIL_IP_ALERTS'),SMTP_HOST:val('SMTP_HOST'),SMTP_PORT:val('SMTP_PORT'),EMAIL_RECIPIENT:val('EMAIL_RECIPIENT'),EMAIL_SENDER:val('EMAIL_SENDER'),SMTP_USER:val('SMTP_USER'),SMTP_PASSWORD:val('SMTP_PASSWORD')";
+    page += ",MQTT_ENABLED:boolVal('MQTT_ENABLED'),MQTT_MESH_RELAY:boolVal('MQTT_MESH_RELAY'),MQTT_IP_ALERTS:boolVal('MQTT_IP_ALERTS'),MQTT_BROKER:val('MQTT_BROKER'),MQTT_PORT:val('MQTT_PORT'),MQTT_TOPIC:val('MQTT_TOPIC'),MQTT_USERNAME:val('MQTT_USERNAME'),MQTT_PASSWORD:val('MQTT_PASSWORD')";
+    page += ",MQTT_QOS:val('MQTT_QOS')";
     page += "};";
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
@@ -3039,10 +3317,7 @@ void setup() {
     if (!isAuthenticated(request)) return;
     const String testMsg = "This is a test notification from ESP32 Monitor";
     sendLoRaNotification("Test", true, testMsg);
-    if (settings.ntfyEnabled) forwardToNtfy(testMsg);
-    if (settings.discordEnabled) forwardToDiscord(testMsg);
-    if (settings.webhookEnabled) forwardToWebhook(testMsg);
-    if (settings.emailEnabled) forwardToEmail(testMsg);
+    fanOutInternetNotificationsWithId(testMsg);
 
     request->send(200, "text/plain", "Test notification triggered on enabled channels");
   });
@@ -3138,10 +3413,7 @@ void setup() {
 
         sendLoRaNotification(source, true, message);
 
-  if (settings.ntfyEnabled) forwardToNtfy(combined);
-  if (settings.discordEnabled) forwardToDiscord(combined);
-  if (settings.webhookEnabled) forwardToWebhook(combined);
-  if (settings.emailEnabled) forwardToEmail(combined);
+      fanOutInternetNotificationsWithId(combined);
 
         request->send(200, "application/json", "{\"status\":\"ok\"}");
       }
@@ -3168,46 +3440,47 @@ void loop() {
     dnsServer.processNextRequest();
   }
 
+  if (settings.mqttEnabled) {
+    ensureMqttConnected();
+  }
+
   if (pendingRestart && millis() >= restartAtMs) {
     Serial.println("Rebooting now...");
     delay(50);
     ESP.restart();
   }
 
-  if (!settings.loraEnabled) {
-    delay(50);
-    return;
-  }
-
-  // Check for LoRa packets (all devices listen)
-  String message;
-  int state = radio.receive(message);
-  
-  if (state == RADIOLIB_ERR_NONE) {
-    // Packet received successfully
-    lastRssi = radio.getRSSI();
-    lastSnr = radio.getSNR();
+  if (settings.loraEnabled) {
+    // Check for LoRa packets (all devices listen)
+    String message;
+    int state = radio.receive(message);
     
-    Serial.print("Received packet: '");
-    Serial.print(message);
-    Serial.print("' RSSI: ");
-    Serial.print(lastRssi);
-    Serial.print(" dBm, SNR: ");
-    Serial.print(lastSnr);
-    Serial.println(" dB");
-    
-    // Handle the message
-    handleLoRaMessage(message);
-    
-    lastMessageTime = millis();
-    messageCount++;
-    
-    // Put radio back in receive mode
-    radio.startReceive();
-  } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
-    // Some other error occurred
-    Serial.print("LoRa receive failed, code: ");
-    Serial.println(state);
+    if (state == RADIOLIB_ERR_NONE) {
+      // Packet received successfully
+      lastRssi = radio.getRSSI();
+      lastSnr = radio.getSNR();
+      
+      Serial.print("Received packet: '");
+      Serial.print(message);
+      Serial.print("' RSSI: ");
+      Serial.print(lastRssi);
+      Serial.print(" dBm, SNR: ");
+      Serial.print(lastSnr);
+      Serial.println(" dB");
+      
+      // Handle the message
+      handleLoRaMessage(message);
+      
+      lastMessageTime = millis();
+      messageCount++;
+      
+      // Put radio back in receive mode
+      radio.startReceive();
+    } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
+      // Some other error occurred
+      Serial.print("LoRa receive failed, code: ");
+      Serial.println(state);
+    }
   }
   
   // Track and heal WiFi connectivity.
@@ -3294,10 +3567,7 @@ void setupWiFi() {
       Serial.println("[WiFi] Captive provisioning complete; sending notifications");
 
       // Internet-based notification providers
-      if (settings.ntfyEnabled) forwardToNtfy(msg);
-      if (settings.discordEnabled) forwardToDiscord(msg);
-      if (settings.webhookEnabled) forwardToWebhook(msg);
-      if (settings.emailEnabled) forwardToEmail(msg);
+      fanOutInternetNotificationsWithId(msg);
 
       // Defer LoRa notification until after the radio is initialized
       pendingWifiProvisionNotify = true;
@@ -3565,6 +3835,12 @@ void handleLoRaMessage(String message) {
   } else if (settings.emailEnabled && !settings.emailMeshRelay) {
     Serial.println("Email mesh relay disabled, skipping");
   }
+
+  if (settings.mqttEnabled && settings.mqttMeshRelay) {
+    forwardToMqtt(forwardMsg);
+  } else if (settings.mqttEnabled && !settings.mqttMeshRelay) {
+    Serial.println("MQTT mesh relay disabled, skipping");
+  }
 }
 
 // ============================================
@@ -3583,6 +3859,8 @@ void forwardToNtfy(String message) {
     Serial.println("Ntfy disabled, skipping");
     return;
   }
+  // Use deterministic MessageID for server-side de-duplication.
+  String messageId = messageIdForBody(message);
   HTTPClient http;
   String url = settings.ntfyServer + "/" + settings.ntfyTopic;
   
@@ -3605,7 +3883,11 @@ void forwardToNtfy(String message) {
   http.addHeader("Title", "ESP32 Uptime Alert");
   http.addHeader("Tags", "bell");
   http.addHeader("Content-Type", "text/plain");
-  http.addHeader("X-Message-ID", String(millis()));  // avoid dedup on server
+  if (messageId.length() > 0) {
+    http.addHeader("X-Message-ID", messageId);
+  } else {
+    http.addHeader("X-Message-ID", String(millis()));
+  }
   
   // Add authentication - MUST be after begin() and headers
   String ntfyToken = settings.ntfyToken;
@@ -3642,7 +3924,7 @@ void forwardToEmail(String message) {
   // Note: ESP32 SMTP support requires additional library
   // For now, this is a placeholder that would need ESP_Mail_Client library
   Serial.println("Email forwarding not fully implemented");
-  Serial.println("Would send: " + message);
+  Serial.println("Would send: " + addMessageIdPrefix(message, messageIdForBody(message)));
   // TODO: Implement ESP_Mail_Client integration
 }
 
@@ -3706,6 +3988,7 @@ void forwardToWebhook(String message) {
   
   // Create JSON payload
   JsonDocument doc;
+  doc["messageId"] = messageIdForBody(message);
   doc["message"] = message;
   doc["source"] = "ESP32_Uptime_Receiver";
   doc["timestamp"] = millis();

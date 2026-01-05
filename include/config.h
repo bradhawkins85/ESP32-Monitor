@@ -260,6 +260,43 @@
 #define WEBHOOK_METHOD "POST"
 #endif
 
+// MQTT Notification Configuration
+#ifndef MQTT_ENABLED
+#define MQTT_ENABLED false
+#endif
+
+#ifndef MQTT_IP_ALERTS
+#define MQTT_IP_ALERTS true
+#endif
+
+#ifndef MQTT_MESH_RELAY
+#define MQTT_MESH_RELAY false  // Relay mesh messages to MQTT
+#endif
+
+#ifndef MQTT_BROKER
+#define MQTT_BROKER ""
+#endif
+
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
+#endif
+
+#ifndef MQTT_TOPIC
+#define MQTT_TOPIC "esp32-monitor/alerts"
+#endif
+
+#ifndef MQTT_QOS
+#define MQTT_QOS 0  // 0, 1, or 2
+#endif
+
+#ifndef MQTT_USERNAME
+#define MQTT_USERNAME ""
+#endif
+
+#ifndef MQTT_PASSWORD
+#define MQTT_PASSWORD ""
+#endif
+
 // Display Configuration
 #ifndef ENABLE_DISPLAY
 #define ENABLE_DISPLAY true
