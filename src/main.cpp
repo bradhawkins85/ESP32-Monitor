@@ -91,6 +91,104 @@ struct Service {
 Service services[MAX_SERVICES];
 int serviceCount = 0;
 
+// ============================================
+// Service Status History (LittleFS)
+// Stores minimal event records: <unix_epoch_seconds>,<U|D>\n
+// Only logs UP<->DOWN transitions (not Pending).
+// Total history budget: 542336 bytes. Enforced via per-service cap.
+// ============================================
+static const char* HISTORY_DIR = "/history";
+static const size_t HISTORY_TOTAL_BUDGET_BYTES = 542336;
+static const size_t HISTORY_PER_SERVICE_BUDGET_BYTES = (HISTORY_TOTAL_BUDGET_BYTES / MAX_SERVICES);
+
+static String sanitizeForPath(const String &in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    if (ok) out += c;
+    else out += '_';
+  }
+  if (out.length() == 0) out = "svc";
+  if (out.length() > 48) out = out.substring(0, 48);
+  return out;
+}
+
+static String historyFileForServiceId(const String &serviceId) {
+  return String(HISTORY_DIR) + "/" + sanitizeForPath(serviceId) + ".log";
+}
+
+static void ensureHistoryDir() {
+  if (!LittleFS.exists(HISTORY_DIR)) {
+    LittleFS.mkdir(HISTORY_DIR);
+  }
+}
+
+static void trimFileToSize(const String &path, size_t maxBytes) {
+  if (!LittleFS.exists(path)) return;
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  size_t sz = f.size();
+  if (sz <= maxBytes) {
+    f.close();
+    return;
+  }
+
+  size_t start = (sz > maxBytes) ? (sz - maxBytes) : 0;
+  if (start > 0) {
+    f.seek(start);
+    // Align to next newline to avoid partial record
+    while (f.available()) {
+      int ch = f.read();
+      if (ch == '\n') break;
+    }
+  }
+
+  String remainder = f.readString();
+  f.close();
+
+  String tmpPath = path + ".tmp";
+  File out = LittleFS.open(tmpPath, "w");
+  if (!out) return;
+  out.print(remainder);
+  out.close();
+
+  LittleFS.remove(path);
+  LittleFS.rename(tmpPath, path);
+}
+
+static void appendServiceStatusEvent(const Service &service, bool isUp) {
+  ensureHistoryDir();
+
+  time_t now = time(nullptr);
+  if (now < 1000000000) {
+    Serial.println("[History] Time not synced; skipping history log");
+    return;
+  }
+
+  String path = historyFileForServiceId(service.id);
+  File f = LittleFS.open(path, "a");
+  if (!f) {
+    Serial.println("[History] Failed to open history file for append");
+    return;
+  }
+
+  char line[32];
+  snprintf(line, sizeof(line), "%lu,%c\n", (unsigned long)now, isUp ? 'U' : 'D');
+  f.print(line);
+  f.close();
+
+  trimFileToSize(path, HISTORY_PER_SERVICE_BUDGET_BYTES);
+}
+
+static void deleteServiceHistory(const String &serviceId) {
+  String path = historyFileForServiceId(serviceId);
+  if (LittleFS.exists(path)) {
+    LittleFS.remove(path);
+  }
+}
+
 // --- Global Variables ---
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 int lastRssi = 0;
@@ -1892,6 +1990,7 @@ void updateServiceStatus(Service& service, bool checkResult) {
   
   // Send LoRa notification on status change (but not for initial pending -> up/down transition)
   if (wasUp != service.isUp && !wasPending) {
+    appendServiceStatusEvent(service, service.isUp);
     if (service.isUp) {
       Serial.printf("[Status] %s is now UP\n", service.name.c_str());
       sendLoRaNotification(service.name, true, service.lastError);
@@ -2804,12 +2903,13 @@ void setup() {
       html += "<div class='service-card " + statusClass + "'>";
       html += "<div class='service-header'>";
       html += "<div class='service-name'>" + services[i].name + "</div>";
+      html += "<div class='service-actions'>";
+      html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
       if (isAuthed) {
-        html += "<div class='service-actions'>";
         html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
         html += "<button class='icon-btn delete' onclick='deleteService(" + String(i) + ")' title='Delete'>🗑️</button>";
-        html += "</div>";
       }
+      html += "</div>";
       html += "</div>";
       html += "<span class='service-status " + statusBadgeClass + "'>" + statusText + "</span>";
       html += "<div class='service-info'>Type: " + String(services[i].type) + " | Host: " + services[i].host + "</div>";
@@ -2906,6 +3006,13 @@ void setup() {
     html += "<button type='submit' class='btn btn-primary' style='flex:1'>Save Service</button>";
     html += "<button type='button' class='btn btn-cancel' onclick='closeModal()'>Cancel</button></div>";
     html += "</form></div></div>";
+
+    // Modal for history
+    html += "<div id='historyModal' class='modal'><div class='modal-content'>";
+    html += "<div class='modal-header'><div class='modal-title' id='historyTitle'>History</div>";
+    html += "<button class='close-btn' onclick='closeHistoryModal()'>×</button></div>";
+    html += "<div id='historyBody' style='white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px;line-height:1.4;color:#2d3748'></div>";
+    html += "</div></div>";
     
     // JavaScript
     html += "<script>";
@@ -2920,6 +3027,23 @@ void setup() {
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show');modalOpen=false;}";
+
+    html += "function closeHistoryModal(){document.getElementById('historyModal').classList.remove('show');modalOpen=false;}";
+
+    html += "async function viewHistory(i){try{";
+    html += "const svc=services[i];document.getElementById('historyTitle').textContent='History - '+(svc?.name||'Service');";
+    html += "document.getElementById('historyBody').textContent='Loading...';";
+    html += "document.getElementById('historyModal').classList.add('show');modalOpen=true;";
+    html += "const res=await fetch('/api/service-history/'+i,{credentials:'include'});";
+    html += "if(!res.ok){document.getElementById('historyBody').textContent='Failed to load history';return;}";
+    html += "const txt=await res.text();";
+    html += "const lines=txt.split(/\\r?\\n/).filter(l=>l.trim().length);";
+    html += "if(!lines.length){document.getElementById('historyBody').textContent='No history yet';return;}";
+    html += "const out=[];for(const line of lines){const parts=line.split(',');if(parts.length<2) continue;";
+    html += "const t=parseInt(parts[0],10);const s=(parts[1]||'').trim();if(!t) continue;";
+    html += "const when=new Date(t*1000).toLocaleString();out.push(when+' - '+(s==='U'?'UP':(s==='D'?'DOWN':s)));}";
+    html += "document.getElementById('historyBody').textContent=out.join('\\n');";
+    html += "}catch(e){document.getElementById('historyBody').textContent='Failed to load history';}}";
     html += "function editService(i){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Edit Service';";
     html += "const s=services[i];document.getElementById('serviceIndex').value=i;";
     html += "document.getElementById('serviceName').value=s.name;";
@@ -3303,13 +3427,51 @@ void setup() {
       request->send(404, "text/plain", "Service not found");
       return;
     }
+
+    String deletedId = services[idx].id;
     // Shift services array
     for (int i = idx; i < serviceCount - 1; i++) {
       services[i] = services[i + 1];
     }
     serviceCount--;
+    deleteServiceHistory(deletedId);
     saveServices();  // Persist to LittleFS
     request->send(200, "text/plain", "Service deleted");
+  });
+
+  // API endpoint to fetch a service's up/down history
+  server.on("/api/service-history/*", HTTP_GET, [](AsyncWebServerRequest *request){
+    String url = request->url();
+    int idx = url.substring(url.lastIndexOf('/') + 1).toInt();
+    if (idx < 0 || idx >= serviceCount) {
+      request->send(404, "text/plain", "Not found");
+      return;
+    }
+
+    String path = historyFileForServiceId(services[idx].id);
+    if (!LittleFS.exists(path)) {
+      AsyncWebServerResponse *resp = request->beginResponse(200, "text/plain", "");
+      resp->addHeader("Cache-Control", "no-store");
+      request->send(resp);
+      return;
+    }
+
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+      request->send(500, "text/plain", "Failed to open");
+      return;
+    }
+
+    AsyncResponseStream *response = request->beginResponseStream("text/plain");
+    response->addHeader("Cache-Control", "no-store");
+    uint8_t buf[512];
+    while (f.available()) {
+      size_t n = f.read(buf, sizeof(buf));
+      if (n == 0) break;
+      response->write(buf, n);
+    }
+    f.close();
+    request->send(response);
   });
 
   // API endpoint to test notifications
