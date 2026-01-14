@@ -58,6 +58,7 @@ string_vars = {
 
     # LoRa/MeshCore Channel Configuration
     "CHANNEL_NAME": os.environ.get("CHANNEL_NAME", "BCAlerts"),
+    "LORA_NODE_NAME": os.environ.get("LORA_NODE_NAME", ""),
     "CHANNEL_SECRET": os.environ.get("CHANNEL_SECRET", ""),
     
     # Discord Configuration

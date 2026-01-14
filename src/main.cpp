@@ -244,6 +244,7 @@ struct Settings {
   // LoRa radio parameters
   bool loraEnabled;
   bool loraIpAlerts;
+  String loraNodeName;
   float loraFreq;
   float loraBandwidth;
   int loraSpreadingFactor;
@@ -319,6 +320,7 @@ Settings defaultSettingsFromBuild() {
 
   s.loraEnabled = (LORA_ENABLED != 0);
   s.loraIpAlerts = (LORA_IP_ALERTS != 0);
+  s.loraNodeName = String(LORA_NODE_NAME);
   s.loraFreq = (float)LORA_FREQ;
   s.loraBandwidth = (float)LORA_BANDWIDTH;
   s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
@@ -1530,15 +1532,26 @@ void sendBootAdvert() {
     return;
   }
   
-  // Get MAC address for node ID and name
+  // Get MAC address for node ID
   uint8_t mac[6];
   WiFi.macAddress(mac);
   uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
   
-  // Create node name from MAC
-  char nodeName[18];
-  snprintf(nodeName, sizeof(nodeName), "%02X:%02X:%02X:%02X:%02X:%02X", 
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  // Use configured node name, or default to first 8 chars of public key
+  String nodeNameStr = settings.loraNodeName;
+  if (nodeNameStr.length() == 0) {
+    // Default: first 8 hex chars of public key
+    char hexBuf[17];
+    for (int i = 0; i < 4; i++) {
+      snprintf(hexBuf + (i * 2), 3, "%02X", ed25519_public_key[i]);
+    }
+    hexBuf[8] = '\0';
+    nodeNameStr = String(hexBuf);
+  }
+  
+  char nodeName[33];
+  strncpy(nodeName, nodeNameStr.c_str(), sizeof(nodeName) - 1);
+  nodeName[sizeof(nodeName) - 1] = '\0';
   size_t nodeNameLen = strlen(nodeName);
   
   // Timestamp (4 bytes, little-endian)
@@ -2662,6 +2675,7 @@ void setup() {
     doc["CHANNEL_NAME"] = settings.channelName;
 
     doc["LORA_ENABLED"] = settings.loraEnabled;
+    doc["LORA_NODE_NAME"] = settings.loraNodeName;
     doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
     doc["LORA_FREQ"] = settings.loraFreq;
     doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
@@ -2769,6 +2783,7 @@ void setup() {
       }
 
       if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
+      if (doc["LORA_NODE_NAME"].is<String>()) settings.loraNodeName = doc["LORA_NODE_NAME"].as<String>();
       if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
 
       // LoRa radio parameters
@@ -2955,6 +2970,7 @@ void setup() {
     page += "</div></div>";
 
     page += "<div class='card'><h2>LoRa / MeshCore</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Node Name</label><input id='LORA_NODE_NAME' value='" + settings.loraNodeName + "' placeholder='(first 8 chars of public key)'></div>";
     page += "<div class='fg'><label class='lbl'>Channel Name</label><input id='CHANNEL_NAME' value='" + settings.channelName + "'></div>";
     page += "<div class='fg'><label class='lbl'>Channel Secret</label><input id='CHANNEL_SECRET' type='password' value='' placeholder='(unchanged)'></div>";
     page += "<div class='fg'><label class='lbl'>LoRa Enabled</label><select id='LORA_ENABLED'><option value='true'" + String(settings.loraEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraEnabled ? " selected" : "") + ">No</option></select></div>";

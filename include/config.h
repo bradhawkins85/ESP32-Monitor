@@ -126,6 +126,10 @@
 #define LORA_IP_ALERTS true
 #endif
 
+#ifndef LORA_NODE_NAME
+#define LORA_NODE_NAME ""  // Default: first 8 hex chars of public key
+#endif
+
 #ifndef LORA_SYNC_WORD
 #define LORA_SYNC_WORD 0x1424  // MeshCore private sync word
 #endif

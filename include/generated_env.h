@@ -8,6 +8,7 @@
 #define ADMIN_USERNAME "admin"
 #define ADMIN_PASSWORD "admin"
 #define CHANNEL_NAME "BCAlerts"
+#define LORA_NODE_NAME ""
 #define CHANNEL_SECRET "f7d32d9d09982b83c2c1086a5ea2239a"
 #define DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
 #define NTFY_SERVER "https://ntfy.hawkinsit.au"
