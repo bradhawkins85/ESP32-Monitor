@@ -3771,18 +3771,25 @@ void setup() {
     String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
     page += "<title>OTA Update</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f7fafc;padding:24px;color:#2d3748;}";
     page += ".card{max-width:520px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 8px 24px rgba(0,0,0,0.08);}";
-    page += "h1{margin:0 0 12px;font-size:24px;}p{margin:0 0 16px;color:#4a5568;}";
+    page += "h1{margin:0 0 12px;font-size:24px;}p{margin:0 0 16px;color:#4a5568;}.warn{color:#e53e3e;font-size:14px;margin-bottom:16px;}";
     page += "input[type=file]{width:100%;padding:12px;border:2px dashed #cbd5e0;border-radius:10px;background:#f8fafc;cursor:pointer;margin-bottom:16px;}";
     page += "button{padding:12px 18px;border:none;border-radius:8px;background:#667eea;color:#fff;font-weight:600;cursor:pointer;}";
     page += "button:disabled{opacity:0.6;cursor:not-allowed;}";
-    page += "#status{margin-top:12px;font-weight:600;}";
+    page += "#status{margin-top:12px;font-weight:600;}.progress-bar{width:100%;height:8px;background:#e2e8f0;border-radius:4px;margin:12px 0;overflow:hidden;}";
+    page += ".progress-fill{height:100%;background:#667eea;width:0;transition:width 0.3s;}";
     page += "</style></head><body><div class='card'><h1>OTA Firmware Update</h1><p>Select a .bin file to upload and flash. Device will reboot after a successful update.</p>";
-    page += "<input type='file' id='file' accept='.bin,.bin.gz'>";
-    page += "<button id='uploadBtn'>Upload & Flash</button><div id='status'></div>";
-    page += "<script>const btn=document.getElementById('uploadBtn');const fileInput=document.getElementById('file');const statusEl=document.getElementById('status');";
-    page += "btn.onclick=async()=>{if(!fileInput.files.length){alert('Choose a firmware file');return;}btn.disabled=true;statusEl.textContent='Uploading...';";
-    page += "const fd=new FormData();fd.append('firmware',fileInput.files[0]);";
-    page += "try{const res=await fetch('/ota/upload',{method:'POST',body:fd,credentials:'include'});const txt=await res.text();statusEl.textContent=txt;if(res.ok){statusEl.textContent+=' Rebooting...';setTimeout(()=>location.href='/',4000);}else{btn.disabled=false;}}catch(e){statusEl.textContent='Upload failed';btn.disabled=false;}};";
+    page += "<p class='warn'>⚠️ Do not close this page or disconnect power during upload.</p>";
+    page += "<input type='file' id='file' accept='.bin,.bin.gz'><div id='fileSize'></div>";
+    page += "<button id='uploadBtn'>Upload & Flash</button><div class='progress-bar'><div id='progressFill' class='progress-fill'></div></div><div id='status'></div>";
+    page += "<script>const btn=document.getElementById('uploadBtn');const fileInput=document.getElementById('file');const statusEl=document.getElementById('status');const progressFill=document.getElementById('progressFill');const fileSizeEl=document.getElementById('fileSize');";
+    page += "fileInput.onchange=()=>{const f=fileInput.files[0];if(f){fileSizeEl.textContent='File: '+f.name+' ('+(f.size/1024).toFixed(1)+' KB)';fileSizeEl.style.color='#4a5568';fileSizeEl.style.fontSize='14px';}};";
+    page += "btn.onclick=async()=>{if(!fileInput.files.length){alert('Choose a firmware file');return;}const file=fileInput.files[0];if(file.size>2*1024*1024){if(!confirm('File is larger than 2MB. Upload may take several minutes. Continue?'))return;}";
+    page += "btn.disabled=true;statusEl.textContent='Preparing upload...';progressFill.style.width='0%';const fd=new FormData();fd.append('firmware',file);";
+    page += "const xhr=new XMLHttpRequest();xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(100*e.loaded/e.total);progressFill.style.width=pct+'%';statusEl.textContent='Uploading: '+pct+'%';}};";
+    page += "xhr.onload=()=>{if(xhr.status===200){statusEl.textContent='✓ '+xhr.responseText+' Rebooting...';statusEl.style.color='#48bb78';setTimeout(()=>location.href='/',5000);}else{statusEl.textContent='✗ Upload failed: '+xhr.responseText;statusEl.style.color='#e53e3e';btn.disabled=false;progressFill.style.width='0%';}};";
+    page += "xhr.onerror=()=>{statusEl.textContent='✗ Connection error during upload';statusEl.style.color='#e53e3e';btn.disabled=false;progressFill.style.width='0%';};";
+    page += "xhr.ontimeout=()=>{statusEl.textContent='✗ Upload timeout (file too large or device busy)';statusEl.style.color='#e53e3e';btn.disabled=false;progressFill.style.width='0%';};";
+    page += "xhr.open('POST','/ota/upload');xhr.timeout=120000;xhr.send(fd);};";
     page += "</script></div></body></html>";
     request->send(200, "text/html", page);
   });
@@ -3794,24 +3801,61 @@ void setup() {
     [](AsyncWebServerRequest *request){
       if (!isAuthenticated(request)) return;
       bool ok = !Update.hasError();
-      request->send(ok ? 200 : 500, "text/plain", ok ? "Update successful." : "Update failed.");
       if (ok) {
+        Serial.println("[OTA] Update successful, rebooting...");
+        request->send(200, "text/plain", "Update successful.");
         delay(500);
         ESP.restart();
+      } else {
+        Serial.println("[OTA] Update failed");
+        Update.printError(Serial);
+        request->send(500, "text/plain", "Update failed.");
       }
     },
     [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
-      if (!isAuthenticated(request, false)) return;
+      if (!isAuthenticated(request, false)) {
+        request->send(401, "text/plain", "Authentication required");
+        return;
+      }
+      
       if (index == 0) {
-        if (!Update.begin()) {
+        Serial.printf("[OTA] Starting update: %s (size unknown)\n", filename.c_str());
+        // Calculate maximum available space for OTA
+        size_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        if (!Update.begin(maxSketchSpace, U_FLASH)) {
+          Serial.println("[OTA] Update.begin() failed");
           Update.printError(Serial);
+          return;
+        }
+        Serial.println("[OTA] Update started successfully");
+      }
+      
+      // Feed watchdog during upload
+      yield();
+      
+      // Write firmware data
+      if (len > 0) {
+        size_t written = Update.write(data, len);
+        if (written != len) {
+          Serial.printf("[OTA] Write failed: wrote %d of %d bytes\n", written, len);
+          Update.printError(Serial);
+          return;
+        }
+        
+        // Log progress every 10%
+        static size_t lastProgress = 0;
+        size_t progress = (index + len) * 100 / Update.size();
+        if (Update.size() > 0 && progress >= lastProgress + 10) {
+          Serial.printf("[OTA] Progress: %d%% (%d / %d bytes)\n", progress, index + len, Update.size());
+          lastProgress = progress;
         }
       }
-      if (Update.write(data, len) != len) {
-        Update.printError(Serial);
-      }
+      
       if (final) {
-        if (!Update.end(true)) {
+        if (Update.end(true)) {
+          Serial.printf("[OTA] Update complete: %d bytes written\n", index + len);
+        } else {
+          Serial.println("[OTA] Update.end() failed");
           Update.printError(Serial);
         }
       }
