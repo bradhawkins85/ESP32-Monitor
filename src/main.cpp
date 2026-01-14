@@ -1620,39 +1620,13 @@ void sendBootAdvert() {
   if (state == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa] Flood advert sent: Node %s (header=0x%02X, len=%u)\n", 
                   nodeName, floodHeader, (unsigned int)pktIdx);
-  } else {
-    Serial.printf("[LoRa] Failed to send flood advert, code: %d\n", state);
-  }
-  
-  // Wait briefly between transmissions
-  delay(100);
-  
-  // --- Send Direct (Zero Hop) Advert (header = 0x12) ---
-  pktIdx = 0;
-  
-  // Header: version(0) + payload_type(ADVERT=4) + route_type(DIRECT=2)
-  uint8_t directHeader = (uint8_t)((ROUTE_TYPE_DIRECT & 0x03) | ((PAYLOAD_TYPE_ADVERT & 0x0F) << 2));
-  packet[pktIdx++] = directHeader;
-  
-  // Path (no path for direct/zero hop)
-  packet[pktIdx++] = 0x00;  // path_len = 0 (no path data)
-  
-  // Advert payload (same as flood)
-  memcpy(packet + pktIdx, payload, payloadIdx);
-  pktIdx += payloadIdx;
-  
-  // Transmit direct (zero hop) advert
-  state = radio.transmit(packet, pktIdx);
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.printf("[LoRa] Direct (zero hop) advert sent: Node %s (header=0x%02X, len=%u)\n", 
-                  nodeName, directHeader, (unsigned int)pktIdx);
     Serial.print("[Ed25519] Public key: ");
     for (int i = 0; i < 8; i++) {
       Serial.printf("%02X", ed25519_public_key[i]);
     }
     Serial.println("...");
   } else {
-    Serial.printf("[LoRa] Failed to send zero hop advert, code: %d\n", state);
+    Serial.printf("[LoRa] Failed to send flood advert, code: %d\n", state);
   }
   
   // Return to RX mode
