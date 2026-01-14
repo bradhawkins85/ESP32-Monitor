@@ -7,6 +7,8 @@
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
+#include <Ed25519.h>
+#include <RNG.h>
 #include <time.h>
 #include "config.h"
 #include <driver/adc.h>
@@ -32,8 +34,12 @@
 #define CIPHER_BLOCK_SIZE 16
 #define CIPHER_MAC_SIZE 2
 #define PAYLOAD_TYPE_GRP_TXT 0x05
+#define PAYLOAD_TYPE_ADVERT 0x04
 #define TXT_TYPE_PLAIN 0x00
-#define ROUTE_TYPE_FLOOD 0x01
+#define ROUTE_TYPE_TRANSPORT_FLOOD 0x00  // flood mode + transport codes
+#define ROUTE_TYPE_FLOOD 0x01            // flood mode, needs 'path' to be built up
+#define ROUTE_TYPE_DIRECT 0x02           // direct route, 'path' is supplied (zero hop = direct with no path)
+#define ROUTE_TYPE_TRANSPORT_DIRECT 0x03 // direct route + transport codes
 
 // --- Uptime Monitoring Types and Struct ---
 enum ServiceType {
@@ -198,6 +204,12 @@ unsigned long lastMessageTime = 0;
 int messageCount = 0;
 unsigned long lastPingTime = 0;
 
+// Ed25519 key pair for node identity
+uint8_t ed25519_private_key[32];
+uint8_t ed25519_public_key[32];
+bool ed25519_keys_loaded = false;
+static const char* ED25519_KEY_FILE = "/ed25519_keys.bin";
+
 // Scheduled reboot (used when settings require restart)
 bool pendingRestart = false;
 unsigned long restartAtMs = 0;
@@ -209,6 +221,17 @@ struct Settings {
   // WiFi
   String wifiSsid;
   String wifiPassword;
+
+  // IP Configuration
+  String ipMode;          // "DHCP" or "STATIC"
+  String staticIp;
+  String staticGateway;
+  String staticSubnet;
+
+  // DNS Configuration
+  String dnsMode;         // "DHCP" or "STATIC"
+  String staticDns1;
+  String staticDns2;
 
   // Admin
   String adminUsername;
@@ -278,6 +301,15 @@ Settings defaultSettingsFromBuild() {
   Settings s;
   s.wifiSsid = String(WIFI_SSID);
   s.wifiPassword = String(WIFI_PASSWORD);
+
+  s.ipMode = String(IP_MODE);
+  s.staticIp = String(STATIC_IP);
+  s.staticGateway = String(STATIC_GATEWAY);
+  s.staticSubnet = String(STATIC_SUBNET);
+
+  s.dnsMode = String(DNS_MODE);
+  s.staticDns1 = String(STATIC_DNS1);
+  s.staticDns2 = String(STATIC_DNS2);
 
   s.adminUsername = String(ADMIN_USERNAME);
   s.adminPassword = String(ADMIN_PASSWORD);
@@ -365,6 +397,16 @@ void loadSettingsOverrides() {
   // Strings
   if (doc["WIFI_SSID"].is<String>()) settings.wifiSsid = doc["WIFI_SSID"].as<String>();
   if (doc["WIFI_PASSWORD"].is<String>()) settings.wifiPassword = doc["WIFI_PASSWORD"].as<String>();
+  
+  if (doc["IP_MODE"].is<String>()) settings.ipMode = doc["IP_MODE"].as<String>();
+  if (doc["STATIC_IP"].is<String>()) settings.staticIp = doc["STATIC_IP"].as<String>();
+  if (doc["STATIC_GATEWAY"].is<String>()) settings.staticGateway = doc["STATIC_GATEWAY"].as<String>();
+  if (doc["STATIC_SUBNET"].is<String>()) settings.staticSubnet = doc["STATIC_SUBNET"].as<String>();
+  
+  if (doc["DNS_MODE"].is<String>()) settings.dnsMode = doc["DNS_MODE"].as<String>();
+  if (doc["STATIC_DNS1"].is<String>()) settings.staticDns1 = doc["STATIC_DNS1"].as<String>();
+  if (doc["STATIC_DNS2"].is<String>()) settings.staticDns2 = doc["STATIC_DNS2"].as<String>();
+  
   if (doc["ADMIN_USERNAME"].is<String>()) settings.adminUsername = doc["ADMIN_USERNAME"].as<String>();
   if (doc["ADMIN_PASSWORD"].is<String>()) settings.adminPassword = doc["ADMIN_PASSWORD"].as<String>();
   if (doc["CHANNEL_NAME"].is<String>()) settings.channelName = doc["CHANNEL_NAME"].as<String>();
@@ -449,6 +491,16 @@ bool saveSettingsOverrides() {
   JsonDocument doc;
   doc["WIFI_SSID"] = settings.wifiSsid;
   doc["WIFI_PASSWORD"] = settings.wifiPassword;
+  
+  doc["IP_MODE"] = settings.ipMode;
+  doc["STATIC_IP"] = settings.staticIp;
+  doc["STATIC_GATEWAY"] = settings.staticGateway;
+  doc["STATIC_SUBNET"] = settings.staticSubnet;
+  
+  doc["DNS_MODE"] = settings.dnsMode;
+  doc["STATIC_DNS1"] = settings.staticDns1;
+  doc["STATIC_DNS2"] = settings.staticDns2;
+  
   doc["ADMIN_USERNAME"] = settings.adminUsername;
   doc["ADMIN_PASSWORD"] = settings.adminPassword;
   doc["CHANNEL_NAME"] = settings.channelName;
@@ -1236,6 +1288,8 @@ void setupLoRa();
 void syncNTP();
 void handleLoRaMessage(String message);
 void sendPingPacket();
+void sendBootAdvert();
+void loadOrGenerateEd25519Keys();
 bool verifyMessage(String message);
 void forwardToNtfy(String message);
 void forwardToEmail(String message);
@@ -1325,6 +1379,45 @@ size_t encryptAndSign(const uint8_t* secret, size_t secretLen, uint8_t* output, 
 uint32_t ourNodeId = 0;
 String ourNodeName = "";
 
+void loadOrGenerateEd25519Keys() {
+  // Try to load existing keys from LittleFS
+  if (LittleFS.exists(ED25519_KEY_FILE)) {
+    File f = LittleFS.open(ED25519_KEY_FILE, "r");
+    if (f && f.size() == 64) {  // 32 bytes private + 32 bytes public
+      f.read(ed25519_private_key, 32);
+      f.read(ed25519_public_key, 32);
+      f.close();
+      ed25519_keys_loaded = true;
+      Serial.println("[Ed25519] Loaded existing key pair");
+      return;
+    }
+    if (f) f.close();
+  }
+  
+  // Generate new key pair
+  Serial.println("[Ed25519] Generating new key pair...");
+  
+  // Seed RNG with hardware RNG and other entropy sources
+  RNG.begin("ESP32 Monitor");
+  RNG.rand(ed25519_private_key, 32);  // Generate random private key
+  
+  // Derive public key from private key
+  Ed25519::derivePublicKey(ed25519_public_key, ed25519_private_key);
+  
+  // Save to LittleFS
+  File f = LittleFS.open(ED25519_KEY_FILE, "w");
+  if (f) {
+    f.write(ed25519_private_key, 32);
+    f.write(ed25519_public_key, 32);
+    f.close();
+    Serial.println("[Ed25519] Key pair generated and saved");
+  } else {
+    Serial.println("[Ed25519] WARNING: Failed to save key pair to filesystem");
+  }
+  
+  ed25519_keys_loaded = true;
+}
+
 void initNodeIdentity() {
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -1334,6 +1427,9 @@ void initNodeIdentity() {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   ourNodeName = String(nodeName);
   Serial.printf("Node identity: %s (ID: 0x%08X)\n", ourNodeName.c_str(), ourNodeId);
+  
+  // Load or generate Ed25519 keys for signing adverts
+  loadOrGenerateEd25519Keys();
 }
 
 // Send LoRa notification for service status changes
@@ -1419,6 +1515,144 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
                   notification.c_str(), timestamp, (unsigned int)pktIdx);
   } else {
     Serial.printf("[LoRa] Failed to send notification, code: %d\n", state);
+  }
+  
+  // Return to RX mode
+  radio.startReceive();
+}
+
+// Send boot advert to announce device presence on the mesh
+void sendBootAdvert() {
+  if (!settings.loraEnabled || !ed25519_keys_loaded) {
+    if (!ed25519_keys_loaded) {
+      Serial.println("[LoRa] Cannot send advert: Ed25519 keys not loaded");
+    }
+    return;
+  }
+  
+  // Get MAC address for node ID and name
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+  
+  // Create node name from MAC
+  char nodeName[18];
+  snprintf(nodeName, sizeof(nodeName), "%02X:%02X:%02X:%02X:%02X:%02X", 
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  size_t nodeNameLen = strlen(nodeName);
+  
+  // Timestamp (4 bytes, little-endian)
+  uint32_t timestamp = (uint32_t)time(nullptr);
+  uint8_t timestampBytes[4];
+  timestampBytes[0] = (uint8_t)(timestamp & 0xFF);
+  timestampBytes[1] = (uint8_t)((timestamp >> 8) & 0xFF);
+  timestampBytes[2] = (uint8_t)((timestamp >> 16) & 0xFF);
+  timestampBytes[3] = (uint8_t)((timestamp >> 24) & 0xFF);
+  
+  // Build app_data first (app_flags + node_name)
+  uint8_t app_data[64];
+  size_t app_data_len = 0;
+  
+  // App flags (1 byte) - bit 0-3: role (1=Chat Node), bit 4: location (0=No), bit 7: name (1=Yes)
+  app_data[app_data_len++] = 0x81;  // Binary: 10000001 (Chat Node with name)
+  
+  // Node name (variable length UTF-8 string)
+  memcpy(&app_data[app_data_len], nodeName, nodeNameLen);
+  app_data_len += nodeNameLen;
+  
+  // Create signature over public_key + timestamp + app_data
+  // Per MeshCore docs: "Ed25519 signature of public key, timestamp, and app data"
+  uint8_t signedData[128];
+  size_t signedDataLen = 0;
+  memcpy(&signedData[signedDataLen], ed25519_public_key, 32);
+  signedDataLen += 32;
+  memcpy(&signedData[signedDataLen], timestampBytes, 4);
+  signedDataLen += 4;
+  memcpy(&signedData[signedDataLen], app_data, app_data_len);
+  signedDataLen += app_data_len;
+  
+  uint8_t signature[64];
+  Ed25519::sign(signature, ed25519_private_key, ed25519_public_key, signedData, signedDataLen);
+  
+  // Build advert payload: [public_key(32)][timestamp(4)][signature(64)][app_data]
+  uint8_t payload[256];
+  size_t payloadIdx = 0;
+  
+  // Public key (32 bytes)
+  memcpy(&payload[payloadIdx], ed25519_public_key, 32);
+  payloadIdx += 32;
+  
+  // Timestamp (4 bytes)
+  memcpy(&payload[payloadIdx], timestampBytes, 4);
+  payloadIdx += 4;
+  
+  // Signature (64 bytes)
+  memcpy(&payload[payloadIdx], signature, 64);
+  payloadIdx += 64;
+  
+  // App data (flags + name)
+  memcpy(&payload[payloadIdx], app_data, app_data_len);
+  payloadIdx += app_data_len;
+  
+  // Build complete packet: [header][path_len][path][payload]
+  uint8_t packet[300];
+  size_t pktIdx = 0;
+  
+  // --- Send Flood Advert (header = 0x11) ---
+  // Header: version(0) + payload_type(ADVERT=4) + route_type(FLOOD=1)
+  uint8_t floodHeader = (uint8_t)((ROUTE_TYPE_FLOOD & 0x03) | ((PAYLOAD_TYPE_ADVERT & 0x0F) << 2));
+  packet[pktIdx++] = floodHeader;
+  
+  // Path (last byte of MAC address only)
+  packet[pktIdx++] = 1;  // path_len (1 byte)
+  packet[pktIdx++] = mac[5];  // Last byte of MAC (e.g., E0)
+  
+  // Advert payload
+  if (pktIdx + payloadIdx > sizeof(packet)) {
+    Serial.println("[LoRa] ERROR: Packet buffer too small for advert");
+    return;
+  }
+  memcpy(packet + pktIdx, payload, payloadIdx);
+  pktIdx += payloadIdx;
+  
+  // Transmit flood advert
+  int state = radio.transmit(packet, pktIdx);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] Flood advert sent: Node %s (header=0x%02X, len=%u)\n", 
+                  nodeName, floodHeader, (unsigned int)pktIdx);
+  } else {
+    Serial.printf("[LoRa] Failed to send flood advert, code: %d\n", state);
+  }
+  
+  // Wait briefly between transmissions
+  delay(100);
+  
+  // --- Send Direct (Zero Hop) Advert (header = 0x12) ---
+  pktIdx = 0;
+  
+  // Header: version(0) + payload_type(ADVERT=4) + route_type(DIRECT=2)
+  uint8_t directHeader = (uint8_t)((ROUTE_TYPE_DIRECT & 0x03) | ((PAYLOAD_TYPE_ADVERT & 0x0F) << 2));
+  packet[pktIdx++] = directHeader;
+  
+  // Path (no path for direct/zero hop)
+  packet[pktIdx++] = 0x00;  // path_len = 0 (no path data)
+  
+  // Advert payload (same as flood)
+  memcpy(packet + pktIdx, payload, payloadIdx);
+  pktIdx += payloadIdx;
+  
+  // Transmit direct (zero hop) advert
+  state = radio.transmit(packet, pktIdx);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] Direct (zero hop) advert sent: Node %s (header=0x%02X, len=%u)\n", 
+                  nodeName, directHeader, (unsigned int)pktIdx);
+    Serial.print("[Ed25519] Public key: ");
+    for (int i = 0; i < 8; i++) {
+      Serial.printf("%02X", ed25519_public_key[i]);
+    }
+    Serial.println("...");
+  } else {
+    Serial.printf("[LoRa] Failed to send zero hop advert, code: %d\n", state);
   }
   
   // Return to RX mode
@@ -2388,6 +2622,9 @@ void setup() {
       pendingLoRaNotify = false;
       pendingLoRaNotifyMessage = "";
     }
+
+    // Send boot advert to announce device on the mesh network
+    sendBootAdvert();
   } else {
     loraReady = false;
     Serial.println("LoRa disabled by settings; skipping radio init");
@@ -2437,6 +2674,16 @@ void setup() {
     if (!isAuthenticated(request)) return;
     JsonDocument doc;
     doc["WIFI_SSID"] = settings.wifiSsid;
+    
+    doc["IP_MODE"] = settings.ipMode;
+    doc["STATIC_IP"] = settings.staticIp;
+    doc["STATIC_GATEWAY"] = settings.staticGateway;
+    doc["STATIC_SUBNET"] = settings.staticSubnet;
+    
+    doc["DNS_MODE"] = settings.dnsMode;
+    doc["STATIC_DNS1"] = settings.staticDns1;
+    doc["STATIC_DNS2"] = settings.staticDns2;
+    
     doc["ADMIN_USERNAME"] = settings.adminUsername;
     doc["CHANNEL_NAME"] = settings.channelName;
 
@@ -2526,6 +2773,16 @@ void setup() {
         String v = doc["WIFI_PASSWORD"].as<String>();
         if (v.length() > 0) settings.wifiPassword = v;
       }
+      
+      if (doc["IP_MODE"].is<String>()) settings.ipMode = doc["IP_MODE"].as<String>();
+      if (doc["STATIC_IP"].is<String>()) settings.staticIp = doc["STATIC_IP"].as<String>();
+      if (doc["STATIC_GATEWAY"].is<String>()) settings.staticGateway = doc["STATIC_GATEWAY"].as<String>();
+      if (doc["STATIC_SUBNET"].is<String>()) settings.staticSubnet = doc["STATIC_SUBNET"].as<String>();
+      
+      if (doc["DNS_MODE"].is<String>()) settings.dnsMode = doc["DNS_MODE"].as<String>();
+      if (doc["STATIC_DNS1"].is<String>()) settings.staticDns1 = doc["STATIC_DNS1"].as<String>();
+      if (doc["STATIC_DNS2"].is<String>()) settings.staticDns2 = doc["STATIC_DNS2"].as<String>();
+      
       if (doc["ADMIN_USERNAME"].is<String>()) settings.adminUsername = doc["ADMIN_USERNAME"].as<String>();
       if (doc["ADMIN_PASSWORD"].is<String>()) {
         String v = doc["ADMIN_PASSWORD"].as<String>();
@@ -2637,9 +2894,17 @@ void setup() {
       }
 
       // Apply changes that can be applied live (WiFi)
-      bool wifiChanged = (before.wifiSsid != settings.wifiSsid) || (before.wifiPassword != settings.wifiPassword);
+      bool wifiChanged = (before.wifiSsid != settings.wifiSsid) || 
+                         (before.wifiPassword != settings.wifiPassword) ||
+                         (before.ipMode != settings.ipMode) ||
+                         (before.staticIp != settings.staticIp) ||
+                         (before.staticGateway != settings.staticGateway) ||
+                         (before.staticSubnet != settings.staticSubnet) ||
+                         (before.dnsMode != settings.dnsMode) ||
+                         (before.staticDns1 != settings.staticDns1) ||
+                         (before.staticDns2 != settings.staticDns2);
       if (wifiChanged) {
-        Serial.println("Settings updated: WiFi changed; reconnecting...");
+        Serial.println("Settings updated: WiFi/IP/DNS changed; reconnecting...");
         setupWiFi();
       }
 
@@ -2695,6 +2960,19 @@ void setup() {
     page += "<div class='card'><h2>WiFi</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>SSID</label><input id='WIFI_SSID' value='" + settings.wifiSsid + "'></div>";
     page += "<div class='fg'><label class='lbl'>Password</label><input id='WIFI_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>IP Configuration</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>IP Mode</label><select id='IP_MODE'><option value='DHCP'" + String(settings.ipMode == "DHCP" ? " selected" : "") + ">DHCP</option><option value='STATIC'" + String(settings.ipMode == "STATIC" ? " selected" : "") + ">Static</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Static IP</label><input id='STATIC_IP' value='" + settings.staticIp + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Gateway</label><input id='STATIC_GATEWAY' value='" + settings.staticGateway + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Subnet Mask</label><input id='STATIC_SUBNET' value='" + settings.staticSubnet + "'></div>";
+    page += "</div></div>";
+
+    page += "<div class='card'><h2>DNS Configuration</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>DNS Mode</label><select id='DNS_MODE'><option value='DHCP'" + String(settings.dnsMode == "DHCP" ? " selected" : "") + ">DHCP</option><option value='STATIC'" + String(settings.dnsMode == "STATIC" ? " selected" : "") + ">Static</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Primary DNS</label><input id='STATIC_DNS1' value='" + settings.staticDns1 + "'></div>";
+    page += "<div class='fg'><label class='lbl'>Secondary DNS</label><input id='STATIC_DNS2' value='" + settings.staticDns2 + "'></div>";
     page += "</div></div>";
 
     page += "<div class='card'><h2>Admin</h2><div class='row'>";
@@ -2773,6 +3051,8 @@ void setup() {
     page += "function boolVal(id){return document.getElementById(id).value==='true';}";
     page += "async function save(){const payload={";
     page += "WIFI_SSID:val('WIFI_SSID'),WIFI_PASSWORD:val('WIFI_PASSWORD'),";
+    page += "IP_MODE:val('IP_MODE'),STATIC_IP:val('STATIC_IP'),STATIC_GATEWAY:val('STATIC_GATEWAY'),STATIC_SUBNET:val('STATIC_SUBNET'),";
+    page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
     page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),";
@@ -3699,6 +3979,54 @@ void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  
+  // Configure static IP if enabled
+  if (settings.ipMode == "STATIC") {
+    IPAddress ip, gateway, subnet;
+    if (ip.fromString(settings.staticIp) && 
+        gateway.fromString(settings.staticGateway) && 
+        subnet.fromString(settings.staticSubnet)) {
+      Serial.println("Configuring static IP...");
+      Serial.print("IP: "); Serial.println(settings.staticIp);
+      Serial.print("Gateway: "); Serial.println(settings.staticGateway);
+      Serial.print("Subnet: "); Serial.println(settings.staticSubnet);
+      
+      // Configure DNS if static DNS is enabled
+      if (settings.dnsMode == "STATIC") {
+        IPAddress dns1, dns2;
+        if (dns1.fromString(settings.staticDns1)) {
+          if (dns2.fromString(settings.staticDns2)) {
+            Serial.print("DNS1: "); Serial.println(settings.staticDns1);
+            Serial.print("DNS2: "); Serial.println(settings.staticDns2);
+            WiFi.config(ip, gateway, subnet, dns1, dns2);
+          } else {
+            Serial.print("DNS1: "); Serial.println(settings.staticDns1);
+            WiFi.config(ip, gateway, subnet, dns1);
+          }
+        } else {
+          WiFi.config(ip, gateway, subnet);
+        }
+      } else {
+        WiFi.config(ip, gateway, subnet);
+      }
+    } else {
+      Serial.println("Invalid static IP configuration, using DHCP");
+    }
+  } else if (settings.dnsMode == "STATIC") {
+    // DHCP for IP but static DNS
+    IPAddress dns1, dns2;
+    if (dns1.fromString(settings.staticDns1)) {
+      if (dns2.fromString(settings.staticDns2)) {
+        Serial.print("Static DNS1: "); Serial.println(settings.staticDns1);
+        Serial.print("Static DNS2: "); Serial.println(settings.staticDns2);
+        WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, dns1, dns2);
+      } else {
+        Serial.print("Static DNS1: "); Serial.println(settings.staticDns1);
+        WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, dns1);
+      }
+    }
+  }
+  
   WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
   
   int attempts = 0;

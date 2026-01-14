@@ -21,6 +21,36 @@
 #define WIFI_PASSWORD "your_wifi_password"
 #endif
 
+// IP Configuration
+#ifndef IP_MODE
+#define IP_MODE "DHCP"  // "DHCP" or "STATIC"
+#endif
+
+#ifndef STATIC_IP
+#define STATIC_IP "192.168.1.100"
+#endif
+
+#ifndef STATIC_GATEWAY
+#define STATIC_GATEWAY "192.168.1.1"
+#endif
+
+#ifndef STATIC_SUBNET
+#define STATIC_SUBNET "255.255.255.0"
+#endif
+
+// DNS Configuration
+#ifndef DNS_MODE
+#define DNS_MODE "DHCP"  // "DHCP" or "STATIC"
+#endif
+
+#ifndef STATIC_DNS1
+#define STATIC_DNS1 "8.8.8.8"
+#endif
+
+#ifndef STATIC_DNS2
+#define STATIC_DNS2 "8.8.4.4"
+#endif
+
 // Captive portal hotspot (starts when STA WiFi can't connect)
 // Hotspot SSID is generated per-device as: ESP32NM-<MAC>
 #ifndef HOTSPOT_IP
