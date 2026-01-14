@@ -2871,7 +2871,8 @@ void setup() {
     html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.modal-content{padding:24px}}";
     html += "</style></head><body>";
     html += "<div class='container'>";
-    html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:6px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div></div>";
+    html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:6px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div>";
+    html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>MAC: " + macWithColons() + "</div></div>";
     
     // Stats cards
     int upCount = 0, downCount = 0;
