@@ -131,11 +131,11 @@
 #endif
 
 #ifndef LORA_SYNC_WORD
-#define LORA_SYNC_WORD 0x1424  // MeshCore private sync word
+#define LORA_SYNC_WORD 0x12  // Standard LoRa sync word for private networks
 #endif
 
 #ifndef LORA_PREAMBLE_LENGTH
-#define LORA_PREAMBLE_LENGTH 16  // MeshCore uses 16-symbol preamble
+#define LORA_PREAMBLE_LENGTH 8  // Standard preamble length
 #endif
 
 // SX1262 Pin Definitions for Heltec Wireless Stick Lite V3
