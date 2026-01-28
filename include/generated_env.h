@@ -24,7 +24,7 @@
 #define SMTP_PASSWORD "your_app_specific_password"
 #define WEBHOOK_URL "https://example.com/webhook"
 #define WEBHOOK_METHOD "POST"
-#define MQTT_BROKER "192.168.1.10"
+#define MQTT_BROKER "159.13.57.169"
 #define MQTT_PORT "1883"
 #define MQTT_TOPIC "esp32-monitor/alerts"
 #define MQTT_USERNAME ""
@@ -45,7 +45,7 @@
 #define EMAIL_IP_ALERTS 0
 #define WEBHOOK_ENABLED 0
 #define WEBHOOK_IP_ALERTS 0
-#define MQTT_ENABLED 0
+#define MQTT_ENABLED 1
 #define MQTT_IP_ALERTS 1
 #define NTFY_MESH_RELAY 1
 #define DISCORD_MESH_RELAY 0

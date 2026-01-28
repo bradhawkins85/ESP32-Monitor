@@ -625,14 +625,44 @@ void loadSettingsOverrides() {
   if (doc["SMTP_PASSWORD"].is<String>()) settings.smtpPassword = doc["SMTP_PASSWORD"].as<String>();
 
   // MQTT strings
-  if (doc["MQTT_BROKER"].is<String>()) settings.mqttBroker = doc["MQTT_BROKER"].as<String>();
-  if (doc["MQTT_PORT"].is<int>()) settings.mqttPort = doc["MQTT_PORT"].as<int>();
-  if (doc["MQTT_PORT"].is<String>()) settings.mqttPort = doc["MQTT_PORT"].as<String>().toInt();
-  if (doc["MQTT_TOPIC"].is<String>()) settings.mqttTopic = doc["MQTT_TOPIC"].as<String>();
-  if (doc["MQTT_QOS"].is<int>()) settings.mqttQos = doc["MQTT_QOS"].as<int>();
-  if (doc["MQTT_QOS"].is<String>()) settings.mqttQos = doc["MQTT_QOS"].as<String>().toInt();
-  if (doc["MQTT_USERNAME"].is<String>()) settings.mqttUsername = doc["MQTT_USERNAME"].as<String>();
-  if (doc["MQTT_PASSWORD"].is<String>()) settings.mqttPassword = doc["MQTT_PASSWORD"].as<String>();
+  if (doc["MQTT_BROKER"].is<String>()) {
+    String v = doc["MQTT_BROKER"].as<String>();
+    if (v.length() > 0) settings.mqttBroker = v;
+  }
+  if (doc["MQTT_PORT"].is<int>()) {
+    int v = doc["MQTT_PORT"].as<int>();
+    if (v > 0) settings.mqttPort = v;
+  }
+  if (doc["MQTT_PORT"].is<String>()) {
+    String v = doc["MQTT_PORT"].as<String>();
+    if (v.length() > 0) {
+      int p = v.toInt();
+      if (p > 0) settings.mqttPort = p;
+    }
+  }
+  if (doc["MQTT_TOPIC"].is<String>()) {
+    String v = doc["MQTT_TOPIC"].as<String>();
+    if (v.length() > 0) settings.mqttTopic = v;
+  }
+  if (doc["MQTT_QOS"].is<int>()) {
+    int v = doc["MQTT_QOS"].as<int>();
+    if (v >= 0 && v <= 2) settings.mqttQos = v;
+  }
+  if (doc["MQTT_QOS"].is<String>()) {
+    String v = doc["MQTT_QOS"].as<String>();
+    if (v.length() > 0) {
+      int q = v.toInt();
+      if (q >= 0 && q <= 2) settings.mqttQos = q;
+    }
+  }
+  if (doc["MQTT_USERNAME"].is<String>()) {
+    String v = doc["MQTT_USERNAME"].as<String>();
+    if (v.length() > 0) settings.mqttUsername = v;
+  }
+  if (doc["MQTT_PASSWORD"].is<String>()) {
+    String v = doc["MQTT_PASSWORD"].as<String>();
+    if (v.length() > 0) settings.mqttPassword = v;
+  }
 
   // Booleans
   if (doc["NTFY_ENABLED"].is<bool>()) settings.ntfyEnabled = doc["NTFY_ENABLED"].as<bool>();
@@ -1478,30 +1508,30 @@ static bool deriveSharedSecretWithPeer(const uint8_t peerEd25519Pub[32], uint8_t
 
 // Helper function to get services as JSON string
 String getServicesJson() {
-  String json = "[";
+  DynamicJsonDocument doc(16384);
+  JsonArray arr = doc.to<JsonArray>();
   for (int i = 0; i < serviceCount; i++) {
-    if (i > 0) json += ",";
-    json += "{";
-    json += "\"name\":\"" + services[i].name + "\",";
-    json += "\"type\":" + String(services[i].type) + ",";
-    json += "\"enabled\":" + String(services[i].enabled ? "true" : "false") + ",";
-    json += "\"host\":\"" + services[i].host + "\",";
-    json += "\"port\":" + String(services[i].port) + ",";
-    json += "\"url\":\"" + services[i].url + "\",";
-    json += "\"expectedResponse\":\"" + services[i].expectedResponse + "\",";
-    json += "\"pushToken\":\"" + services[i].pushToken + "\",";
-    json += "\"snmpOid\":\"" + services[i].snmpOid + "\",";
-    json += "\"snmpCommunity\":\"" + services[i].snmpCommunity + "\",";
-    json += "\"snmpCompareOp\":" + String((int)services[i].snmpCompareOp) + ",";
-    json += "\"snmpExpectedValue\":\"" + services[i].snmpExpectedValue + "\",";
-    json += "\"uptimeThreshold\":" + String(services[i].uptimeThreshold) + ",";
-    json += "\"uptimeCompareOp\":" + String((int)services[i].uptimeCompareOp) + ",";
-    json += "\"checkInterval\":" + String(services[i].checkInterval) + ",";
-    json += "\"passThreshold\":" + String(services[i].passThreshold) + ",";
-    json += "\"failThreshold\":" + String(services[i].failThreshold);
-    json += "}";
+    JsonObject obj = arr.createNestedObject();
+    obj["name"] = services[i].name;
+    obj["type"] = services[i].type;
+    obj["enabled"] = services[i].enabled;
+    obj["host"] = services[i].host;
+    obj["port"] = services[i].port;
+    obj["url"] = services[i].url;
+    obj["expectedResponse"] = services[i].expectedResponse;
+    obj["pushToken"] = services[i].pushToken;
+    obj["snmpOid"] = services[i].snmpOid;
+    obj["snmpCommunity"] = services[i].snmpCommunity;
+    obj["snmpCompareOp"] = (int)services[i].snmpCompareOp;
+    obj["snmpExpectedValue"] = services[i].snmpExpectedValue;
+    obj["uptimeThreshold"] = services[i].uptimeThreshold;
+    obj["uptimeCompareOp"] = (int)services[i].uptimeCompareOp;
+    obj["checkInterval"] = services[i].checkInterval;
+    obj["passThreshold"] = services[i].passThreshold;
+    obj["failThreshold"] = services[i].failThreshold;
   }
-  json += "]";
+  String json;
+  serializeJson(doc, json);
   return json;
 }
 
