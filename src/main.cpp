@@ -3699,6 +3699,7 @@ void setup() {
       html += "<label for='fileInput' class='file-label'>📤 Import Config</label>";
       html += "</form>";
       html += "<button class='btn btn-secondary' onclick='testNotifications()'>🔔 Test Notifications</button>";
+      html += "<button class='btn btn-secondary' onclick='sendMeshAdvert()'>📡 Mesh Advert</button>";
       html += "<button class='btn btn-secondary' onclick='gotoOta()'>⬆️ OTA Update</button>";
       html += "<button class='btn btn-secondary' onclick='gotoSettings()'>⚙️ Settings</button>";
       html += "<button class='btn btn-secondary' onclick='logout()'>Logout</button>";
@@ -3853,6 +3854,9 @@ void setup() {
     html += "function testNotifications(){if(!isAuthed){alert('Login required');return;}if(confirm('Send test notification on all channels?')){";
     html += "fetch('/api/test-notification',{method:'POST',credentials:'include'})";
     html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
+    html += "function sendMeshAdvert(){if(!isAuthed){alert('Login required');return;}if(confirm('Send MeshCore flood advert to the mesh?')){";
+    html += "fetch('/api/mesh-advert',{method:'POST',credentials:'include'})";
+    html += ".then(async r=>{const t=await r.text();if(r.ok){alert(t||'Advert sent');}else{alert(t||'Failed to send advert');}})}}";
     html += "function gotoOta(){if(!isAuthed){alert('Login required');return;}window.open('/ota','_blank');}";
     html += "function gotoSettings(){if(!isAuthed){alert('Login required');return;}window.open('/settings','_blank');}";
     html += "const loginForm=document.getElementById('loginForm');";
@@ -4242,6 +4246,21 @@ void setup() {
     fanOutInternetNotificationsWithId(testMsg);
 
     request->send(200, "text/plain", "Test notification triggered on enabled channels");
+  });
+
+  // API endpoint to send a MeshCore flood advert
+  server.on("/api/mesh-advert", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    if (!settings.loraEnabled) {
+      request->send(409, "text/plain", "LoRa is disabled");
+      return;
+    }
+    if (!ed25519_keys_loaded) {
+      request->send(500, "text/plain", "Ed25519 keys not loaded");
+      return;
+    }
+    sendBootAdvert();
+    request->send(200, "text/plain", "MeshCore flood advert sent");
   });
 
   // OTA update page (protected)
