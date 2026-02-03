@@ -97,6 +97,16 @@ struct Service {
   unsigned long pauseUntil;
 };
 
+// ============================================
+// Direct LoRa Node Configuration
+// ============================================
+#define MAX_DIRECT_NODES 12
+
+struct DirectNodeConfig {
+  String name;
+  String pubkeyHex; // 64 hex chars (Ed25519 public key)
+};
+
 // --- Service Array and Count ---
 #define MAX_SERVICES 16
 Service services[MAX_SERVICES];
@@ -424,6 +434,9 @@ struct Settings {
   float loraBandwidth;
   int loraSpreadingFactor;
   int loraCodingRate;
+  bool loraDirectEnabled;
+  DirectNodeConfig loraDirectNodes[MAX_DIRECT_NODES];
+  int loraDirectNodeCount;
 
   // Ntfy
   bool ntfyEnabled;
@@ -473,6 +486,14 @@ struct Settings {
 
 Settings settings;
 
+static void clearDirectNodeList(Settings &s) {
+  s.loraDirectNodeCount = 0;
+  for (int i = 0; i < MAX_DIRECT_NODES; i++) {
+    s.loraDirectNodes[i].name = "";
+    s.loraDirectNodes[i].pubkeyHex = "";
+  }
+}
+
 Settings defaultSettingsFromBuild() {
   Settings s;
   s.wifiSsid = String(WIFI_SSID);
@@ -500,6 +521,8 @@ Settings defaultSettingsFromBuild() {
   s.loraBandwidth = (float)LORA_BANDWIDTH;
   s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
   s.loraCodingRate = (int)LORA_CODING_RATE;
+  s.loraDirectEnabled = false;
+  clearDirectNodeList(s);
 
   s.ntfyEnabled = (NTFY_ENABLED != 0);
   s.ntfyMeshRelay = (NTFY_MESH_RELAY != 0);
@@ -545,6 +568,9 @@ Settings defaultSettingsFromBuild() {
   s.mqttPassword = String(MQTT_PASSWORD);
   return s;
 }
+
+static bool normalizeHexKey(const String &input, String &out);
+static bool parseHexKeyToBytes(const String &hex, uint8_t out[32]);
 
 static const char* SETTINGS_FILE = "/settings.json";
 
@@ -605,6 +631,24 @@ void loadSettingsOverrides() {
 
   if (doc["LORA_CODING_RATE"].is<int>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<int>();
   if (doc["LORA_CODING_RATE"].is<String>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<String>().toInt();
+
+  if (doc["LORA_DIRECT_ENABLED"].is<bool>()) settings.loraDirectEnabled = doc["LORA_DIRECT_ENABLED"].as<bool>();
+  if (doc["LORA_DIRECT_NODES"].is<JsonArray>()) {
+    JsonArray nodes = doc["LORA_DIRECT_NODES"].as<JsonArray>();
+    clearDirectNodeList(settings);
+    for (JsonObject obj : nodes) {
+      if (settings.loraDirectNodeCount >= MAX_DIRECT_NODES) break;
+      String pubkey = obj["pubkey"] | "";
+      String name = obj["name"] | "";
+      String normalized;
+      if (!normalizeHexKey(pubkey, normalized)) {
+        continue;
+      }
+      settings.loraDirectNodes[settings.loraDirectNodeCount].name = name;
+      settings.loraDirectNodes[settings.loraDirectNodeCount].pubkeyHex = normalized;
+      settings.loraDirectNodeCount++;
+    }
+  }
 
   if (doc["NTFY_SERVER"].is<String>()) settings.ntfyServer = doc["NTFY_SERVER"].as<String>();
   if (doc["NTFY_TOPIC"].is<String>()) settings.ntfyTopic = doc["NTFY_TOPIC"].as<String>();
@@ -719,6 +763,14 @@ bool saveSettingsOverrides() {
   doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
   doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
   doc["LORA_CODING_RATE"] = settings.loraCodingRate;
+  doc["LORA_DIRECT_ENABLED"] = settings.loraDirectEnabled;
+  JsonArray directNodes = doc.createNestedArray("LORA_DIRECT_NODES");
+  for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+    if (settings.loraDirectNodes[i].pubkeyHex.length() == 0) continue;
+    JsonObject obj = directNodes.add<JsonObject>();
+    obj["name"] = settings.loraDirectNodes[i].name;
+    obj["pubkey"] = settings.loraDirectNodes[i].pubkeyHex;
+  }
 
   doc["NTFY_ENABLED"] = settings.ntfyEnabled;
   doc["NTFY_MESH_RELAY"] = settings.ntfyMeshRelay;
@@ -1505,6 +1557,8 @@ void forwardToWebhook(String message);
 size_t encryptAndSign(const uint8_t* secret, size_t secretLen, uint8_t* output, size_t maxOutput, const uint8_t* input, size_t inputLen);
 void deriveChannelKey(const char* channelName, const char* channelSecret, uint8_t* hash, uint8_t* key, size_t* keyLen);
 static bool deriveSharedSecretWithPeer(const uint8_t peerEd25519Pub[32], uint8_t shared[32]);
+static bool normalizeHexKey(const String &input, String &out);
+static bool parseHexKeyToBytes(const String &hex, uint8_t out[32]);
 
 // Helper function to get services as JSON string
 String getServicesJson() {
@@ -1529,6 +1583,20 @@ String getServicesJson() {
     obj["checkInterval"] = services[i].checkInterval;
     obj["passThreshold"] = services[i].passThreshold;
     obj["failThreshold"] = services[i].failThreshold;
+  }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+String getDirectNodesJson() {
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+    if (settings.loraDirectNodes[i].pubkeyHex.length() == 0) continue;
+    JsonObject obj = arr.createNestedObject();
+    obj["name"] = settings.loraDirectNodes[i].name;
+    obj["pubkey"] = settings.loraDirectNodes[i].pubkeyHex;
   }
   String json;
   serializeJson(doc, json);
@@ -1789,6 +1857,33 @@ static void sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   radio.startReceive();
 }
 
+static void sendLoRaDirectNotifications(const String &notification) {
+  if (!settings.loraEnabled) return;
+  if (!settings.loraDirectEnabled) return;
+  if (settings.loraDirectNodeCount <= 0) return;
+
+  for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+    const String &pubHex = settings.loraDirectNodes[i].pubkeyHex;
+    if (pubHex.length() == 0) continue;
+
+    uint8_t pubkey[32];
+    if (!parseHexKeyToBytes(pubHex, pubkey)) {
+      Serial.printf("[LoRa] Skipping direct node %d: invalid pubkey\n", i);
+      continue;
+    }
+
+    if (memcmp(pubkey, ed25519_public_key, 32) == 0) {
+      Serial.println("[LoRa] Skipping direct message to self");
+      continue;
+    }
+
+    String label = settings.loraDirectNodes[i].name;
+    if (label.length() == 0) label = String("node-") + String(i + 1);
+    Serial.printf("[LoRa] Direct notify -> %s\n", label.c_str());
+    sendLoRaDirectMessage(notification, pubkey, pubkey[0], nullptr, 0);
+  }
+}
+
 // Send LoRa notification for service status changes
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message) {
   if (!settings.loraEnabled) return;
@@ -1873,6 +1968,9 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   } else {
     Serial.printf("[LoRa] Failed to send notification, code: %d\n", state);
   }
+
+  // Optional direct notifications to configured nodes
+  sendLoRaDirectNotifications(notification);
   
   // Return to RX mode
   radio.startReceive();
@@ -2868,6 +2966,24 @@ size_t hexToBytes(const char* hex, uint8_t* bytes, size_t maxBytes) {
   return byteLen;
 }
 
+static bool normalizeHexKey(const String &input, String &out) {
+  out = input;
+  out.trim();
+  if (out.startsWith("0x") || out.startsWith("0X")) {
+    out = out.substring(2);
+  }
+  out.toLowerCase();
+  if (out.length() != 64) return false;
+  if (!isHexString(out.c_str(), out.length())) return false;
+  return true;
+}
+
+static bool parseHexKeyToBytes(const String &hex, uint8_t out[32]) {
+  String normalized;
+  if (!normalizeHexKey(hex, normalized)) return false;
+  return hexToBytes(normalized.c_str(), out, 32) == 32;
+}
+
 /**
  * Derive channel hash and secret from channel name and passphrase
  * Matches MeshCore's channel derivation (same logic as transmitter):
@@ -3170,6 +3286,14 @@ void setup() {
     doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
     doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
     doc["LORA_CODING_RATE"] = settings.loraCodingRate;
+    doc["LORA_DIRECT_ENABLED"] = settings.loraDirectEnabled;
+    JsonArray directNodes = doc.createNestedArray("LORA_DIRECT_NODES");
+    for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+      if (settings.loraDirectNodes[i].pubkeyHex.length() == 0) continue;
+      JsonObject obj = directNodes.add<JsonObject>();
+      obj["name"] = settings.loraDirectNodes[i].name;
+      obj["pubkey"] = settings.loraDirectNodes[i].pubkeyHex;
+    }
 
     doc["NTFY_ENABLED"] = settings.ntfyEnabled;
     doc["NTFY_MESH_RELAY"] = settings.ntfyMeshRelay;
@@ -3289,6 +3413,24 @@ void setup() {
 
       if (doc["LORA_CODING_RATE"].is<int>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<int>();
       if (doc["LORA_CODING_RATE"].is<String>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<String>().toInt();
+
+      if (doc["LORA_DIRECT_ENABLED"].is<bool>()) settings.loraDirectEnabled = doc["LORA_DIRECT_ENABLED"].as<bool>();
+      if (doc["LORA_DIRECT_NODES"].is<JsonArray>()) {
+        JsonArray nodes = doc["LORA_DIRECT_NODES"].as<JsonArray>();
+        clearDirectNodeList(settings);
+        for (JsonObject obj : nodes) {
+          if (settings.loraDirectNodeCount >= MAX_DIRECT_NODES) break;
+          String pubkey = obj["pubkey"] | "";
+          String name = obj["name"] | "";
+          String normalized;
+          if (!normalizeHexKey(pubkey, normalized)) {
+            continue;
+          }
+          settings.loraDirectNodes[settings.loraDirectNodeCount].name = name;
+          settings.loraDirectNodes[settings.loraDirectNodeCount].pubkeyHex = normalized;
+          settings.loraDirectNodeCount++;
+        }
+      }
 
       if (doc["NTFY_SERVER"].is<String>()) settings.ntfyServer = doc["NTFY_SERVER"].as<String>();
       if (doc["NTFY_TOPIC"].is<String>()) settings.ntfyTopic = doc["NTFY_TOPIC"].as<String>();
@@ -3431,6 +3573,7 @@ void setup() {
     page += "input,select{width:100%;padding:10px 12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px}input:focus,select:focus{outline:none;border-color:#667eea}";
     page += ".btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.btn{padding:10px 14px;border:none;border-radius:10px;cursor:pointer;font-weight:700}";
     page += ".primary{background:#667eea;color:#fff}.secondary{background:#e2e8f0;color:#2d3748}.hint{font-size:12px;color:#718096;margin-top:6px}";
+    page += ".node-row{display:grid;grid-template-columns:1fr 2fr auto;gap:10px;align-items:center;margin-bottom:10px}.node-actions{display:flex;gap:6px;align-items:center}.btn-small{padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px}";
     page += "@media(max-width:700px){.row{grid-template-columns:1fr}}";
     page += "</style></head><body><div class='container'>";
     page += "<div class='card'><h1>Settings</h1><div class='hint'>Saved settings override build-time .env defaults. Passwords/tokens are never displayed; leaving them blank keeps the existing value.</div></div>";
@@ -3469,6 +3612,15 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Spreading Factor</label><input id='LORA_SPREADING_FACTOR' type='number' min='6' max='12' step='1' value='" + String(settings.loraSpreadingFactor) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Coding Rate (4/x)</label><input id='LORA_CODING_RATE' type='number' min='5' max='8' step='1' value='" + String(settings.loraCodingRate) + "'></div>";
     page += "</div></div>";
+
+    page += "<div class='card'><h2>LoRa Direct Messaging</h2>";
+    page += "<div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Direct Messages</label><select id='LORA_DIRECT_ENABLED'><option value='true'" + String(settings.loraDirectEnabled ? " selected" : "") + ">Enabled</option><option value='false'" + String(!settings.loraDirectEnabled ? " selected" : "") + ">Disabled</option></select></div>";
+    page += "</div>";
+    page += "<div class='hint'>Add recipient nodes by Ed25519 public key (64 hex chars). These will receive direct LoRa alerts in addition to channel alerts.</div>";
+    page += "<div id='directNodes'></div>";
+    page += "<div class='btns'><button class='btn secondary' type='button' onclick='addDirectNode()'>+ Add Node</button></div>";
+    page += "</div>";
 
     page += "<div class='card'><h2>Ntfy</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Enabled</label><select id='NTFY_ENABLED'><option value='true'" + String(settings.ntfyEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyEnabled ? " selected" : "") + ">No</option></select></div>";
@@ -3526,6 +3678,11 @@ void setup() {
     page += "</div><div class='hint'>WiFi changes reconnect automatically. LoRa changes reboot the device automatically.</div></div>";
 
     page += "</div><script>";
+    page += "const directNodes=" + getDirectNodesJson() + ";";
+    page += "function renderDirectNodes(){const c=document.getElementById('directNodes');if(!c) return;c.innerHTML='';if(!directNodes.length){c.innerHTML=\"<div class='hint'>No direct nodes configured.</div>\";return;}directNodes.forEach((n,i)=>{const row=document.createElement('div');row.className='node-row';row.innerHTML=\"<input class='node-name' placeholder='Name (optional)'>\"+\"<input class='node-pubkey mono' placeholder='Ed25519 public key (64 hex)'>\"+\"<div class='node-actions'><button class='btn btn-small secondary' type='button' onclick='removeDirectNode(\"+i+\")'>Remove</button></div>\";c.appendChild(row);row.querySelector('.node-name').value=n.name||'';row.querySelector('.node-pubkey').value=n.pubkey||'';});};";
+    page += "function addDirectNode(name,pubkey){directNodes.push({name:name||'',pubkey:pubkey||''});renderDirectNodes();}";
+    page += "function removeDirectNode(i){directNodes.splice(i,1);renderDirectNodes();}";
+    page += "function collectDirectNodes(){const list=[];document.querySelectorAll('.node-row').forEach(row=>{const name=row.querySelector('.node-name')?.value.trim()||'';const pubkey=row.querySelector('.node-pubkey')?.value.trim()||'';if(pubkey.length>0){list.push({name:name,pubkey:pubkey});}});return list;};";
     page += "function val(id){return document.getElementById(id).value;}";
     page += "function boolVal(id){return document.getElementById(id).value==='true';}";
     page += "async function save(){const payload={";
@@ -3534,7 +3691,7 @@ void setup() {
     page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
     page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
@@ -3546,6 +3703,7 @@ void setup() {
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
     page += "}";
+    page += "renderDirectNodes();";
     page += "</script></body></html>";
     request->send(200, "text/html", page);
   });
