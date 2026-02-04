@@ -118,6 +118,7 @@ int serviceCount = 0;
 // ============================================
 struct PeerInfo {
   uint8_t hash;           // First byte of Ed25519 public key
+  uint8_t altHash;        // First byte of SHA-256(public key)
   uint8_t ed25519_pub[32];
   String name;            // Optional human-readable name
   uint32_t lastAdvert;    // Unix timestamp of last advert
@@ -251,6 +252,7 @@ static void clearPeerCache() {
   for (int i = 0; i < MAX_PEERS; i++) {
     peers[i].inUse = false;
     peers[i].hash = 0;
+    peers[i].altHash = 0;
     peers[i].name = "";
     peers[i].lastAdvert = 0;
   }
@@ -258,9 +260,20 @@ static void clearPeerCache() {
 
 static int findPeerIndexByHash(uint8_t hash) {
   for (int i = 0; i < MAX_PEERS; i++) {
-    if (peers[i].inUse && peers[i].hash == hash) return i;
+    if (peers[i].inUse && (peers[i].hash == hash || peers[i].altHash == hash)) return i;
   }
   return -1;
+}
+
+static uint8_t computeNodeHashSha256(const uint8_t pub[32]) {
+  unsigned char fullHash[32];
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts(&sha, 0);
+  mbedtls_sha256_update(&sha, pub, 32);
+  mbedtls_sha256_finish(&sha, fullHash);
+  mbedtls_sha256_free(&sha);
+  return (uint8_t)fullHash[0];
 }
 
 static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint32_t lastAdvert) {
@@ -271,12 +284,25 @@ static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint
     }
   }
   if (idx < 0) return -1;
-  peers[idx].hash = hash;
+  peers[idx].hash = pub[0];
+  peers[idx].altHash = computeNodeHashSha256(pub);
   memcpy(peers[idx].ed25519_pub, pub, 32);
   peers[idx].name = name;
   peers[idx].lastAdvert = lastAdvert;
   peers[idx].inUse = true;
   return idx;
+}
+
+static int ensurePeerFromAdvertCache(uint8_t hash) {
+  for (int i = 0; i < ADVERT_CACHE_MAX; i++) {
+    if (!advertCache[i].inUse) continue;
+    uint8_t pubFirst = advertCache[i].pub[0];
+    uint8_t pubSha = computeNodeHashSha256(advertCache[i].pub);
+    if (hash == pubFirst || hash == pubSha) {
+      return upsertPeer(pubFirst, advertCache[i].pub, String(advertCache[i].name), advertCache[i].lastAdvert);
+    }
+  }
+  return -1;
 }
 
 // ============================================
@@ -392,8 +418,9 @@ uint8_t ed25519_public_key[32];
 bool ed25519_keys_loaded = false;
 static const char* ED25519_KEY_FILE = "/ed25519_keys.bin";
 
-// Our node hash for direct messaging (first byte of SHA-256(public_key))
+// Our node hash for direct messaging (primary = pubkey[0], alternate = SHA-256(pubkey)[0])
 uint8_t ourNodeHash = 0;
+uint8_t ourNodeHashAlt = 0;
 
 // Scheduled reboot (used when settings require restart)
 bool pendingRestart = false;
@@ -1707,9 +1734,10 @@ void initNodeIdentity() {
   // Load or generate Ed25519 keys for signing adverts
   loadOrGenerateEd25519Keys();
 
-  // Compute our node hash (MeshCore: first byte of public key)
+  // Compute our node hashes (primary = pubkey[0], alternate = SHA-256(pubkey)[0])
   ourNodeHash = ed25519_public_key[0];
-  Serial.printf("Node hash (pubkey[0]): 0x%02X\n", ourNodeHash);
+  ourNodeHashAlt = computeNodeHashSha256(ed25519_public_key);
+  Serial.printf("Node hash (pubkey[0]): 0x%02X, alt (sha256[0]): 0x%02X\n", ourNodeHash, ourNodeHashAlt);
 
   clearPeerCache();
 }
@@ -3189,14 +3217,14 @@ void setup() {
   
   // Initialize node identity for filtering own messages
   initNodeIdentity();
+
+  // Load cached adverts as early as possible
+  loadAdvertCache();
   
   // Sync time via NTP for proper timestamps
   if (wifiConnected) {
     syncNTP();
   }
-
-  // Load cached adverts after time sync (if available)
-  loadAdvertCache();
   
   // Setup LoRa
   if (settings.loraEnabled) {
@@ -4909,6 +4937,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   uint8_t channelKey[32];
   size_t channelKeyLen;
   const uint8_t* senderPubKey = nullptr;
+  uint8_t senderHash = 0;
 
   // --- Handle ADVERT to populate peer cache ---
   if (payloadType == PAYLOAD_TYPE_ADVERT) {
@@ -4992,15 +5021,16 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     }
     uint8_t destHash = message[idx++];
     uint8_t srcHash = message[idx++];
+    senderHash = srcHash;
     Serial.printf("Direct payload: destHash=0x%02X srcHash=0x%02X (our hash=0x%02X)\n", 
                   destHash, srcHash, ourNodeHash);
 
-    // MeshCore node hash is the first byte of the public key
+    // MeshCore node hash may be pubkey[0] or sha256(pubkey)[0]
     uint8_t pubKeyFirstByte = ed25519_public_key[0];
-    Serial.printf("Checking: node hash pubkey[0]=0x%02X\n", pubKeyFirstByte);
+    Serial.printf("Checking: node hash pubkey[0]=0x%02X, alt sha256[0]=0x%02X\n", pubKeyFirstByte, ourNodeHashAlt);
 
     // Check if destHash matches our node hash
-    bool isForUs = (destHash == pubKeyFirstByte);
+    bool isForUs = (destHash == pubKeyFirstByte || destHash == ourNodeHashAlt);
     
     if (!isForUs) {
       Serial.printf("Direct message not addressed to us; ignoring (dest=0x%02X)\n", destHash);
@@ -5011,6 +5041,9 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
 
     // Lookup sender public key via srcHash
     int pidx = findPeerIndexByHash(srcHash);
+    if (pidx < 0) {
+      pidx = ensurePeerFromAdvertCache(srcHash);
+    }
     if (pidx >= 0) {
       senderPubKey = peers[pidx].ed25519_pub;
       Serial.printf("Sender resolved from cache (hash=pubkey[0]) pubkey=%02X%02X%02X%02X...\n",
@@ -5136,7 +5169,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   if (command == "ping") {
     Serial.println("[Command] Received ping, sending pong");
     if (senderPubKey != nullptr) {
-      sendLoRaDirectMessage("pong", senderPubKey, senderPubKey[0], replyPath, replyPathLen);
+      sendLoRaDirectMessage("pong", senderPubKey, senderHash, replyPath, replyPathLen);
     } else {
       Serial.println("[Command] Missing sender public key; cannot reply");
     }
@@ -5179,7 +5212,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
                       String(downCount) + " down";
     
     if (senderPubKey != nullptr) {
-      sendLoRaDirectMessage(statusMsg, senderPubKey, senderPubKey[0], replyPath, replyPathLen);
+      sendLoRaDirectMessage(statusMsg, senderPubKey, senderHash, replyPath, replyPathLen);
     } else {
       Serial.println("[Command] Missing sender public key; cannot reply");
     }
@@ -5193,8 +5226,8 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     for (size_t i = 0; i < pathLen; i++) {
       if (pathIdx + 1 <= 2 + pathLen) {
         uint8_t nodeHashInPath = (uint8_t)message[pathIdx];
-        if (nodeHashInPath == ourNodeHash) {
-          Serial.printf("Found our node hash (0x%02X) in path, not forwarding\n", ourNodeHash);
+        if (nodeHashInPath == ourNodeHash || nodeHashInPath == ourNodeHashAlt) {
+          Serial.printf("Found our node hash (0x%02X/0x%02X) in path, not forwarding\n", ourNodeHash, ourNodeHashAlt);
           Serial.println("=== Packet Processing Complete ===\n");
           return;
         }
