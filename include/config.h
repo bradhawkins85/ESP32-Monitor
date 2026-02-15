@@ -130,6 +130,10 @@
 #define LORA_NODE_NAME ""  // Default: first 8 hex chars of public key
 #endif
 
+#ifndef LORA_COMMAND_PIN
+#define LORA_COMMAND_PIN "0000"  // PIN required for LoRa commands like status/reboot
+#endif
+
 #ifndef LORA_SYNC_WORD
 #define LORA_SYNC_WORD 0x12  // Standard LoRa sync word for private networks
 #endif

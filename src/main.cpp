@@ -36,15 +36,43 @@
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
 #define CIPHER_MAC_SIZE 2
+#define PAYLOAD_TYPE_REQ 0x00
+#define PAYLOAD_TYPE_RESPONSE 0x01
 #define PAYLOAD_TYPE_TXT 0x02
 #define PAYLOAD_TYPE_ACK 0x03
 #define PAYLOAD_TYPE_ADVERT 0x04
 #define PAYLOAD_TYPE_GRP_TXT 0x05
+#define PAYLOAD_TYPE_GRP_DATA 0x06
+#define PAYLOAD_TYPE_ANON_REQ 0x07
+#define PAYLOAD_TYPE_PATH 0x08
 #define TXT_TYPE_PLAIN 0x00
+#define TXT_TYPE_CLI_CMD 0x01
+#define TXT_TYPE_SIGNED_PLAIN 0x02
+#define TXT_TYPE_CLI_DATA 0x03
 #define ROUTE_TYPE_TRANSPORT_FLOOD 0x00  // flood mode + transport codes
 #define ROUTE_TYPE_FLOOD 0x01            // flood mode, needs 'path' to be built up
 #define ROUTE_TYPE_DIRECT 0x02           // direct route, 'path' is supplied (zero hop = direct with no path)
 #define ROUTE_TYPE_TRANSPORT_DIRECT 0x03 // direct route + transport codes
+
+// MeshCore public channel PSK (well-known, base64 "izOH6cXN6mrJ5e26oRXNcg==")
+static const uint8_t MESHCORE_PUBLIC_PSK[16] = {
+  0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+  0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72
+};
+
+// Multi-channel support: monitor public + user channel(s)
+#define MAX_MESH_CHANNELS 8
+
+struct MeshChannel {
+  uint8_t hash;         // SHA256(secret)[0]
+  uint8_t key[32];      // Channel encryption key
+  size_t  keyLen;       // 16 or 32
+  char    name[33];     // Channel name for logging
+  bool    active;       // Is this channel slot in use?
+};
+
+static MeshChannel meshChannels[MAX_MESH_CHANNELS];
+static int meshChannelCount = 0;
 
 // --- Uptime Monitoring Types and Struct ---
 enum ServiceType {
@@ -408,6 +436,10 @@ SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 int lastRssi = 0;
 float lastSnr = 0;
 bool wifiConnected = false;
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
+static bool wifiAttemptInProgress = false;
+static bool wifiAttemptRestoreCaptive = false;
+static unsigned long wifiAttemptStartMs = 0;
 unsigned long lastMessageTime = 0;
 int messageCount = 0;
 unsigned long lastPingTime = 0;
@@ -457,6 +489,7 @@ struct Settings {
   bool loraEnabled;
   bool loraIpAlerts;
   String loraNodeName;
+  String loraCommandPin;
   float loraFreq;
   float loraBandwidth;
   int loraSpreadingFactor;
@@ -544,6 +577,7 @@ Settings defaultSettingsFromBuild() {
   s.loraEnabled = (LORA_ENABLED != 0);
   s.loraIpAlerts = (LORA_IP_ALERTS != 0);
   s.loraNodeName = String(LORA_NODE_NAME);
+  s.loraCommandPin = String(LORA_COMMAND_PIN);
   s.loraFreq = (float)LORA_FREQ;
   s.loraBandwidth = (float)LORA_BANDWIDTH;
   s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
@@ -645,6 +679,7 @@ void loadSettingsOverrides() {
   // LoRa radio parameters
   if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
   if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
+  if (doc["LORA_COMMAND_PIN"].is<String>()) settings.loraCommandPin = doc["LORA_COMMAND_PIN"].as<String>();
   if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
   if (doc["LORA_FREQ"].is<double>()) settings.loraFreq = (float)doc["LORA_FREQ"].as<double>();
   if (doc["LORA_FREQ"].is<String>()) settings.loraFreq = doc["LORA_FREQ"].as<String>().toFloat();
@@ -786,6 +821,7 @@ bool saveSettingsOverrides() {
 
   doc["LORA_ENABLED"] = settings.loraEnabled;
   doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
+  doc["LORA_COMMAND_PIN"] = settings.loraCommandPin;
   doc["LORA_FREQ"] = settings.loraFreq;
   doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
   doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
@@ -1097,6 +1133,8 @@ bool captivePortalActive = false;
 String captiveApSsid;
 IPAddress captiveApIp;
 IPAddress captiveApNetmask(255, 255, 255, 0);
+static const unsigned long CAPTIVE_RETRY_INTERVAL_MS = 60UL * 60UL * 1000UL;
+static unsigned long lastCaptiveRetryMs = 0;
 
 // One-time notification after captive WiFi provisioning
 static const char* WIFI_PROVISION_FLAG_FILE = "/wifi_provisioned.flag";
@@ -1303,6 +1341,15 @@ static String captivePortalHtml() {
   return page;
 }
 
+static void stopCaptivePortal() {
+  if (!captivePortalActive) return;
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  captivePortalActive = false;
+  Serial.println("[CaptivePortal] Stopped");
+}
+
 static void startCaptivePortal() {
   if (captivePortalActive) return;
 
@@ -1334,6 +1381,7 @@ static void startCaptivePortal() {
 
   dnsServer.start(53, "*", captiveApIp);
   captivePortalActive = true;
+  lastCaptiveRetryMs = millis();
   Serial.printf("[CaptivePortal] Started SSID=%s IP=%s\n", captiveApSsid.c_str(), captiveApIp.toString().c_str());
 }
 
@@ -1569,7 +1617,7 @@ void checkAllServices() {
 // ============================================
 // Function Declarations
 // ============================================
-void setupWiFi();
+void setupWiFi(bool waitForConnect = true);
 void setupLoRa();
 void syncNTP();
 void handleLoRaMessage(const uint8_t* message, size_t messageLen);
@@ -1583,7 +1631,9 @@ void forwardToDiscord(String message);
 void forwardToWebhook(String message);
 size_t encryptAndSign(const uint8_t* secret, size_t secretLen, uint8_t* output, size_t maxOutput, const uint8_t* input, size_t inputLen);
 void deriveChannelKey(const char* channelName, const char* channelSecret, uint8_t* hash, uint8_t* key, size_t* keyLen);
+void initMeshChannels();
 static bool deriveSharedSecretWithPeer(const uint8_t peerEd25519Pub[32], uint8_t shared[32]);
+static void deriveDirectKeyFromShared(const uint8_t shared[32], uint8_t outKey[32]);
 static bool normalizeHexKey(const String &input, String &out);
 static bool parseHexKeyToBytes(const String &hex, uint8_t out[32]);
 
@@ -1768,6 +1818,7 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   }
 
   // For direct messages, derive ECDH shared secret with peer
+  // MeshCore uses the raw shared secret directly (not SHA-256 derived)
   uint8_t channelKey[32];
   size_t channelKeyLen = 32;
   if (!deriveSharedSecretWithPeer(destPubKey, channelKey)) {
@@ -1775,7 +1826,7 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
     return;
   }
   
-  // Encrypt and compute MAC
+  // Encrypt and compute MAC using raw shared secret
   uint8_t macAndCipher[256];
   size_t macCipherLen = encryptAndSign(channelKey, channelKeyLen, macAndCipher, sizeof(macAndCipher), plaintext, idx);
   if (macCipherLen == 0) {
@@ -2711,6 +2762,15 @@ void updateServiceStatus(Service& service, bool checkResult) {
 // MeshCore Crypto Functions
 // ============================================
 
+static void deriveDirectKeyFromShared(const uint8_t shared[32], uint8_t outKey[32]) {
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts(&sha, 0);
+  mbedtls_sha256_update(&sha, shared, 32);
+  mbedtls_sha256_finish(&sha, outKey);
+  mbedtls_sha256_free(&sha);
+}
+
 /**
  * Verify MAC and decrypt MeshCore packet
  * @param secret Channel secret key
@@ -3077,6 +3137,47 @@ void deriveChannelKey(const char* channelName, const char* channelSecret, uint8_
   Serial.printf("Channel hash: 0x%02X, Key length: %d\n", *hash, (int)*keyLen);
 }
 
+/**
+ * Initialize mesh channels: public channel + user's configured channel.
+ * Called at startup and whenever channel settings change.
+ */
+void initMeshChannels() {
+  meshChannelCount = 0;
+  memset(meshChannels, 0, sizeof(meshChannels));
+
+  // Channel 0: MeshCore public channel (always present, like MeshCore firmware)
+  {
+    MeshChannel& ch = meshChannels[meshChannelCount];
+    ch.active = true;
+    memcpy(ch.key, MESHCORE_PUBLIC_PSK, 16);
+    ch.keyLen = 16;
+    strncpy(ch.name, "Public", sizeof(ch.name) - 1);
+    // hash = SHA256(PSK)[0]
+    unsigned char h[32];
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, MESHCORE_PUBLIC_PSK, 16);
+    mbedtls_sha256_finish(&sha, h);
+    mbedtls_sha256_free(&sha);
+    ch.hash = h[0];
+    Serial.printf("[Channels] #%d '%s' hash=0x%02X keyLen=%d\n", meshChannelCount, ch.name, ch.hash, (int)ch.keyLen);
+    meshChannelCount++;
+  }
+
+  // Channel 1+: User's configured channel (if secret is set)
+  if (settings.channelSecret.length() > 0) {
+    MeshChannel& ch = meshChannels[meshChannelCount];
+    ch.active = true;
+    deriveChannelKey(settings.channelName.c_str(), settings.channelSecret.c_str(), &ch.hash, ch.key, &ch.keyLen);
+    strncpy(ch.name, settings.channelName.c_str(), sizeof(ch.name) - 1);
+    Serial.printf("[Channels] #%d '%s' hash=0x%02X keyLen=%d\n", meshChannelCount, ch.name, ch.hash, (int)ch.keyLen);
+    meshChannelCount++;
+  }
+
+  Serial.printf("[Channels] %d channel(s) initialized\n", meshChannelCount);
+}
+
 // ============================================
 // MeshCore TX Helper
 // ============================================
@@ -3426,6 +3527,10 @@ void setup() {
       if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
       if (doc["LORA_NODE_NAME"].is<String>()) settings.loraNodeName = doc["LORA_NODE_NAME"].as<String>();
       if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
+      if (doc["LORA_COMMAND_PIN"].is<String>()) {
+        String v = doc["LORA_COMMAND_PIN"].as<String>();
+        if (v.length() > 0) settings.loraCommandPin = v;
+      }
 
       // LoRa radio parameters
       if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
@@ -3633,6 +3738,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Node Name</label><input id='LORA_NODE_NAME' value='" + settings.loraNodeName + "' placeholder='(first 8 chars of public key)'></div>";
     page += "<div class='fg'><label class='lbl'>Channel Name</label><input id='CHANNEL_NAME' value='" + settings.channelName + "'></div>";
     page += "<div class='fg'><label class='lbl'>Channel Secret</label><input id='CHANNEL_SECRET' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "<div class='fg'><label class='lbl'>Command PIN</label><input id='LORA_COMMAND_PIN' type='password' value='' placeholder='(unchanged)'></div>";
     page += "<div class='fg'><label class='lbl'>LoRa Enabled</label><select id='LORA_ENABLED'><option value='true'" + String(settings.loraEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='LORA_IP_ALERTS'><option value='true'" + String(settings.loraIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Frequency (MHz)</label><input id='LORA_FREQ' type='number' step='0.001' value='" + String(settings.loraFreq, 3) + "'></div>";
@@ -3719,7 +3825,7 @@ void setup() {
     page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
     page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
@@ -4584,12 +4690,26 @@ void setup() {
   server.begin();
 }
 
+static void startWifiConnectAttempt(bool restoreCaptiveOnFail) {
+  wifiAttemptRestoreCaptive = restoreCaptiveOnFail;
+  wifiAttemptInProgress = true;
+  wifiAttemptStartMs = millis();
+  setupWiFi(false);
+}
+
 // ============================================
 // Main Loop
 // ============================================
 void loop() {
   if (captivePortalActive) {
     dnsServer.processNextRequest();
+
+    // Hourly retry: pause hotspot and attempt STA connection.
+    if (!wifiAttemptInProgress && millis() - lastCaptiveRetryMs >= CAPTIVE_RETRY_INTERVAL_MS) {
+      Serial.println("[CaptivePortal] Hourly retry: stopping hotspot to try WiFi reconnect");
+      stopCaptivePortal();
+      startWifiConnectAttempt(true);
+    }
   }
 
   if (settings.mqttEnabled) {
@@ -4665,11 +4785,28 @@ void loop() {
 
     wifiConnected = nowConnected;
 
-    if (!wifiConnected && millis() - lastWifiAttempt >= 10000) {
+    if (!wifiConnected && !wifiAttemptInProgress && millis() - lastWifiAttempt >= 10000) {
       Serial.println("WiFi disconnected, reconnecting...");
-      setupWiFi();
+      startWifiConnectAttempt(false);
       lastWifiAttempt = millis();
-      wifiConnected = (WiFi.status() == WL_CONNECTED);
+    }
+
+    if (wifiAttemptInProgress) {
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiAttemptInProgress = false;
+        wifiAttemptRestoreCaptive = false;
+        wifiConnected = true;
+        Serial.println("WiFi connected!");
+        notifyIpChangeIfNeeded(WiFi.localIP().toString(), "reconnect");
+      } else if (millis() - wifiAttemptStartMs >= WIFI_CONNECT_TIMEOUT_MS) {
+        bool restoreCaptive = wifiAttemptRestoreCaptive;
+        Serial.println("WiFi reconnect timed out");
+        wifiAttemptInProgress = false;
+        wifiAttemptRestoreCaptive = false;
+        if (restoreCaptive || !captivePortalActive) {
+          startCaptivePortal();
+        }
+      }
     }
 
     // Detect DHCP renewals / IP changes while connected
@@ -4690,7 +4827,7 @@ void loop() {
 // ============================================
 // WiFi Setup
 // ============================================
-void setupWiFi() {
+void setupWiFi(bool waitForConnect) {
   if (captivePortalActive) {
     Serial.println("WiFi connect skipped: captive portal active");
     return;
@@ -4751,7 +4888,11 @@ void setupWiFi() {
   }
   
   WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
-  
+
+  if (!waitForConnect) {
+    return;
+  }
+
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
@@ -4865,6 +5006,9 @@ void setupLoRa() {
   Serial.println(settings.channelName);
   Serial.println("========================\n");
   
+  // Initialize mesh channels (public + user's channel)
+  initMeshChannels();
+  
   // Start listening for packets (all devices listen and can transmit)
   state = radio.startReceive();
   if (state != RADIOLIB_ERR_NONE) {
@@ -4893,15 +5037,26 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   uint8_t routeType = header & 0x03;
   uint8_t payloadType = (header >> 2) & 0x0F;
   uint8_t version = (header >> 6) & 0x03;
-  uint8_t pathLen = message[1];
   
-  Serial.printf("Header: 0x%02X -> route=%d, payload=%d, version=%d, pathLen=%d\n", 
-                header, routeType, payloadType, version, pathLen);
+  // Handle transport codes for route types 0 (TRANSPORT_FLOOD) and 3 (TRANSPORT_DIRECT)
+  bool hasTransportCodes = (routeType == ROUTE_TYPE_TRANSPORT_FLOOD || routeType == ROUTE_TYPE_TRANSPORT_DIRECT);
+  size_t hdrSize = 1 + (hasTransportCodes ? 4 : 0);  // header + optional transport codes
   
-  // Check minimum packet size based on header + path
-  if (messageLen < (2 + pathLen)) {
+  if (messageLen < hdrSize + 1) {
+    Serial.println("Packet too short for header + path_len");
+    return;
+  }
+  
+  uint8_t pathLen = message[hdrSize];  // path_len is after header (and optional transport codes)
+  
+  Serial.printf("Header: 0x%02X -> route=%d, payload=%d, version=%d, pathLen=%d, transport=%s\n", 
+                header, routeType, payloadType, version, pathLen, hasTransportCodes ? "yes" : "no");
+  
+  // Check minimum packet size based on header + transport codes + path_len byte + path
+  size_t pathStart = hdrSize + 1;  // offset where path bytes begin
+  if (messageLen < (pathStart + pathLen)) {
     Serial.printf("Packet too short: have %d bytes, need at least %d (header + pathLen)\n", 
-                  (int)messageLen, 2 + pathLen);
+                  (int)messageLen, (int)(pathStart + pathLen));
     return;
   }
   
@@ -4909,7 +5064,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   uint8_t senderPath[64];
   size_t senderPathLen = (pathLen > 64) ? 64 : pathLen;
   if (pathLen > 0) {
-    memcpy(senderPath, message + 2, senderPathLen);
+    memcpy(senderPath, message + pathStart, senderPathLen);
   }
 
   // Build reverse path for replies (path uses node hashes)
@@ -4921,14 +5076,17 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     }
   }
   
-  // We handle PAYLOAD_TYPE_TXT (0x02), PAYLOAD_TYPE_GRP_TXT (0x05), and PAYLOAD_TYPE_ADVERT (0x04)
-  if (payloadType != PAYLOAD_TYPE_TXT && payloadType != PAYLOAD_TYPE_GRP_TXT && payloadType != PAYLOAD_TYPE_ADVERT) {
+  // We handle PAYLOAD_TYPE_TXT (0x02), PAYLOAD_TYPE_GRP_TXT (0x05), PAYLOAD_TYPE_ADVERT (0x04),
+  // PAYLOAD_TYPE_PATH (0x08), PAYLOAD_TYPE_REQ (0x00), and PAYLOAD_TYPE_RESPONSE (0x01)
+  if (payloadType != PAYLOAD_TYPE_TXT && payloadType != PAYLOAD_TYPE_GRP_TXT && 
+      payloadType != PAYLOAD_TYPE_ADVERT && payloadType != PAYLOAD_TYPE_PATH &&
+      payloadType != PAYLOAD_TYPE_REQ && payloadType != PAYLOAD_TYPE_RESPONSE) {
     Serial.printf("Unsupported payload type: %d\n", payloadType);
     return;
   }
   
-  // Skip path (pathLen is in bytes)
-  size_t idx = 2 + pathLen;
+  // Payload starts after header + optional transport codes + path_len byte + path bytes
+  size_t idx = pathStart + pathLen;
   if (idx >= messageLen) {
     Serial.println("Packet too short for payload");
     return;
@@ -4942,7 +5100,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   // --- Handle ADVERT to populate peer cache ---
   if (payloadType == PAYLOAD_TYPE_ADVERT) {
     // Advert payload: [public_key(32)][timestamp(4)][signature(64)][app_data]
-    size_t advertIdx = 2 + pathLen;
+    size_t advertIdx = idx;  // idx already points to start of payload
     size_t remain = messageLen - advertIdx;
     if (remain < 32 + 4) {
       Serial.println("Advert payload too short for public key + timestamp");
@@ -4991,27 +5149,94 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     return;
   }
   
-  // For group messages, verify channel hash; for direct messages, read dest/src hash and derive ECDH key
+  // For group messages, try all matching channels; for direct messages, read dest/src hash and derive ECDH key
+  String matchedChannelName = "";
+  String text = "";
   if (payloadType == PAYLOAD_TYPE_GRP_TXT) {
-    // Get channel hash
+    // Get channel hash from packet
     uint8_t receivedHash = (uint8_t)message[idx++];
     Serial.printf("Received channel hash: 0x%02X\n", receivedHash);
     
-    // Derive our channel hash and secret
-    uint8_t channelHash;
-    deriveChannelKey(settings.channelName.c_str(), settings.channelSecret.c_str(), &channelHash, channelKey, &channelKeyLen);
+    // Save idx for retry with multiple channels
+    size_t encDataIdx = idx;
+    size_t encryptedLen = messageLen - encDataIdx;
     
-    Serial.printf("Expected channel hash: 0x%02X\n", channelHash);
-    
-    if (receivedHash != channelHash) {
-      Serial.println("Channel hash mismatch - wrong channel");
+    // Minimum: 2 bytes MAC + 16 bytes ciphertext (AES block)
+    size_t minEncryptedLen = CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE;
+    if (encryptedLen < minEncryptedLen) {
+      Serial.printf("Packet too short for valid encrypted message (need at least %d, got %d)\n", 
+                    (int)minEncryptedLen, (int)encryptedLen);
       return;
     }
     
-    Serial.println("Channel hash matched!");
-  } else {
-    // Direct messages: [destHash(1)][srcHash(1)][MAC(2) + ciphertext]
-    Serial.printf("Processing as direct TXT message (payload type %d)\n", payloadType);
+    const uint8_t* encrypted = message + encDataIdx;
+    uint8_t decrypted[256];
+    size_t decryptedLen = 0;
+    bool matched = false;
+    
+    // Try all channels with matching hash (like MeshCore's searchChannelsByHash + decrypt loop)
+    for (int ch = 0; ch < meshChannelCount; ch++) {
+      if (!meshChannels[ch].active) continue;
+      if (meshChannels[ch].hash != receivedHash) continue;
+      
+      Serial.printf("  Trying channel '%s' (hash=0x%02X, keyLen=%d)...\n", 
+                    meshChannels[ch].name, meshChannels[ch].hash, (int)meshChannels[ch].keyLen);
+      
+      decryptedLen = verifyAndDecrypt(meshChannels[ch].key, meshChannels[ch].keyLen, decrypted, encrypted, encryptedLen);
+      if (decryptedLen > 0) {
+        Serial.printf("  -> Decrypted successfully on channel '%s'!\n", meshChannels[ch].name);
+        matchedChannelName = meshChannels[ch].name;
+        matched = true;
+        break;
+      }
+    }
+    
+    if (!matched) {
+      // Log which hashes we have configured
+      Serial.print("Channel hash mismatch or decryption failed. Configured channels: ");
+      for (int ch = 0; ch < meshChannelCount; ch++) {
+        Serial.printf("'%s'=0x%02X ", meshChannels[ch].name, meshChannels[ch].hash);
+      }
+      Serial.println();
+      return;
+    }
+    
+    // Parse the decrypted group message directly here
+    Serial.printf("Decrypted %d bytes from channel '%s'\n", decryptedLen, matchedChannelName.c_str());
+    
+    if (decryptedLen < 5) {
+      Serial.println("Decrypted payload too short");
+      return;
+    }
+    
+    uint32_t timestamp = decrypted[0] | (decrypted[1] << 8) | (decrypted[2] << 16) | (decrypted[3] << 24);
+    uint8_t txtType = decrypted[4];
+    
+    Serial.printf("Timestamp: %u, Text type: %d\n", timestamp, txtType);
+    
+    // Extract text message (remove zero padding)
+    size_t textLen = decryptedLen - 5;
+    char textMessage[256];
+    memcpy(textMessage, &decrypted[5], textLen);
+    textMessage[textLen] = '\0';
+    
+    // Remove trailing zeros (padding)
+    for (int i = textLen - 1; i >= 0; i--) {
+      if (textMessage[i] == '\0' || textMessage[i] == 0) {
+        textMessage[i] = '\0';
+      } else {
+        break;
+      }
+    }
+    
+    text = String(textMessage);
+    Serial.printf("[LoRa][%s] Group message: %s\n", matchedChannelName.c_str(), text.c_str());
+    
+  } else if (payloadType == PAYLOAD_TYPE_TXT || payloadType == PAYLOAD_TYPE_PATH ||
+             payloadType == PAYLOAD_TYPE_REQ || payloadType == PAYLOAD_TYPE_RESPONSE) {
+    // Direct/peer messages: [destHash(1)][srcHash(1)][MAC(2) + ciphertext]
+    // TXT, PATH, REQ, RESPONSE all use the same format with dest/src hashes + encrypted data
+    Serial.printf("Processing as peer message (payload type %d)\n", payloadType);
     
     size_t minDirectSize = 1 + 1 + CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE; // AES block minimum
     if ((messageLen - idx) < minDirectSize) {
@@ -5061,86 +5286,137 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       Serial.println("Failed to derive shared secret for direct message");
       return;
     }
+    // MeshCore uses the raw ECDH shared secret directly for encrypt/decrypt
     memcpy(channelKey, shared, 32);
     channelKeyLen = 32;
-  }
-  
-  // Remaining data is MAC + ciphertext
-  size_t encryptedLen = messageLen - idx;
-  Serial.printf("Encrypted payload length: %d bytes\n", encryptedLen);
-  
-  // Minimum: 2 bytes MAC + 16 bytes ciphertext (AES block)
-  size_t minEncryptedLen = CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE;
-  if (encryptedLen < minEncryptedLen) {
-    Serial.printf("Packet too short for valid encrypted message (need at least %d bytes, got %d)\n", 
-                  (int)minEncryptedLen, (int)encryptedLen);
-    Serial.println("This may be a different packet type or corrupted packet");
-    return;
-  }
-  
-  const uint8_t* encrypted = message + idx;
-  uint8_t decrypted[256];
-  
-  // Decrypt and verify MAC
-  size_t decryptedLen = verifyAndDecrypt(channelKey, channelKeyLen, decrypted, encrypted, encryptedLen);
-  
-  if (decryptedLen == 0) {
-    Serial.println("Decryption or MAC verification failed");
-    Serial.println("This could mean:");
-    Serial.println("  - Packet is not from this channel");
-    Serial.println("  - Sender is using a different CHANNEL_SECRET");
-    Serial.println("  - Packet was corrupted during transmission");
-    return;
-  }
-  
-  Serial.printf("Decrypted %d bytes successfully\n", decryptedLen);
-  
-  // Parse plaintext: [timestamp(4)][txt_type(1)][text]
-  if (decryptedLen < 5) {
-    Serial.println("Decrypted payload too short");
-    return;
-  }
-  
-  uint32_t timestamp = decrypted[0] | (decrypted[1] << 8) | (decrypted[2] << 16) | (decrypted[3] << 24);
-  uint8_t txtType = decrypted[4];
-  
-  Serial.printf("Timestamp: %u, Text type: %d\n", timestamp, txtType);
-  
-  // Extract text message (remove zero padding)
-  size_t textLen = decryptedLen - 5;
-  char textMessage[256];
-  memcpy(textMessage, &decrypted[5], textLen);
-  textMessage[textLen] = '\0';
-  
-  // Remove trailing zeros (padding)
-  for (int i = textLen - 1; i >= 0; i--) {
-    if (textMessage[i] == '\0' || textMessage[i] == ' ') {
-      textMessage[i] = '\0';
-    } else {
-      break;
+    
+    // --- Decrypt and parse direct message ---
+    size_t encryptedLen = messageLen - idx;
+    Serial.printf("Encrypted payload length: %d bytes\n", encryptedLen);
+    
+    size_t minEncryptedLen = CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE;
+    if (encryptedLen < minEncryptedLen) {
+      Serial.printf("Packet too short for valid encrypted message (need at least %d bytes, got %d)\n", 
+                    (int)minEncryptedLen, (int)encryptedLen);
+      Serial.println("This may be a different packet type or corrupted packet");
+      return;
     }
-  }
-  
-  Serial.printf("Decoded message: \"%s\"\n", textMessage);
-
-  // Send ACK for direct plain text messages
-  if (payloadType == PAYLOAD_TYPE_TXT && senderPubKey != nullptr) {
-    uint8_t txtTypeFlags = txtType & 0xFC;
-    if (txtTypeFlags == TXT_TYPE_PLAIN) {
-      size_t textLen = strlen(textMessage);
-      size_t ackDataLen = 5 + textLen;
-      if (ackDataLen <= decryptedLen) {
-        uint32_t ackHash = computeAckHash(decrypted, ackDataLen, senderPubKey);
-        sendLoRaAck(ackHash, replyPath, replyPathLen);
-      } else {
-        Serial.println("[LoRa] ACK skipped: decrypted payload length mismatch");
+    
+    const uint8_t* encrypted = message + idx;
+    uint8_t decrypted[256];
+    
+    // Try raw shared secret first (MeshCore standard)
+    size_t decryptedLen = verifyAndDecrypt(channelKey, channelKeyLen, decrypted, encrypted, encryptedLen);
+    if (decryptedLen == 0 && senderPubKey != nullptr) {
+      // Fallback: try SHA-256 derived key (in case peer uses derived key)
+      uint8_t derivedKey[32];
+      deriveDirectKeyFromShared(shared, derivedKey);
+      decryptedLen = verifyAndDecrypt(derivedKey, 32, decrypted, encrypted, encryptedLen);
+      if (decryptedLen > 0) {
+        Serial.println("[LoRa] Direct message decrypted using SHA-256 derived key (non-standard)");
       }
-    } else {
-      Serial.println("[LoRa] ACK skipped: non-plain text type");
     }
+    
+    if (decryptedLen == 0) {
+      Serial.println("Decryption or MAC verification failed");
+      return;
+    }
+    
+    Serial.printf("Decrypted %d bytes successfully\n", decryptedLen);
+    
+    // Handle PATH payload type (route establishment)
+    if (payloadType == PAYLOAD_TYPE_PATH) {
+      // PATH decrypted data: [path_len(1)][path(path_len)][extra_type(1)][extra(rest)]
+      if (decryptedLen < 2) {
+        Serial.println("[PATH] Decrypted PATH payload too short");
+        Serial.println("=== Packet Processing Complete ===\n");
+        return;
+      }
+      uint8_t returnPathLen = decrypted[0];
+      if (1 + returnPathLen + 1 > decryptedLen) {
+        Serial.println("[PATH] PATH data incomplete");
+        Serial.println("=== Packet Processing Complete ===\n");
+        return;
+      }
+      const uint8_t* returnPath = &decrypted[1];
+      uint8_t extraType = decrypted[1 + returnPathLen] & 0x0F;
+      
+      Serial.printf("[PATH] Return path from peer (len=%d), extra_type=%d\n", returnPathLen, extraType);
+      
+      // If there's an embedded ACK in the PATH, process it
+      if (extraType == PAYLOAD_TYPE_ACK && 1 + returnPathLen + 1 + 4 <= decryptedLen) {
+        uint32_t ackHash;
+        memcpy(&ackHash, &decrypted[1 + returnPathLen + 1], 4);
+        Serial.printf("[PATH] Contains embedded ACK hash: 0x%08X\n", ackHash);
+      }
+      
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+    
+    // Handle REQ/RESPONSE payload types (log and ignore for now)
+    if (payloadType == PAYLOAD_TYPE_REQ || payloadType == PAYLOAD_TYPE_RESPONSE) {
+      Serial.printf("[LoRa] Received %s from peer (srcHash=0x%02X), %d decrypted bytes\n",
+                    payloadType == PAYLOAD_TYPE_REQ ? "REQUEST" : "RESPONSE",
+                    senderHash, decryptedLen);
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+    
+    // --- Parse TXT message payload ---
+    if (decryptedLen < 5) {
+      Serial.println("Decrypted payload too short for TXT message");
+      return;
+    }
+    
+    uint32_t timestamp = decrypted[0] | (decrypted[1] << 8) | (decrypted[2] << 16) | (decrypted[3] << 24);
+    uint8_t txtType = decrypted[4];
+    
+    Serial.printf("Timestamp: %u, Text type: %d\n", timestamp, txtType);
+    
+    size_t textLen = decryptedLen - 5;
+    char textMessage[256];
+    memcpy(textMessage, &decrypted[5], textLen);
+    textMessage[textLen] = '\0';
+    
+    // Compute ACK hash BEFORE stripping padding, using strlen on raw decrypted data
+    // MeshCore ACK: SHA256(data[0..4+strlen(&data[5])] || sender_pubkey)[0..3]
+    size_t rawTextLen = strlen((const char*)&decrypted[5]);
+    
+    for (int i = textLen - 1; i >= 0; i--) {
+      if (textMessage[i] == '\0') {
+        textMessage[i] = '\0';
+      } else {
+        break;
+      }
+    }
+    
+    Serial.printf("Decoded message: \"%s\"\n", textMessage);
+
+    // Send ACK for direct plain text messages
+    if (senderPubKey != nullptr) {
+      uint8_t txtTypeFlags = (txtType >> 2) & 0x3F;  // upper 6 bits = txt_type
+      if (txtTypeFlags == TXT_TYPE_PLAIN) {
+        size_t ackDataLen = 5 + rawTextLen;
+        if (ackDataLen <= decryptedLen) {
+          uint32_t ackHash = computeAckHash(decrypted, ackDataLen, senderPubKey);
+          sendLoRaAck(ackHash, replyPath, replyPathLen);
+        }
+      }
+    }
+    
+    matchedChannelName = "Direct";
+    text = String(textMessage);
+    Serial.printf("[LoRa][Direct] Message: %s\n", text.c_str());
+  } else {
+    // Unhandled payload type that passed the initial filter
+    Serial.printf("Payload type %d not processed for text extraction\n", payloadType);
+    Serial.println("=== Packet Processing Complete ===\n");
+    return;
   }
   
-  String msgStr = String(textMessage);
+  // ===== Common text handling for both group and direct messages =====
+  String msgStr = text;
   
   // Check if this is our own message by checking if the message starts with our node name
   if (msgStr.startsWith(ourNodeName + ":")) {
@@ -5149,21 +5425,37 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     return;
   }
   
-  // Check for direct commands (ping, status)
+  // Check for direct commands (ping, status, reboot)
   String trimmedMsg = msgStr;
   trimmedMsg.trim();
-  trimmedMsg.toLowerCase();
-  
-  // Extract command from "sender: command" format, or use full text
-  int colonPos = msgStr.indexOf(':');
-  String command = "";
-  if (colonPos != -1 && colonPos < msgStr.length() - 1) {
-    command = msgStr.substring(colonPos + 1);
-  } else {
-    command = trimmedMsg;
+
+  // Extract command from "sender: command" format, or use full text.
+  // If the prefix is an actual command (e.g., "status:1234"), don't strip it.
+  int colonPos = trimmedMsg.indexOf(':');
+  String commandRaw = trimmedMsg;
+  if (colonPos != -1 && colonPos < trimmedMsg.length() - 1) {
+    String before = trimmedMsg.substring(0, colonPos);
+    before.trim();
+    String beforeLower = before;
+    beforeLower.toLowerCase();
+    if (beforeLower != "ping" && beforeLower != "status" && beforeLower != "reboot") {
+      commandRaw = trimmedMsg.substring(colonPos + 1);
+    }
   }
-  command.trim();
+  commandRaw.trim();
+
+  String pinPart = "";
+  int pinSep = commandRaw.indexOf(':');
+  if (pinSep != -1 && pinSep < commandRaw.length() - 1) {
+    pinPart = commandRaw.substring(pinSep + 1);
+    commandRaw = commandRaw.substring(0, pinSep);
+  }
+  commandRaw.trim();
+  pinPart.trim();
+
+  String command = commandRaw;
   command.toLowerCase();
+  bool pinOk = (settings.loraCommandPin.length() > 0 && pinPart == settings.loraCommandPin);
   
   // Handle "ping" command
   if (command == "ping") {
@@ -5180,6 +5472,14 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   // Handle "status" command
   if (command == "status") {
     Serial.println("[Command] Received status request, sending status");
+    if (!pinOk) {
+      Serial.println("[Command] Status denied: invalid or missing PIN");
+      if (senderPubKey != nullptr) {
+        sendLoRaDirectMessage("unauthorized", senderPubKey, senderHash, replyPath, replyPathLen);
+      }
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
     
     // Get IP address
     String ip = WiFi.localIP().toString();
@@ -5219,12 +5519,32 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     Serial.println("=== Packet Processing Complete ===\n");
     return;
   }
+
+  // Handle "reboot" command (PIN required)
+  if (command == "reboot") {
+    Serial.println("[Command] Received reboot request");
+    if (!pinOk) {
+      Serial.println("[Command] Reboot denied: invalid or missing PIN");
+      if (senderPubKey != nullptr) {
+        sendLoRaDirectMessage("unauthorized", senderPubKey, senderHash, replyPath, replyPathLen);
+      }
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+    if (senderPubKey != nullptr) {
+      sendLoRaDirectMessage("rebooting", senderPubKey, senderHash, replyPath, replyPathLen);
+    }
+    pendingRestart = true;
+    restartAtMs = millis() + 1000;
+    Serial.println("=== Packet Processing Complete ===\n");
+    return;
+  }
   
   // Also check path for our node hash to detect own messages
   if (pathLen >= 1) {
-    size_t pathIdx = 2;
+    size_t pathIdx = pathStart;
     for (size_t i = 0; i < pathLen; i++) {
-      if (pathIdx + 1 <= 2 + pathLen) {
+      if (pathIdx < pathStart + pathLen) {
         uint8_t nodeHashInPath = (uint8_t)message[pathIdx];
         if (nodeHashInPath == ourNodeHash || nodeHashInPath == ourNodeHashAlt) {
           Serial.printf("Found our node hash (0x%02X/0x%02X) in path, not forwarding\n", ourNodeHash, ourNodeHashAlt);
@@ -5245,7 +5565,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     return;
   }
   
-  String forwardMsg = String(textMessage);
+  String forwardMsg = msgStr;
 
   if (settings.ntfyEnabled && settings.ntfyMeshRelay) {
     forwardToNtfy(forwardMsg);
