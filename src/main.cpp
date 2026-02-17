@@ -151,13 +151,14 @@ struct PeerInfo {
   uint8_t ed25519_pub[32];
   String name;            // Optional human-readable name
   uint32_t lastAdvert;    // Unix timestamp of last advert
+  uint8_t nodeType;       // MeshCore appFlags lower nibble: 0=Unknown,1=Client,2=Repeater,3=Router
   bool inUse;
 };
 
 #define MAX_PEERS 16
 PeerInfo peers[MAX_PEERS];
 
-static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint32_t lastAdvert);
+static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint32_t lastAdvert, uint8_t nodeType = 0);
 
 // ============================================
 // Advert Cache (persisted)
@@ -170,6 +171,7 @@ struct AdvertCacheEntry {
   uint8_t pub[32];
   uint32_t lastAdvert;
   char name[32];
+  uint8_t nodeType;       // MeshCore appFlags lower nibble
   bool inUse;
 };
 
@@ -180,6 +182,7 @@ static void clearAdvertCache() {
     advertCache[i].inUse = false;
     advertCache[i].lastAdvert = 0;
     advertCache[i].name[0] = '\0';
+    advertCache[i].nodeType = 0;
   }
 }
 
@@ -202,6 +205,7 @@ static void saveAdvertCache() {
     f.write(advertCache[i].pub, 32);
     f.write((uint8_t*)&advertCache[i].lastAdvert, sizeof(uint32_t));
     f.write((uint8_t*)advertCache[i].name, sizeof(advertCache[i].name));
+    f.write(&advertCache[i].nodeType, 1);
   }
   f.close();
 }
@@ -221,16 +225,26 @@ static void loadAdvertCache() {
 
   uint32_t now = (uint32_t)time(nullptr);
   bool hasValidTime = (now >= 1000000000UL);
-  size_t recordSize = 32 + sizeof(uint32_t) + 32;
+  size_t recordSize = 32 + sizeof(uint32_t) + 32 + 1; // pub + timestamp + name + nodeType
+  size_t legacyRecordSize = 32 + sizeof(uint32_t) + 32; // old format without nodeType
   int loaded = 0;
 
-  while (f.available() >= (int)recordSize && loaded < ADVERT_CACHE_MAX) {
+  // Detect format: try new format first, fall back to legacy
+  size_t fileSize = f.size();
+  bool hasNodeType = (fileSize > 0 && (fileSize % recordSize == 0));
+  size_t useRecordSize = hasNodeType ? recordSize : legacyRecordSize;
+
+  while (f.available() >= (int)useRecordSize && loaded < ADVERT_CACHE_MAX) {
     AdvertCacheEntry entry;
     entry.inUse = true;
+    entry.nodeType = 0;
     f.read(entry.pub, 32);
     f.read((uint8_t*)&entry.lastAdvert, sizeof(uint32_t));
     f.read((uint8_t*)entry.name, sizeof(entry.name));
     entry.name[sizeof(entry.name) - 1] = '\0';
+    if (hasNodeType) {
+      f.read(&entry.nodeType, 1);
+    }
 
     if (hasValidTime && entry.lastAdvert > 0 && (now - entry.lastAdvert) > ADVERT_RETENTION_SECONDS) {
       continue;
@@ -238,7 +252,7 @@ static void loadAdvertCache() {
 
     advertCache[loaded] = entry;
     uint8_t peerHash = entry.pub[0];
-    upsertPeer(peerHash, entry.pub, String(entry.name), entry.lastAdvert);
+    upsertPeer(peerHash, entry.pub, String(entry.name), entry.lastAdvert, entry.nodeType);
     loaded++;
   }
 
@@ -246,7 +260,7 @@ static void loadAdvertCache() {
   Serial.printf("[LoRa] Loaded %d cached adverts\n", loaded);
 }
 
-static void updateAdvertCache(const uint8_t* pub, const String& name, uint32_t lastAdvert) {
+static void updateAdvertCache(const uint8_t* pub, const String& name, uint32_t lastAdvert, uint8_t nodeType = 0) {
   int idx = findAdvertCacheByPub(pub);
   if (idx < 0) {
     for (int i = 0; i < ADVERT_CACHE_MAX; i++) {
@@ -269,6 +283,7 @@ static void updateAdvertCache(const uint8_t* pub, const String& name, uint32_t l
   advertCache[idx].inUse = true;
   memcpy(advertCache[idx].pub, pub, 32);
   advertCache[idx].lastAdvert = lastAdvert;
+  advertCache[idx].nodeType = nodeType;
   memset(advertCache[idx].name, 0, sizeof(advertCache[idx].name));
   size_t nameLen = name.length();
   if (nameLen >= sizeof(advertCache[idx].name)) nameLen = sizeof(advertCache[idx].name) - 1;
@@ -284,6 +299,7 @@ static void clearPeerCache() {
     peers[i].altHash = 0;
     peers[i].name = "";
     peers[i].lastAdvert = 0;
+    peers[i].nodeType = 0;
   }
 }
 
@@ -305,7 +321,7 @@ static uint8_t computeNodeHashSha256(const uint8_t pub[32]) {
   return (uint8_t)fullHash[0];
 }
 
-static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint32_t lastAdvert) {
+static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint32_t lastAdvert, uint8_t nodeType) {
   int idx = findPeerIndexByHash(hash);
   if (idx < 0) {
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -318,6 +334,7 @@ static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint
   memcpy(peers[idx].ed25519_pub, pub, 32);
   peers[idx].name = name;
   peers[idx].lastAdvert = lastAdvert;
+  peers[idx].nodeType = nodeType;
   peers[idx].inUse = true;
   return idx;
 }
@@ -328,7 +345,7 @@ static int ensurePeerFromAdvertCache(uint8_t hash) {
     uint8_t pubFirst = advertCache[i].pub[0];
     uint8_t pubSha = computeNodeHashSha256(advertCache[i].pub);
     if (hash == pubFirst || hash == pubSha) {
-      return upsertPeer(pubFirst, advertCache[i].pub, String(advertCache[i].name), advertCache[i].lastAdvert);
+      return upsertPeer(pubFirst, advertCache[i].pub, String(advertCache[i].name), advertCache[i].lastAdvert, advertCache[i].nodeType);
     }
   }
   return -1;
@@ -430,6 +447,59 @@ static void deleteServiceHistory(const String &serviceId) {
   if (LittleFS.exists(path)) {
     LittleFS.remove(path);
   }
+}
+
+// ============================================
+// LoRa Message Log (LittleFS)
+// Stores message events: <unix_epoch>,<dir>,<type>,<peer>,<message_preview>,<status>\n
+//   dir: S=sent, R=received
+//   type: D=direct, G=group, A=ack, N=notification, V=advert
+//   status: ok, fail
+// Budget: 10% of total LittleFS space, enforced via trimFileToSize.
+// ============================================
+static const char* LORA_LOG_FILE = "/lora_log.csv";
+
+static size_t getLoraLogBudget() {
+  size_t totalBytes = LittleFS.totalBytes();
+  return totalBytes / 10;  // 10% of available storage
+}
+
+static const char* nodeTypeName(uint8_t t) {
+  switch (t) {
+    case 1: return "Client";
+    case 2: return "Repeater";
+    case 3: return "Router";
+    default: return "Unknown";
+  }
+}
+
+static void appendLoraLog(char dir, char type, const String &peer, const String &preview, bool success) {
+  time_t now = time(nullptr);
+  if (now < 1000000000) return;  // Time not synced
+
+  // Sanitize preview: replace commas and newlines to keep CSV clean
+  String safePreview = preview;
+  safePreview.replace(",", ";");
+  safePreview.replace("\n", " ");
+  safePreview.replace("\r", "");
+  if (safePreview.length() > 80) safePreview = safePreview.substring(0, 80);
+
+  String safePeer = peer;
+  safePeer.replace(",", ";");
+  if (safePeer.length() > 32) safePeer = safePeer.substring(0, 32);
+
+  File f = LittleFS.open(LORA_LOG_FILE, "a");
+  if (!f) return;
+
+  char line[192];
+  snprintf(line, sizeof(line), "%lu,%c,%c,%s,%s,%s\n",
+           (unsigned long)now, dir, type,
+           safePeer.c_str(), safePreview.c_str(),
+           success ? "ok" : "fail");
+  f.print(line);
+  f.close();
+
+  trimFileToSize(LORA_LOG_FILE, getLoraLogBudget());
 }
 
 // --- Global Variables ---
@@ -2028,6 +2098,15 @@ bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
     Serial.printf("[LoRa] Failed to send message, code: %d\n", state);
   }
   
+  // Log to LoRa message history
+  {
+    String peerName = "";
+    int pi = findPeerIndexByHash(destHash);
+    if (pi >= 0) peerName = peers[pi].name;
+    if (peerName.length() == 0) { char hx[8]; snprintf(hx, sizeof(hx), "0x%02X", destHash); peerName = hx; }
+    appendLoraLog('S', 'D', peerName, message, success);
+  }
+  
   // Return to RX mode
   radio.startReceive();
   return success;
@@ -2086,6 +2165,13 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
     }
   }
 
+  // Log ACK to LoRa message history
+  {
+    char hashStr[16];
+    snprintf(hashStr, sizeof(hashStr), "0x%08X", ackHash);
+    appendLoraLog('S', 'A', String(hashStr), "ACK", anySuccess);
+  }
+
   radio.startReceive();
   return anySuccess;
 }
@@ -2113,7 +2199,8 @@ static void sendLoRaDirectNotifications(const String &notification) {
     String label = settings.loraDirectNodes[i].name;
     if (label.length() == 0) label = String("node-") + String(i + 1);
     Serial.printf("[LoRa] Direct notify -> %s\n", label.c_str());
-    sendLoRaDirectMessage(notification, pubkey, pubkey[0], nullptr, 0);
+    bool notifyOk = sendLoRaDirectMessage(notification, pubkey, pubkey[0], nullptr, 0);
+    appendLoraLog('S', 'N', label, notification, notifyOk);
   }
 }
 
@@ -2201,6 +2288,7 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   } else {
     Serial.printf("[LoRa] Failed to send notification, code: %d\n", state);
   }
+  appendLoraLog('S', 'G', settings.channelName, notification, state == RADIOLIB_ERR_NONE);
 
   // Optional direct notifications to configured nodes
   sendLoRaDirectNotifications(notification);
@@ -4222,6 +4310,7 @@ void setup() {
       html += "<button class='btn btn-secondary' onclick='testNotifications()'>🔔 Test Notifications</button>";
       html += "<button class='btn btn-secondary' onclick='gotoOta()'>⬆️ OTA Update</button>";
       html += "<button class='btn btn-secondary' onclick='gotoSettings()'>⚙️ Settings</button>";
+      html += "<button class='btn btn-secondary' onclick='gotoLora()'>📡 LoRa Stats</button>";
       html += "<button class='btn btn-secondary' onclick='logout()'>Logout</button>";
     } else {
       html += "<div class='auth-hint'>Login to manage services, import/export configuration, trigger tests, or run OTA updates.</div>";
@@ -4376,6 +4465,7 @@ void setup() {
     html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
     html += "function gotoOta(){if(!isAuthed){alert('Login required');return;}window.open('/ota','_blank');}";
     html += "function gotoSettings(){if(!isAuthed){alert('Login required');return;}window.open('/settings','_blank');}";
+    html += "function gotoLora(){if(!isAuthed){alert('Login required');return;}window.open('/lora','_blank');}";
     html += "const loginForm=document.getElementById('loginForm');";
     html += "if(loginForm){loginForm.addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(loginForm);const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:fd.get('username'),password:fd.get('password')})});if(res.ok){location.reload();}else{alert('Invalid credentials');}});}";
     html += "function logout(){fetch('/api/logout',{method:'POST',credentials:'include'}).then(()=>location.reload());}";
@@ -4963,6 +5053,195 @@ void setup() {
     request->send(200, "application/json", "{\"status\":\"starting update\"}");
     // Run the update after responding (will reboot on success)
     checkAutoOtaUpdate(true);
+  });
+
+  // LoRa Stats JSON API
+  server.on("/api/lora-stats", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+
+    JsonDocument doc;
+
+    // Radio info
+    doc["enabled"] = settings.loraEnabled;
+    doc["lastRssi"] = lastRssi;
+    doc["lastSnr"] = lastSnr;
+    doc["messageCount"] = messageCount;
+    doc["lastMessageTime"] = (unsigned long)lastMessageTime;
+
+    // Peers
+    JsonArray peersArr = doc["peers"].to<JsonArray>();
+    for (int i = 0; i < MAX_PEERS; i++) {
+      if (!peers[i].inUse) continue;
+      JsonObject p = peersArr.add<JsonObject>();
+      p["name"] = peers[i].name;
+      p["hash"] = peers[i].hash;
+      p["type"] = nodeTypeName(peers[i].nodeType);
+      p["typeId"] = peers[i].nodeType;
+      p["lastAdvert"] = peers[i].lastAdvert;
+      // Pubkey as hex
+      char hexPub[65];
+      for (int b = 0; b < 32; b++) snprintf(hexPub + b * 2, 3, "%02x", peers[i].ed25519_pub[b]);
+      p["pubkey"] = String(hexPub);
+    }
+
+    // Storage info
+    doc["logBudget"] = (unsigned long)getLoraLogBudget();
+    doc["totalBytes"] = (unsigned long)LittleFS.totalBytes();
+    doc["usedBytes"] = (unsigned long)LittleFS.usedBytes();
+
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // LoRa message log (raw CSV)
+  server.on("/api/lora-log", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    if (!LittleFS.exists(LORA_LOG_FILE)) {
+      request->send(200, "text/plain", "");
+      return;
+    }
+    request->send(LittleFS, LORA_LOG_FILE, "text/plain");
+  });
+
+  // Clear LoRa log
+  server.on("/api/lora-log", HTTP_DELETE, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    if (LittleFS.exists(LORA_LOG_FILE)) LittleFS.remove(LORA_LOG_FILE);
+    request->send(200, "application/json", "{\"status\":\"ok\"}");
+  });
+
+  // LoRa Stats HTML page
+  server.on("/lora", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+
+    String page = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>LoRa Stats</title>";
+    page += "<style>";
+    page += "*{margin:0;padding:0;box-sizing:border-box}";
+    page += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px;color:#2d3748}";
+    page += ".container{max-width:1000px;margin:0 auto}";
+    page += ".card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}";
+    page += "h1{font-size:22px;margin-bottom:6px;color:#2d3748}";
+    page += "h2{font-size:16px;margin:0 0 12px;color:#4a5568}";
+    page += ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:16px}";
+    page += ".stat-card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:12px;padding:18px;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06)}";
+    page += ".stat-value{font-size:28px;font-weight:700;color:#2d3748;margin-bottom:2px}";
+    page += ".stat-label{font-size:11px;color:#718096;text-transform:uppercase;letter-spacing:1px}";
+    page += "table{width:100%;border-collapse:collapse;font-size:13px}";
+    page += "th{text-align:left;padding:10px 8px;border-bottom:2px solid #e2e8f0;font-weight:600;color:#4a5568;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}";
+    page += "td{padding:8px;border-bottom:1px solid #edf2f7;color:#2d3748}";
+    page += "tr:hover{background:#f7fafc}";
+    page += ".badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}";
+    page += ".badge-client{background:#ebf4ff;color:#3182ce}";
+    page += ".badge-repeater{background:#fefcbf;color:#b7791f}";
+    page += ".badge-router{background:#c6f6d5;color:#276749}";
+    page += ".badge-unknown{background:#edf2f7;color:#718096}";
+    page += ".badge-ok{background:#c6f6d5;color:#276749}";
+    page += ".badge-fail{background:#fed7d7;color:#c53030}";
+    page += ".badge-sent{background:#e9d8fd;color:#6b46c1}";
+    page += ".badge-recv{background:#bee3f8;color:#2b6cb0}";
+    page += ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:11px}";
+    page += ".btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}";
+    page += ".btn{padding:10px 14px;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-size:13px;text-decoration:none;display:inline-flex;align-items:center;gap:6px}";
+    page += ".primary{background:#667eea;color:#fff}";
+    page += ".secondary{background:#e2e8f0;color:#2d3748}";
+    page += ".danger{background:#fed7d7;color:#c53030}";
+    page += ".truncate{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:middle}";
+    page += ".hint{font-size:12px;color:#718096;margin-top:6px}";
+    page += ".empty{text-align:center;padding:24px;color:#a0aec0;font-size:14px}";
+    page += ".storage-bar{width:100%;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-top:8px}";
+    page += ".storage-fill{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:4px;transition:width 0.3s}";
+    page += "@media(max-width:700px){.stats{grid-template-columns:1fr 1fr}table{font-size:12px}.truncate{max-width:140px}}";
+    page += "</style></head><body><div class='container'>";
+
+    // Header
+    page += "<div class='card'><h1>📡 LoRa Stats</h1>";
+    page += "<div class='hint'>Radio statistics, known peers, and message history.</div>";
+    page += "<div class='btns'><a href='/' class='btn secondary'>← Dashboard</a>";
+    page += "<button class='btn secondary' onclick='location.reload()'>↻ Refresh</button>";
+    page += "<button class='btn danger' id='clearBtn' onclick='clearLog()'>🗑 Clear Log</button></div></div>";
+
+    // Stats cards (populated via JS)
+    page += "<div class='stats'>";
+    page += "<div class='stat-card'><div class='stat-value' id='msgCount'>-</div><div class='stat-label'>Messages</div></div>";
+    page += "<div class='stat-card'><div class='stat-value' id='peerCount'>-</div><div class='stat-label'>Known Peers</div></div>";
+    page += "<div class='stat-card'><div class='stat-value' id='rssiVal'>-</div><div class='stat-label'>Last RSSI</div></div>";
+    page += "<div class='stat-card'><div class='stat-value' id='snrVal'>-</div><div class='stat-label'>Last SNR</div></div>";
+    page += "</div>";
+
+    // Peers table
+    page += "<div class='card'><h2>Known Peers</h2>";
+    page += "<div id='peersTable'><div class='empty'>Loading...</div></div></div>";
+
+    // Message log table
+    page += "<div class='card'><h2>Message History</h2>";
+    page += "<div id='storageInfo'></div>";
+    page += "<div id='logTable'><div class='empty'>Loading...</div></div></div>";
+
+    page += "</div>";
+
+    // JavaScript
+    page += "<script>";
+    page += "const typeLabels={D:'Direct',G:'Group',A:'ACK',N:'Notification',V:'Advert'};";
+    page += "const typeBadge={Client:'badge-client',Repeater:'badge-repeater',Router:'badge-router',Unknown:'badge-unknown'};";
+    page += "function ago(ts){if(!ts)return 'Never';const s=Math.floor(Date.now()/1000)-ts;if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}";
+    page += "function fmtTime(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleString();}";
+
+    page += "async function loadStats(){try{";
+    page += "const res=await fetch('/api/lora-stats',{credentials:'include'});if(!res.ok)return;";
+    page += "const d=await res.json();";
+    page += "document.getElementById('msgCount').textContent=d.messageCount||0;";
+    page += "document.getElementById('peerCount').textContent=d.peers?d.peers.length:0;";
+    page += "document.getElementById('rssiVal').textContent=d.lastRssi?d.lastRssi+' dBm':'-';";
+    page += "document.getElementById('snrVal').textContent=d.lastSnr?(d.lastSnr).toFixed(1)+' dB':'-';";
+
+    // Peers table
+    page += "if(d.peers&&d.peers.length>0){";
+    page += "let h='<table><tr><th>Name</th><th>Type</th><th>Hash</th><th>Last Seen</th></tr>';";
+    page += "for(const p of d.peers){";
+    page += "const cls=typeBadge[p.type]||'badge-unknown';";
+    page += "h+='<tr><td>'+(p.name||'<em>unnamed</em>')+'</td>';";
+    page += "h+='<td><span class=\"badge '+cls+'\">'+p.type+'</span></td>';";
+    page += "h+='<td class=\"mono\">0x'+p.hash.toString(16).toUpperCase().padStart(2,'0')+'</td>';";
+    page += "h+='<td>'+ago(p.lastAdvert)+'</td></tr>';}";
+    page += "h+='</table>';document.getElementById('peersTable').innerHTML=h;";
+    page += "}else{document.getElementById('peersTable').innerHTML='<div class=\"empty\">No peers discovered yet</div>';}";
+
+    // Storage bar
+    page += "if(d.totalBytes){const pct=Math.min(100,((d.usedBytes||0)/d.totalBytes*100)).toFixed(1);";
+    page += "const logPct=((d.logBudget||0)/d.totalBytes*100).toFixed(1);";
+    page += "document.getElementById('storageInfo').innerHTML='<div class=\"hint\">Storage: '+(d.usedBytes/1024).toFixed(0)+'KB / '+(d.totalBytes/1024).toFixed(0)+'KB used ('+pct+'%). LoRa log budget: '+(d.logBudget/1024).toFixed(0)+'KB ('+logPct+'%)</div><div class=\"storage-bar\"><div class=\"storage-fill\" style=\"width:'+pct+'%\"></div></div>';}";
+
+    page += "}catch(e){console.error(e);}}";
+
+    // Log table
+    page += "async function loadLog(){try{";
+    page += "const res=await fetch('/api/lora-log',{credentials:'include'});if(!res.ok)return;";
+    page += "const txt=await res.text();";
+    page += "const lines=txt.split('\\n').filter(l=>l.trim().length);";
+    page += "if(lines.length===0){document.getElementById('logTable').innerHTML='<div class=\"empty\">No messages logged yet</div>';return;}";
+    page += "lines.reverse();";  // newest first
+    page += "let h='<table><tr><th>Time</th><th>Dir</th><th>Type</th><th>Peer</th><th>Message</th><th>Status</th></tr>';";
+    page += "const max=200;const show=lines.slice(0,max);";
+    page += "for(const line of show){const p=line.split(',');if(p.length<6)continue;";
+    page += "const ts=parseInt(p[0]);const dir=p[1];const typ=p[2];const peer=p[3];const msg=p.slice(4,p.length-1).join(',');const st=p[p.length-1];";
+    page += "h+='<tr><td>'+fmtTime(ts)+'</td>';";
+    page += "h+='<td><span class=\"badge '+(dir==='S'?'badge-sent':'badge-recv')+'\">'+(dir==='S'?'Sent':'Recv')+'</span></td>';";
+    page += "h+='<td>'+(typeLabels[typ]||typ)+'</td>';";
+    page += "h+='<td>'+(peer||'-')+'</td>';";
+    page += "h+='<td><span class=\"truncate\">'+(msg||'-')+'</span></td>';";
+    page += "h+='<td><span class=\"badge '+(st==='ok'?'badge-ok':'badge-fail')+'\">'+(st||'-')+'</span></td></tr>';}";
+    page += "if(lines.length>max)h+='<tr><td colspan=\"6\" class=\"hint\">Showing '+max+' of '+lines.length+' entries</td></tr>';";
+    page += "h+='</table>';document.getElementById('logTable').innerHTML=h;";
+    page += "}catch(e){console.error(e);}}";
+
+    page += "async function clearLog(){if(!confirm('Clear LoRa message log?'))return;";
+    page += "await fetch('/api/lora-log',{method:'DELETE',credentials:'include'});location.reload();}";
+
+    page += "loadStats();loadLog();";
+    page += "</script></body></html>";
+
+    request->send(200, "text/html", page);
   });
 
   server.begin();
@@ -5598,12 +5877,14 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     // Compute peer hash = first byte of public key
     uint8_t peerHash = pub[0];
 
-    // Attempt to parse name from app_data (after signature)
+    // Attempt to parse name and node type from app_data (after signature)
     String name = "";
+    uint8_t peerNodeType = 0;  // 0=Unknown
     size_t appDataIdx = advertIdx + 64; // Skip signature(64)
     
     if (appDataIdx < messageLen) {
       uint8_t appFlags = message[appDataIdx++];
+      peerNodeType = appFlags & 0x0F;  // Lower nibble = role (1=Client,2=Repeater,3=Router)
       // Check if name flag is set (bit 7)
       if ((appFlags & 0x80) && appDataIdx < messageLen) {
         size_t nameLen = messageLen - appDataIdx;
@@ -5621,10 +5902,11 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       useTimestamp = (uint32_t)time(nullptr);
     }
 
-    upsertPeer(peerHash, pub, name, useTimestamp);
-    updateAdvertCache(pub, name, useTimestamp);
-    Serial.printf("[Advert] Cached peer hash=0x%02X name='%s' pubkey=%02X%02X%02X%02X... ts=%u\n", 
-                  peerHash, name.c_str(), pub[0], pub[1], pub[2], pub[3], useTimestamp);
+    upsertPeer(peerHash, pub, name, useTimestamp, peerNodeType);
+    updateAdvertCache(pub, name, useTimestamp, peerNodeType);
+    Serial.printf("[Advert] Cached peer hash=0x%02X name='%s' type=%d pubkey=%02X%02X%02X%02X... ts=%u\n", 
+                  peerHash, name.c_str(), peerNodeType, pub[0], pub[1], pub[2], pub[3], useTimestamp);
+    appendLoraLog('R', 'V', name.length() > 0 ? name : String("0x") + String(peerHash, HEX), String(nodeTypeName(peerNodeType)) + " advert", true);
     Serial.println("=== Packet Processing Complete ===\n");
     return;
   }
@@ -5711,6 +5993,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     
     text = String(textMessage);
     Serial.printf("[LoRa][%s] Group message: %s\n", matchedChannelName.c_str(), text.c_str());
+    appendLoraLog('R', 'G', matchedChannelName, text, true);
     
   } else if (payloadType == PAYLOAD_TYPE_ANON_REQ) {
     // Anonymous request: [destHash(1)][senderPubKey(32)][MAC(2) + ciphertext]
@@ -5822,6 +6105,15 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       matchedChannelName = "Direct";
       text = String(textMessage);
       Serial.printf("[LoRa][Direct/ANON_REQ] Message: %s\n", text.c_str());
+      {
+        String peerName = "";
+        if (senderPubKey != nullptr) {
+          int pi = findPeerIndexByHash(senderPubKey[0]);
+          if (pi >= 0) peerName = peers[pi].name;
+        }
+        if (peerName.length() == 0) peerName = "ANON";
+        appendLoraLog('R', 'D', peerName, text, true);
+      }
     } else {
       Serial.println("ANON_REQ payload too short for text extraction");
       Serial.println("=== Packet Processing Complete ===\n");
@@ -6076,6 +6368,16 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     matchedChannelName = "Direct";
     text = String(textMessage);
     Serial.printf("[LoRa][Direct] Message: %s\n", text.c_str());
+    {
+      String peerName = "";
+      if (senderPubKey != nullptr) {
+        int pi = findPeerIndexByHash(senderPubKey[0]);
+        if (pi >= 0) peerName = peers[pi].name;
+      }
+      if (peerName.length() == 0 && senderHash != 0) { char hx[8]; snprintf(hx, sizeof(hx), "0x%02X", senderHash); peerName = hx; }
+      if (peerName.length() == 0) peerName = "Unknown";
+      appendLoraLog('R', 'D', peerName, text, true);
+    }
   } else {
     // Unhandled payload type that passed the initial filter
     Serial.printf("Payload type %d not processed for text extraction\n", payloadType);
