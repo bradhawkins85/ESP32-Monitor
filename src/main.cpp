@@ -6095,11 +6095,12 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   
   // Check for direct commands (ping, status, reboot)
+  // Format: "sender: pin:command" — pin comes first to allow multi-word commands
   String trimmedMsg = msgStr;
   trimmedMsg.trim();
 
-  // Extract command from "sender: command" format, or use full text.
-  // If the prefix is an actual command (e.g., "status:1234"), don't strip it.
+  // Extract command from "sender: pin:command" format, or use full text.
+  // If the prefix is an actual command (e.g., "ping"), don't strip it.
   int colonPos = trimmedMsg.indexOf(':');
   String commandRaw = trimmedMsg;
   if (colonPos != -1 && colonPos < trimmedMsg.length() - 1) {
@@ -6113,21 +6114,23 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   commandRaw.trim();
 
+  // Parse pin:command format — PIN is before the first ':', command is everything after
   String pinPart = "";
+  String command = commandRaw;
   int pinSep = commandRaw.indexOf(':');
   if (pinSep != -1 && pinSep < commandRaw.length() - 1) {
-    pinPart = commandRaw.substring(pinSep + 1);
-    commandRaw = commandRaw.substring(0, pinSep);
+    pinPart = commandRaw.substring(0, pinSep);
+    command = commandRaw.substring(pinSep + 1);
   }
-  commandRaw.trim();
   pinPart.trim();
+  command.trim();
 
-  String command = commandRaw;
-  command.toLowerCase();
+  String commandLower = command;
+  commandLower.toLowerCase();
   bool pinOk = (settings.loraCommandPin.length() > 0 && pinPart == settings.loraCommandPin);
   
   // Handle "ping" command
-  if (command == "ping") {
+  if (commandLower == "ping") {
     Serial.println("[Command] Received ping, sending pong");
     if (senderPubKey != nullptr) {
       sendLoRaDirectMessage("pong", senderPubKey, senderHash, replyPath, replyPathLen);
@@ -6139,7 +6142,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   
   // Handle "status" command
-  if (command == "status") {
+  if (commandLower == "status") {
     Serial.println("[Command] Received status request, sending status");
     if (!pinOk) {
       Serial.println("[Command] Status denied: invalid or missing PIN");
@@ -6190,7 +6193,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
 
   // Handle "reboot" command (PIN required)
-  if (command == "reboot") {
+  if (commandLower == "reboot") {
     Serial.println("[Command] Received reboot request");
     if (!pinOk) {
       Serial.println("[Command] Reboot denied: invalid or missing PIN");
