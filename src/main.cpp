@@ -1885,14 +1885,22 @@ void initNodeIdentity() {
   uint8_t mac[6];
   WiFi.macAddress(mac);
   ourNodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
-  char nodeName[18];
-  snprintf(nodeName, sizeof(nodeName), "%02X:%02X:%02X:%02X:%02X:%02X", 
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  ourNodeName = String(nodeName);
-  Serial.printf("Node identity: %s (ID: 0x%08X)\n", ourNodeName.c_str(), ourNodeId);
   
   // Load or generate Ed25519 keys for signing adverts
   loadOrGenerateEd25519Keys();
+
+  // Node name: use configured name, or default to first 8 hex chars of public key
+  if (settings.loraNodeName.length() > 0) {
+    ourNodeName = settings.loraNodeName;
+  } else {
+    char hexBuf[9];
+    for (int i = 0; i < 4; i++) {
+      snprintf(hexBuf + (i * 2), 3, "%02X", ed25519_public_key[i]);
+    }
+    hexBuf[8] = '\0';
+    ourNodeName = String(hexBuf);
+  }
+  Serial.printf("Node identity: %s (ID: 0x%08X)\n", ourNodeName.c_str(), ourNodeId);
 
   // Compute our node hashes (primary = pubkey[0], alternate = SHA-256(pubkey)[0])
   ourNodeHash = ed25519_public_key[0];
