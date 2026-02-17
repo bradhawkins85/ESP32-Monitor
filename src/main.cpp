@@ -627,8 +627,8 @@ struct Settings {
   String mqttUsername;
   String mqttPassword;
 
-  // Auto OTA
-  bool autoOtaEnabled;
+  // Auto OTA (0=off, 1=enabled, 2=enabled-delayed)
+  int autoOtaEnabled;
   String autoOtaUrl;
   int autoOtaCheckInterval;  // seconds
 };
@@ -800,7 +800,7 @@ Settings defaultSettingsFromBuild() {
   s.mqttUsername = String(MQTT_USERNAME);
   s.mqttPassword = String(MQTT_PASSWORD);
 
-  s.autoOtaEnabled = (AUTO_OTA_ENABLED != 0);
+  s.autoOtaEnabled = AUTO_OTA_ENABLED;  // 0=off, 1=on, 2=delayed
   s.autoOtaUrl = String(AUTO_OTA_URL);
   s.autoOtaCheckInterval = (int)AUTO_OTA_CHECK_INTERVAL;
   if (s.autoOtaCheckInterval < 60) s.autoOtaCheckInterval = 3600;
@@ -972,7 +972,8 @@ void loadSettingsOverrides() {
   if (doc["MQTT_IP_ALERTS"].is<bool>()) settings.mqttIpAlerts = doc["MQTT_IP_ALERTS"].as<bool>();
 
   // Auto OTA
-  if (doc["AUTO_OTA_ENABLED"].is<bool>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<bool>();
+  if (doc["AUTO_OTA_ENABLED"].is<int>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<int>();
+  else if (doc["AUTO_OTA_ENABLED"].is<bool>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<bool>() ? 1 : 0;
   if (doc["AUTO_OTA_URL"].is<String>()) settings.autoOtaUrl = doc["AUTO_OTA_URL"].as<String>();
   if (doc["AUTO_OTA_CHECK_INTERVAL"].is<int>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<int>();
   if (doc["AUTO_OTA_CHECK_INTERVAL"].is<String>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<String>().toInt();
@@ -3924,7 +3925,8 @@ void setup() {
       if (doc["MQTT_IP_ALERTS"].is<bool>()) settings.mqttIpAlerts = doc["MQTT_IP_ALERTS"].as<bool>();
 
       // Auto OTA
-      if (doc["AUTO_OTA_ENABLED"].is<bool>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<bool>();
+      if (doc["AUTO_OTA_ENABLED"].is<int>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<int>();
+      else if (doc["AUTO_OTA_ENABLED"].is<bool>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<bool>() ? 1 : 0;
       if (doc["AUTO_OTA_URL"].is<String>()) settings.autoOtaUrl = doc["AUTO_OTA_URL"].as<String>();
       if (doc["AUTO_OTA_CHECK_INTERVAL"].is<int>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<int>();
       if (doc["AUTO_OTA_CHECK_INTERVAL"].is<String>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<String>().toInt();
@@ -4113,7 +4115,7 @@ void setup() {
     page += "</div></div>";
 
     page += "<div class='card'><h2>Auto OTA Updates</h2><div class='row'>";
-    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='AUTO_OTA_ENABLED'><option value='true'" + String(settings.autoOtaEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.autoOtaEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='AUTO_OTA_ENABLED'><option value='0'" + String(settings.autoOtaEnabled == 0 ? " selected" : "") + ">No</option><option value='1'" + String(settings.autoOtaEnabled == 1 ? " selected" : "") + ">Yes</option><option value='2'" + String(settings.autoOtaEnabled == 2 ? " selected" : "") + ">Yes - Delayed</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Check Interval (sec)</label><input id='AUTO_OTA_CHECK_INTERVAL' value='" + String(settings.autoOtaCheckInterval) + "'></div>";
     page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>Firmware URL</label><input id='AUTO_OTA_URL' value='" + settings.autoOtaUrl + "' placeholder='https://example.com/firmware'></div>";
     page += "<div class='fg' style='grid-column:1/-1'><label class='lbl' style='font-size:12px;color:#718096'>Current version: " + String(FIRMWARE_VERSION) + " &mdash; The server should host a version.json with {version, url, notes} and the .bin file</label></div>";
@@ -4147,7 +4149,7 @@ void setup() {
     page += "EMAIL_ENABLED:boolVal('EMAIL_ENABLED'),EMAIL_MESH_RELAY:boolVal('EMAIL_MESH_RELAY'),EMAIL_IP_ALERTS:boolVal('EMAIL_IP_ALERTS'),SMTP_HOST:val('SMTP_HOST'),SMTP_PORT:val('SMTP_PORT'),EMAIL_RECIPIENT:val('EMAIL_RECIPIENT'),EMAIL_SENDER:val('EMAIL_SENDER'),SMTP_USER:val('SMTP_USER'),SMTP_PASSWORD:val('SMTP_PASSWORD')";
     page += ",MQTT_ENABLED:boolVal('MQTT_ENABLED'),MQTT_MESH_RELAY:boolVal('MQTT_MESH_RELAY'),MQTT_IP_ALERTS:boolVal('MQTT_IP_ALERTS'),MQTT_BROKER:val('MQTT_BROKER'),MQTT_PORT:val('MQTT_PORT'),MQTT_TOPIC:val('MQTT_TOPIC'),MQTT_USERNAME:val('MQTT_USERNAME'),MQTT_PASSWORD:val('MQTT_PASSWORD')";
     page += ",MQTT_QOS:val('MQTT_QOS')";
-    page += ",AUTO_OTA_ENABLED:boolVal('AUTO_OTA_ENABLED'),AUTO_OTA_URL:val('AUTO_OTA_URL'),AUTO_OTA_CHECK_INTERVAL:parseInt(val('AUTO_OTA_CHECK_INTERVAL'))||3600";
+    page += ",AUTO_OTA_ENABLED:parseInt(val('AUTO_OTA_ENABLED'))||0,AUTO_OTA_URL:val('AUTO_OTA_URL'),AUTO_OTA_CHECK_INTERVAL:parseInt(val('AUTO_OTA_CHECK_INTERVAL'))||3600";
     page += "};";
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
@@ -5010,7 +5012,7 @@ void setup() {
   server.on("/api/auto-ota/status", HTTP_GET, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
     JsonDocument doc;
-    doc["enabled"] = settings.autoOtaEnabled;
+    doc["enabled"] = settings.autoOtaEnabled;  // 0=off, 1=on, 2=delayed
     doc["currentVersion"] = String(FIRMWARE_VERSION);
     doc["latestVersion"] = autoOtaLatestVersion;
     doc["latestUrl"] = autoOtaLatestUrl;
@@ -5569,10 +5571,19 @@ void loop() {
   checkAllServices();
 
   // Periodic auto-OTA check
-  if (settings.autoOtaEnabled && !captivePortalActive && !autoOtaUpdateInProgress) {
+  if (settings.autoOtaEnabled != 0 && !captivePortalActive && !autoOtaUpdateInProgress) {
     unsigned long intervalMs = (unsigned long)settings.autoOtaCheckInterval * 1000UL;
     if (intervalMs < 60000UL) intervalMs = 3600000UL;
-    if (autoOtaLastCheckMs == 0 || (millis() - autoOtaLastCheckMs >= intervalMs)) {
+    if (autoOtaLastCheckMs == 0) {
+      if (settings.autoOtaEnabled == 2) {
+        // Delayed mode: skip boot check, just record the time
+        autoOtaLastCheckMs = millis();
+      } else {
+        // Normal mode: check immediately on boot
+        autoOtaLastCheckMs = millis();
+        checkAutoOtaUpdate(true);
+      }
+    } else if (millis() - autoOtaLastCheckMs >= intervalMs) {
       autoOtaLastCheckMs = millis();
       checkAutoOtaUpdate(true);  // Check and apply if available
     }

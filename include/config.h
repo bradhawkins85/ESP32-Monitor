@@ -348,8 +348,9 @@
 #endif
 
 // Auto OTA Update Configuration
+// 0 = Disabled, 1 = Enabled (check on boot), 2 = Enabled - Delayed (skip boot check, wait for interval)
 #ifndef AUTO_OTA_ENABLED
-#define AUTO_OTA_ENABLED false
+#define AUTO_OTA_ENABLED 0
 #endif
 
 #ifndef AUTO_OTA_URL
