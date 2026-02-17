@@ -1933,8 +1933,9 @@ void initNodeIdentity() {
 }
 
 // Send direct LoRa text message (for commands like ping/status)
-void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uint8_t destHash, const uint8_t* replyPath, size_t replyPathLen) {
-  if (!settings.loraEnabled) return;
+// Returns true if the radio transmission succeeded.
+bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uint8_t destHash, const uint8_t* replyPath, size_t replyPathLen) {
+  if (!settings.loraEnabled) return false;
 
   // Send message without node name prefix (direct response style)
   size_t textLen = message.length();
@@ -1954,7 +1955,7 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   
   if (destPubKey == nullptr) {
     Serial.println("[LoRa] ERROR: Missing destination public key for direct message");
-    return;
+    return false;
   }
 
   // For direct messages, derive ECDH shared secret with peer
@@ -1963,7 +1964,7 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   size_t channelKeyLen = 32;
   if (!deriveSharedSecretWithPeer(destPubKey, channelKey)) {
     Serial.println("[LoRa] ERROR: Failed to derive shared secret for direct message");
-    return;
+    return false;
   }
   
   // Encrypt and compute MAC using raw shared secret
@@ -1971,7 +1972,7 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   size_t macCipherLen = encryptAndSign(channelKey, channelKeyLen, macAndCipher, sizeof(macAndCipher), plaintext, idx);
   if (macCipherLen == 0) {
     Serial.println("[LoRa] ERROR: Failed to encrypt message");
-    return;
+    return false;
   }
   
   // Build complete packet: [header][path_len][path][destHash][srcHash][MAC+ciphertext]
@@ -2012,14 +2013,15 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   // MAC + ciphertext
   if (pktIdx + macCipherLen > sizeof(packet)) {
     Serial.println("[LoRa] ERROR: Packet buffer too small");
-    return;
+    return false;
   }
   memcpy(packet + pktIdx, macAndCipher, macCipherLen);
   pktIdx += macCipherLen;
   
   // Transmit
   int state = radio.transmit(packet, pktIdx);
-  if (state == RADIOLIB_ERR_NONE) {
+  bool success = (state == RADIOLIB_ERR_NONE);
+  if (success) {
     Serial.printf("[LoRa] Sent direct message: %s (len=%u)\n", 
                   message.c_str(), (unsigned int)pktIdx);
   } else {
@@ -2028,6 +2030,7 @@ void sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   
   // Return to RX mode
   radio.startReceive();
+  return success;
 }
 
 static uint32_t computeAckHash(const uint8_t* data, size_t dataLen, const uint8_t senderPubKey[32]) {
@@ -2042,8 +2045,9 @@ static uint32_t computeAckHash(const uint8_t* data, size_t dataLen, const uint8_
   return (uint32_t)fullHash[0] | ((uint32_t)fullHash[1] << 8) | ((uint32_t)fullHash[2] << 16) | ((uint32_t)fullHash[3] << 24);
 }
 
-static void sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t replyPathLen) {
-  if (!settings.loraEnabled) return;
+// Returns true if at least one ACK was transmitted successfully.
+static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t replyPathLen) {
+  if (!settings.loraEnabled) return false;
 
   uint8_t packet[64];
   size_t pktIdx = 0;
@@ -2070,17 +2074,20 @@ static void sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   if (ackCount < 1) ackCount = 1;
   if (ackCount > 5) ackCount = 5;
 
+  bool anySuccess = false;
   for (int ackIdx = 0; ackIdx < ackCount; ackIdx++) {
     if (ackIdx > 0) delay(150);
     int state = radio.transmit(packet, pktIdx);
     if (state == RADIOLIB_ERR_NONE) {
       Serial.printf("[LoRa] Sent ACK %d/%d (hash=0x%08X, len=%u)\n", ackIdx + 1, ackCount, ackHash, (unsigned int)pktIdx);
+      anySuccess = true;
     } else {
       Serial.printf("[LoRa] Failed to send ACK %d/%d, code: %d\n", ackIdx + 1, ackCount, state);
     }
   }
 
   radio.startReceive();
+  return anySuccess;
 }
 
 static void sendLoRaDirectNotifications(const String &notification) {
@@ -6203,11 +6210,24 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       Serial.println("=== Packet Processing Complete ===\n");
       return;
     }
+    // Ensure ack/reply messages are sent successfully before rebooting
+    bool replySent = false;
     if (senderPubKey != nullptr) {
-      sendLoRaDirectMessage("rebooting", senderPubKey, senderHash, replyPath, replyPathLen);
+      for (int attempt = 0; attempt < 3 && !replySent; attempt++) {
+        if (attempt > 0) {
+          Serial.printf("[Command] Retrying reboot reply (attempt %d/3)\n", attempt + 1);
+          delay(200);
+        }
+        replySent = sendLoRaDirectMessage("rebooting", senderPubKey, senderHash, replyPath, replyPathLen);
+      }
+      if (!replySent) {
+        Serial.println("[Command] WARNING: Failed to send reboot reply after 3 attempts, rebooting anyway");
+      }
     }
+    // Allow time for the final transmission to fully propagate before restarting
     pendingRestart = true;
-    restartAtMs = millis() + 1000;
+    restartAtMs = millis() + 2000;
+    Serial.println("[Command] Reboot scheduled after successful ack/reply");
     Serial.println("=== Packet Processing Complete ===\n");
     return;
   }
