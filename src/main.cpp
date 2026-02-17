@@ -4965,12 +4965,26 @@ static void startWifiConnectAttempt(bool restoreCaptiveOnFail) {
 // Auto OTA Update from Web Server
 // ============================================
 
+static bool parseSemVer(const String &version, int &major, int &minor, int &patch) {
+  int start = 0;
+  while (start < (int)version.length() && !isdigit(version[start])) {
+    start++;
+  }
+  if (start >= (int)version.length()) return false;
+  return sscanf(version.c_str() + start, "%d.%d.%d", &major, &minor, &patch) == 3;
+}
+
 // Compare semantic version strings: returns >0 if b > a, 0 if equal, <0 if a > b
 static int compareSemVer(const String &a, const String &b) {
   int aMajor = 0, aMinor = 0, aPatch = 0;
   int bMajor = 0, bMinor = 0, bPatch = 0;
-  sscanf(a.c_str(), "%d.%d.%d", &aMajor, &aMinor, &aPatch);
-  sscanf(b.c_str(), "%d.%d.%d", &bMajor, &bMinor, &bPatch);
+  bool aOk = parseSemVer(a, aMajor, aMinor, aPatch);
+  bool bOk = parseSemVer(b, bMajor, bMinor, bPatch);
+
+  if (!aOk && bOk) return 1;   // Non-semver (hash) should always update to semver
+  if (aOk && !bOk) return -1;  // Semver should not downgrade to a non-semver
+  if (!aOk && !bOk) return 0;
+
   if (bMajor != aMajor) return bMajor - aMajor;
   if (bMinor != aMinor) return bMinor - aMinor;
   return bPatch - aPatch;
@@ -5010,6 +5024,7 @@ static bool checkAutoOtaUpdate(bool applyIfAvailable) {
   } else {
     http.begin(plainClient, versionUrl);
   }
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setTimeout(15000);
 
   int httpCode = http.GET();
@@ -5047,12 +5062,24 @@ static bool checkAutoOtaUpdate(bool applyIfAvailable) {
   String currentVersion = String(FIRMWARE_VERSION);
   Serial.printf("[AutoOTA] Current: %s, Remote: %s\n", currentVersion.c_str(), remoteVersion.c_str());
 
-  int cmp = compareSemVer(currentVersion, remoteVersion);
-  if (cmp <= 0) {
-    Serial.println("[AutoOTA] Firmware is up to date");
-    autoOtaLastCheckStatus = "up-to-date";
-    autoOtaLatestUrl = "";
-    return false;
+  // If current firmware is not a valid semver (e.g. git hash like "b8af24c"),
+  // always accept any valid semver release from the server
+  int localMaj = 0, localMin = 0, localPat = 0;
+  bool localIsSemVer = (sscanf(currentVersion.c_str(), "%d.%d.%d", &localMaj, &localMin, &localPat) == 3);
+  int remoteMaj = 0, remoteMin = 0, remotePat = 0;
+  bool remoteIsSemVer = (sscanf(remoteVersion.c_str(), "%d.%d.%d", &remoteMaj, &remoteMin, &remotePat) == 3);
+
+  if (!localIsSemVer && remoteIsSemVer) {
+    Serial.printf("[AutoOTA] Local version '%s' is not semver, forcing update to %s\n",
+                  currentVersion.c_str(), remoteVersion.c_str());
+  } else {
+    int cmp = compareSemVer(currentVersion, remoteVersion);
+    if (cmp <= 0) {
+      Serial.println("[AutoOTA] Firmware is up to date");
+      autoOtaLastCheckStatus = "up-to-date";
+      autoOtaLatestUrl = "";
+      return false;
+    }
   }
 
   Serial.printf("[AutoOTA] Update available: %s -> %s\n", currentVersion.c_str(), remoteVersion.c_str());

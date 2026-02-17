@@ -1,5 +1,6 @@
 Import("env")
 import os
+import subprocess
 
 # Load .env file
 try:
@@ -20,6 +21,49 @@ try:
                     print(f"Loaded {key}: length={len(value)}")
 except FileNotFoundError:
     print("Warning: .env file not found, using defaults from config.h")
+
+# Determine FIRMWARE_VERSION: .env > environment variable > git tag > fallback
+def get_firmware_version():
+    # 1. Already set in .env or environment
+    ver = os.environ.get("FIRMWARE_VERSION", "")
+    if ver:
+        print(f"Firmware version from env: {ver}")
+        return ver
+    # 2. Derive from git tag (e.g. v1.0.2 -> 1.0.2)
+    try:
+        tag = subprocess.check_output(
+            ["git", "describe", "--tags", "--abbrev=0"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if tag.startswith("v"):
+            tag = tag[1:]
+        print(f"Firmware version from git tag: {tag}")
+        return tag
+    except Exception:
+        pass
+    # 3. Derive from git describe (e.g. v1.0.0-3-gabcdef -> 1.0.0-dev.3)
+    try:
+        desc = subprocess.check_output(
+            ["git", "describe", "--tags", "--always"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if desc.startswith("v"):
+            desc = desc[1:]
+        # Convert vX.Y.Z-N-gHASH to X.Y.Z-dev.N
+        parts = desc.split("-")
+        if len(parts) >= 3:
+            base = parts[0]
+            commits = parts[1]
+            return f"{base}-dev.{commits}"
+        print(f"Firmware version from git describe: {desc}")
+        return desc
+    except Exception:
+        pass
+    print("Warning: Could not determine firmware version, using 0.0.0-unknown")
+    return "0.0.0-unknown"
+
+firmware_version = get_firmware_version()
+os.environ["FIRMWARE_VERSION"] = firmware_version
 
 # Inject environment variables as build flags
 # Separate boolean flags from string values
@@ -91,7 +135,7 @@ string_vars = {
     "MQTT_PASSWORD": os.environ.get("MQTT_PASSWORD", ""),
 
     # Auto OTA Configuration
-    "FIRMWARE_VERSION": os.environ.get("FIRMWARE_VERSION", "1.0.0"),
+    "FIRMWARE_VERSION": firmware_version,
     "AUTO_OTA_URL": os.environ.get("AUTO_OTA_URL", ""),
 }
 
