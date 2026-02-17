@@ -4119,7 +4119,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Check Interval (sec)</label><input id='AUTO_OTA_CHECK_INTERVAL' value='" + String(settings.autoOtaCheckInterval) + "'></div>";
     page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>Firmware URL</label><input id='AUTO_OTA_URL' value='" + settings.autoOtaUrl + "' placeholder='https://example.com/firmware'></div>";
     page += "<div class='fg' style='grid-column:1/-1'><label class='lbl' style='font-size:12px;color:#718096'>Current version: " + String(FIRMWARE_VERSION) + " &mdash; The server should host a version.json with {version, url, notes} and the .bin file</label></div>";
-    page += "<div class='fg' style='grid-column:1/-1'><button class='btn secondary' type='button' onclick='checkOta()'>Check Now</button> <span id='otaStatus' style='font-size:13px;color:#718096'></span></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><button id='otaBtn' class='btn secondary' type='button' onclick='checkOta()'>Check Now</button> <span id='otaStatus' style='font-size:13px;color:#718096'></span></div>";
     page += "</div></div>";
 
     page += "<div class='card'><div class='btns'>";
@@ -4154,7 +4154,8 @@ void setup() {
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
     page += "}";
-    page += "async function checkOta(){const st=document.getElementById('otaStatus');st.textContent='Checking...';try{const r=await fetch('/api/auto-ota/check',{method:'POST',credentials:'include'});const d=await r.json();if(d.updateAvailable){st.textContent='Update available: v'+d.latestVersion+(d.latestNotes?' - '+d.latestNotes:'');st.style.color='#48bb78';}else{st.textContent='Up to date (v'+d.currentVersion+')';st.style.color='#718096';}}catch(e){st.textContent='Check failed: '+e.message;st.style.color='#e53e3e';}}";
+    page += "async function checkOta(){const btn=document.getElementById('otaBtn');const st=document.getElementById('otaStatus');btn.disabled=true;st.textContent='Checking...';try{const r=await fetch('/api/auto-ota/check',{method:'POST',credentials:'include'});const d=await r.json();if(d.updateAvailable){st.textContent='Update available: v'+d.latestVersion+(d.latestNotes?' - '+d.latestNotes:'');st.style.color='#48bb78';btn.textContent='Install Now';btn.className='btn primary';btn.onclick=installOta;btn.disabled=false;}else{st.textContent='Up to date (v'+d.currentVersion+')';st.style.color='#718096';btn.disabled=false;}}catch(e){st.textContent='Check failed: '+e.message;st.style.color='#e53e3e';btn.disabled=false;}}";
+    page += "async function installOta(){const btn=document.getElementById('otaBtn');const st=document.getElementById('otaStatus');if(!confirm('Install firmware update now? The device will reboot.'))return;btn.disabled=true;btn.textContent='Installing...';st.textContent='Downloading and flashing firmware...';st.style.color='#ecc94b';try{const r=await fetch('/api/auto-ota/apply',{method:'POST',credentials:'include'});const d=await r.json();if(d.error){st.textContent='Install failed: '+d.error;st.style.color='#e53e3e';btn.textContent='Install Now';btn.disabled=false;}else{st.textContent='Update started. Device will reboot shortly...';st.style.color='#48bb78';}}catch(e){st.textContent='Install failed: '+e.message;st.style.color='#e53e3e';btn.textContent='Install Now';btn.disabled=false;}}";
     page += "renderDirectNodes();";
     page += "</script></body></html>";
     request->send(200, "text/html", page);
