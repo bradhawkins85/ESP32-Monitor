@@ -543,6 +543,7 @@ static String autoOtaLatestUrl = "";
 static String autoOtaLatestNotes = "";
 static String autoOtaLastCheckStatus = "never";
 static bool autoOtaUpdateInProgress = false;
+static bool autoOtaApplyRequested = false;  // Flag set by web handler, consumed by loop()
 static bool checkAutoOtaUpdate(bool applyIfAvailable);
 
 // ============================================
@@ -5173,8 +5174,10 @@ void setup() {
       return;
     }
     request->send(200, "application/json", "{\"status\":\"starting update\"}");
-    // Run the update after responding (will reboot on success)
-    checkAutoOtaUpdate(true);
+    // Defer the actual update to loop() — httpUpdate.update() is a long blocking
+    // call that cannot run inside an AsyncWebServer handler without corrupting
+    // the WiFi/TCP stack.
+    autoOtaApplyRequested = true;
   });
 
   // LoRa Stats JSON API
@@ -5711,6 +5714,13 @@ void loop() {
   
   // Check all services periodically
   checkAllServices();
+
+  // Handle deferred "Install Now" request from the web UI
+  if (autoOtaApplyRequested && !autoOtaUpdateInProgress) {
+    autoOtaApplyRequested = false;
+    Serial.println("[AutoOTA] Applying deferred install request from web UI");
+    checkAutoOtaUpdate(true);
+  }
 
   // Periodic auto-OTA check
   if (settings.autoOtaEnabled != 0 && !captivePortalActive && !autoOtaUpdateInProgress) {
