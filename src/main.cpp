@@ -4251,8 +4251,9 @@ void setup() {
     html += "<title>ESP32 Uptime Monitor</title>";
     html += "<style>";
     html += "*{margin:0;padding:0;box-sizing:border-box}";
-    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px}";
-    html += ".container{max-width:1200px;margin:0 auto}";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,sans-serif;background:#000;min-height:100vh;padding:20px;overflow-x:hidden}";
+    html += "#meshBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}";
+    html += ".container{max-width:1200px;margin:0 auto;position:relative;z-index:1}";
     html += ".header{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:30px;margin-bottom:20px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}";
     html += "h1{color:#2d3748;font-size:28px;margin-bottom:8px}";
     html += ".subtitle{color:#718096;font-size:14px}";
@@ -4314,6 +4315,7 @@ void setup() {
     html += ".btn-cancel:hover{background:#cbd5e0}";
     html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.modal-content{padding:24px}}";
     html += "</style></head><body>";
+    html += "<canvas id='meshBg'></canvas>";
     html += "<div class='container'>";
     html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:13px;opacity:0.9;margin-top:6px'>Firmware v" + String(FIRMWARE_VERSION) + "</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div>";
     html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>MAC: " + macWithColons() + "</div>";
@@ -4571,6 +4573,22 @@ void setup() {
     html += "setInterval(()=>{if(!modalOpen) location.reload();},30000);";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "</script>";
+    html += "<script>";
+    html += "(function(){";
+    html += "var c=document.getElementById('meshBg'),ctx=c.getContext('2d');";
+    html += "var dots=[],MAX=60,DIST=120;";
+    html += "function resize(){c.width=window.innerWidth;c.height=window.innerHeight;}";
+    html += "window.addEventListener('resize',resize);resize();";
+    html += "for(var i=0;i<MAX;i++){dots.push({x:Math.random()*c.width,y:Math.random()*c.height,vx:(Math.random()-0.5)*0.6,vy:(Math.random()-0.5)*0.6,r:Math.random()*1.5+1});}";
+    html += "function draw(){ctx.clearRect(0,0,c.width,c.height);";
+    html += "for(var i=0;i<dots.length;i++){var d=dots[i];d.x+=d.vx;d.y+=d.vy;";
+    html += "if(d.x<0||d.x>c.width)d.vx*=-1;if(d.y<0||d.y>c.height)d.vy*=-1;";
+    html += "ctx.beginPath();ctx.arc(d.x,d.y,d.r,0,Math.PI*2);ctx.fillStyle='rgba(72,187,120,0.8)';ctx.fill();";
+    html += "for(var j=i+1;j<dots.length;j++){var e=dots[j],dx=d.x-e.x,dy=d.y-e.y,dist=Math.sqrt(dx*dx+dy*dy);";
+    html += "if(dist<DIST){ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);";
+    html += "ctx.strokeStyle='rgba(72,187,120,'+(1-dist/DIST)*0.4+')';ctx.lineWidth=0.8;ctx.stroke();}}}";
+    html += "requestAnimationFrame(draw);}draw();})();";
+    html += "</script>";
     html += "</body></html>";
     request->send(200, "text/html", html);
   });
@@ -4638,8 +4656,9 @@ void setup() {
   // Kiosk view: stats + services only, no actions/controls
   server.on("/kiosk", HTTP_GET, [](AsyncWebServerRequest *request) {
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>Kiosk</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:20px;}";
-    html += ".container{max-width:1100px;margin:0 auto;}";
+    html += "<title>Kiosk</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#000;color:#e2e8f0;margin:0;padding:20px;overflow-x:hidden;}";
+    html += "#meshBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}";
+    html += ".container{max-width:1100px;margin:0 auto;position:relative;z-index:1;}";
     html += ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;}";
     html += ".stat{background:#1e293b;border-radius:12px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,0.2);}";
     html += ".stat .value{font-size:32px;font-weight:700;color:#f8fafc;}";
@@ -4650,7 +4669,7 @@ void setup() {
     html += ".name{font-size:16px;font-weight:700;color:#f8fafc;margin-bottom:6px;}";
     html += ".meta{color:#cbd5e1;font-size:13px;} .status-badge{display:inline-block;padding:4px 10px;border-radius:12px;font-weight:700;font-size:12px;margin-top:6px;}";
     html += ".status-up{background:#22c55e33;color:#bbf7d0;} .status-down{background:#ef444433;color:#fecdd3;}";
-    html += "</style></head><body><div class='container'>";
+    html += "</style></head><body><canvas id='meshBg'></canvas><div class='container'>";
 
     int upCount = 0, downCount = 0;
     for (int i = 0; i < serviceCount; i++) {
@@ -4690,7 +4709,22 @@ void setup() {
       html += "</div>";
     }
     html += "</div>";
-    html += "</div><script>setInterval(()=>location.reload(),20000);</script></body></html>";
+    html += "</div><script>setInterval(()=>location.reload(),20000);";
+    html += "(function(){";
+    html += "var c=document.getElementById('meshBg'),ctx=c.getContext('2d');";
+    html += "var dots=[],MAX=60,DIST=120;";
+    html += "function resize(){c.width=window.innerWidth;c.height=window.innerHeight;}";
+    html += "window.addEventListener('resize',resize);resize();";
+    html += "for(var i=0;i<MAX;i++){dots.push({x:Math.random()*c.width,y:Math.random()*c.height,vx:(Math.random()-0.5)*0.6,vy:(Math.random()-0.5)*0.6,r:Math.random()*1.5+1});}";
+    html += "function draw(){ctx.clearRect(0,0,c.width,c.height);";
+    html += "for(var i=0;i<dots.length;i++){var d=dots[i];d.x+=d.vx;d.y+=d.vy;";
+    html += "if(d.x<0||d.x>c.width)d.vx*=-1;if(d.y<0||d.y>c.height)d.vy*=-1;";
+    html += "ctx.beginPath();ctx.arc(d.x,d.y,d.r,0,Math.PI*2);ctx.fillStyle='rgba(72,187,120,0.8)';ctx.fill();";
+    html += "for(var j=i+1;j<dots.length;j++){var e=dots[j],dx=d.x-e.x,dy=d.y-e.y,dist=Math.sqrt(dx*dx+dy*dy);";
+    html += "if(dist<DIST){ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);";
+    html += "ctx.strokeStyle='rgba(72,187,120,'+(1-dist/DIST)*0.4+')';ctx.lineWidth=0.8;ctx.stroke();}}}";
+    html += "requestAnimationFrame(draw);}draw();})();";
+    html += "</script></body></html>";
     request->send(200, "text/html", html);
   });
 
