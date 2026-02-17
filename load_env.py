@@ -11,6 +11,12 @@ try:
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip()
+                # Strip inline comments (# ...) but not inside quoted strings
+                if not ((value.startswith('"') and value.endswith('"')) or
+                        (value.startswith("'") and value.endswith("'"))):
+                    comment_idx = value.find('#')
+                    if comment_idx >= 0:
+                        value = value[:comment_idx].strip()
                 # Remove surrounding quotes if present
                 if (value.startswith('"') and value.endswith('"')) or \
                    (value.startswith("'") and value.endswith("'")):
@@ -145,7 +151,7 @@ int_vars = {
     "LORA_SPREADING_FACTOR": os.environ.get("LORA_SPREADING_FACTOR", "7"),
     "LORA_CODING_RATE": os.environ.get("LORA_CODING_RATE", "5"),
     "MQTT_QOS": os.environ.get("MQTT_QOS", "0"),
-    "AUTO_OTA_CHECK_INTERVAL": os.environ.get("AUTO_OTA_CHECK_INTERVAL", "3600"),
+    "AUTO_OTA_CHECK_INTERVAL": os.environ.get("AUTO_OTA_CHECK_INTERVAL", "86400"),
 }
 
 # Float vars (no quotes)

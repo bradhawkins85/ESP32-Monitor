@@ -353,7 +353,7 @@
 #endif
 
 #ifndef AUTO_OTA_CHECK_INTERVAL
-#define AUTO_OTA_CHECK_INTERVAL 3600  // Seconds between version checks (default: 1 hour)
+#define AUTO_OTA_CHECK_INTERVAL 86400  // Seconds between version checks (default: 24 hours)
 #endif
 
 #endif // CONFIG_H
