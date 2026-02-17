@@ -500,6 +500,7 @@ struct Settings {
   // LoRa radio parameters
   bool loraEnabled;
   bool loraIpAlerts;
+  bool loraIgnorePublic;
   String loraNodeName;
   String loraCommandPin;
   float loraFreq;
@@ -675,6 +676,7 @@ Settings defaultSettingsFromBuild() {
 
   s.loraEnabled = (LORA_ENABLED != 0);
   s.loraIpAlerts = (LORA_IP_ALERTS != 0);
+  s.loraIgnorePublic = (LORA_IGNORE_PUBLIC != 0);
   s.loraNodeName = String(LORA_NODE_NAME);
   s.loraCommandPin = "";  // Will be set from generated credentials
   s.loraFreq = (float)LORA_FREQ;
@@ -786,6 +788,7 @@ void loadSettingsOverrides() {
   // LoRa radio parameters
   if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
   if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
+  if (doc["LORA_IGNORE_PUBLIC"].is<bool>()) settings.loraIgnorePublic = doc["LORA_IGNORE_PUBLIC"].as<bool>();
   if (doc["LORA_COMMAND_PIN"].is<String>()) settings.loraCommandPin = doc["LORA_COMMAND_PIN"].as<String>();
   if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
   if (doc["LORA_FREQ"].is<double>()) settings.loraFreq = (float)doc["LORA_FREQ"].as<double>();
@@ -939,6 +942,7 @@ bool saveSettingsOverrides() {
 
   doc["LORA_ENABLED"] = settings.loraEnabled;
   doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
+  doc["LORA_IGNORE_PUBLIC"] = settings.loraIgnorePublic;
   doc["LORA_COMMAND_PIN"] = settings.loraCommandPin;
   doc["LORA_FREQ"] = settings.loraFreq;
   doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
@@ -3594,6 +3598,7 @@ void setup() {
     doc["LORA_ENABLED"] = settings.loraEnabled;
     doc["LORA_NODE_NAME"] = settings.loraNodeName;
     doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
+    doc["LORA_IGNORE_PUBLIC"] = settings.loraIgnorePublic;
     doc["LORA_FREQ"] = settings.loraFreq;
     doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
     doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
@@ -3717,6 +3722,7 @@ void setup() {
       if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
       if (doc["LORA_NODE_NAME"].is<String>()) settings.loraNodeName = doc["LORA_NODE_NAME"].as<String>();
       if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
+      if (doc["LORA_IGNORE_PUBLIC"].is<bool>()) settings.loraIgnorePublic = doc["LORA_IGNORE_PUBLIC"].as<bool>();
       if (doc["LORA_COMMAND_PIN"].is<String>()) {
         String v = doc["LORA_COMMAND_PIN"].as<String>();
         if (v.length() > 0) settings.loraCommandPin = v;
@@ -3944,6 +3950,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Command PIN</label><input id='LORA_COMMAND_PIN' type='password' value='' placeholder='(unchanged)'></div>";
     page += "<div class='fg'><label class='lbl'>LoRa Enabled</label><select id='LORA_ENABLED'><option value='true'" + String(settings.loraEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='LORA_IP_ALERTS'><option value='true'" + String(settings.loraIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraIpAlerts ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Ignore Public Channel</label><select id='LORA_IGNORE_PUBLIC'><option value='true'" + String(settings.loraIgnorePublic ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraIgnorePublic ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Frequency (MHz)</label><input id='LORA_FREQ' type='number' step='0.001' value='" + String(settings.loraFreq, 3) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Bandwidth (kHz)</label><input id='LORA_BANDWIDTH' type='number' step='0.1' value='" + String(settings.loraBandwidth, 1) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Spreading Factor</label><input id='LORA_SPREADING_FACTOR' type='number' min='6' max='12' step='1' value='" + String(settings.loraSpreadingFactor) + "'></div>";
@@ -4037,7 +4044,7 @@ void setup() {
     page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),SHOW_BOOT_CREDENTIALS:boolVal('SHOW_BOOT_CREDENTIALS'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_IGNORE_PUBLIC:boolVal('LORA_IGNORE_PUBLIC'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
     page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
@@ -6080,9 +6087,9 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   
   // Only process direct messages and messages from the configured channel.
-  // Public channel messages are monitored for logging but NOT relayed or acted upon.
-  if (matchedChannelName == "Public") {
-    Serial.println("[LoRa] Public channel message ignored (not relaying to notification services)");
+  // Public channel messages are ignored when LORA_IGNORE_PUBLIC is enabled.
+  if (matchedChannelName == "Public" && settings.loraIgnorePublic) {
+    Serial.println("[LoRa] Public channel message ignored (LORA_IGNORE_PUBLIC enabled)");
     Serial.println("=== Packet Processing Complete ===\n");
     return;
   }

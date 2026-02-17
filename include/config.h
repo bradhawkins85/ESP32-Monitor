@@ -131,6 +131,10 @@
 #define LORA_IP_ALERTS true
 #endif
 
+#ifndef LORA_IGNORE_PUBLIC
+#define LORA_IGNORE_PUBLIC true  // Ignore messages on the MeshCore public channel
+#endif
+
 #ifndef LORA_NODE_NAME
 #define LORA_NODE_NAME ""  // Default: first 8 hex chars of public key
 #endif

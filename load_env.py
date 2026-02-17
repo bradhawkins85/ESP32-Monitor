@@ -76,6 +76,7 @@ os.environ["FIRMWARE_VERSION"] = firmware_version
 bool_vars = {
     "LORA_ENABLED": os.environ.get("LORA_ENABLED", "true"),
     "LORA_IP_ALERTS": os.environ.get("LORA_IP_ALERTS", "true"),
+    "LORA_IGNORE_PUBLIC": os.environ.get("LORA_IGNORE_PUBLIC", "true"),
     "DISCORD_ENABLED": os.environ.get("DISCORD_ENABLED", "false"),
     "DISCORD_IP_ALERTS": os.environ.get("DISCORD_IP_ALERTS", "true"),
     "NTFY_ENABLED": os.environ.get("NTFY_ENABLED", "true"),
