@@ -12,6 +12,11 @@
 // Build-time Configuration
 // ============================================
 
+// Firmware Version (used for auto-OTA version comparison)
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "1.0.0"
+#endif
+
 // WiFi Configuration
 #ifndef WIFI_SSID
 #define WIFI_SSID "your_wifi_ssid"
@@ -57,9 +62,7 @@
 #define HOTSPOT_IP "192.168.4.1"
 #endif
 
-#ifndef HOTSPOT_PASSWORD
-#define HOTSPOT_PASSWORD "esp32monitor"
-#endif
+// HOTSPOT_PASSWORD is auto-generated on first boot; no compile-time default
 
 // Status LED (onboard). Override in .env via ADMIN_LED_PIN if different.
 #ifndef LED_PIN
@@ -97,8 +100,10 @@
 #define ADMIN_USERNAME "admin"
 #endif
 
-#ifndef ADMIN_PASSWORD
-#define ADMIN_PASSWORD "admin"
+// ADMIN_PASSWORD is auto-generated on first boot; no compile-time default
+
+#ifndef SHOW_BOOT_CREDENTIALS
+#define SHOW_BOOT_CREDENTIALS true
 #endif
 
 // LoRa Configuration
@@ -338,6 +343,19 @@
 // Display Configuration
 #ifndef ENABLE_DISPLAY
 #define ENABLE_DISPLAY true
+#endif
+
+// Auto OTA Update Configuration
+#ifndef AUTO_OTA_ENABLED
+#define AUTO_OTA_ENABLED false
+#endif
+
+#ifndef AUTO_OTA_URL
+#define AUTO_OTA_URL ""  // Base URL for firmware (e.g. https://example.com/firmware)
+#endif
+
+#ifndef AUTO_OTA_CHECK_INTERVAL
+#define AUTO_OTA_CHECK_INTERVAL 3600  // Seconds between version checks (default: 1 hour)
 #endif
 
 #endif // CONFIG_H

@@ -41,6 +41,8 @@ bool_vars = {
     "WEBHOOK_MESH_RELAY": os.environ.get("WEBHOOK_MESH_RELAY", "false"),
     "EMAIL_MESH_RELAY": os.environ.get("EMAIL_MESH_RELAY", "false"),
     "MQTT_MESH_RELAY": os.environ.get("MQTT_MESH_RELAY", "false"),
+    "SHOW_BOOT_CREDENTIALS": os.environ.get("SHOW_BOOT_CREDENTIALS", "true"),
+    "AUTO_OTA_ENABLED": os.environ.get("AUTO_OTA_ENABLED", "false"),
 }
 
 string_vars = {
@@ -50,11 +52,9 @@ string_vars = {
 
     # Captive Portal Hotspot
     "HOTSPOT_IP": os.environ.get("HOTSPOT_IP", "192.168.4.1"),
-    "HOTSPOT_PASSWORD": os.environ.get("HOTSPOT_PASSWORD", "esp32monitor"),
 
     # Admin Authentication
     "ADMIN_USERNAME": os.environ.get("ADMIN_USERNAME", "admin"),
-    "ADMIN_PASSWORD": os.environ.get("ADMIN_PASSWORD", "admin"),
 
     # LoRa/MeshCore Channel Configuration
     "CHANNEL_NAME": os.environ.get("CHANNEL_NAME", "BCAlerts"),
@@ -89,6 +89,10 @@ string_vars = {
     "MQTT_TOPIC": os.environ.get("MQTT_TOPIC", "esp32-monitor/alerts"),
     "MQTT_USERNAME": os.environ.get("MQTT_USERNAME", ""),
     "MQTT_PASSWORD": os.environ.get("MQTT_PASSWORD", ""),
+
+    # Auto OTA Configuration
+    "FIRMWARE_VERSION": os.environ.get("FIRMWARE_VERSION", "1.0.0"),
+    "AUTO_OTA_URL": os.environ.get("AUTO_OTA_URL", ""),
 }
 
 # Numeric vars (no quotes)
@@ -97,6 +101,7 @@ int_vars = {
     "LORA_SPREADING_FACTOR": os.environ.get("LORA_SPREADING_FACTOR", "7"),
     "LORA_CODING_RATE": os.environ.get("LORA_CODING_RATE", "5"),
     "MQTT_QOS": os.environ.get("MQTT_QOS", "0"),
+    "AUTO_OTA_CHECK_INTERVAL": os.environ.get("AUTO_OTA_CHECK_INTERVAL", "3600"),
 }
 
 # Float vars (no quotes)

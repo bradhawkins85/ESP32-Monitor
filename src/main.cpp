@@ -29,6 +29,7 @@
 // #include <ElegantOTA.h>  // Temporarily disabled due to header conflicts
 #include <cstdlib>
 #include <Update.h>
+#include <HTTPUpdate.h>
 #include <DNSServer.h>
 #include <esp_system.h>
 #include <AsyncMqttClient.h>
@@ -458,6 +459,15 @@ uint8_t ourNodeHashAlt = 0;
 bool pendingRestart = false;
 unsigned long restartAtMs = 0;
 
+// Auto OTA globals and forward declaration
+static unsigned long autoOtaLastCheckMs = 0;
+static String autoOtaLatestVersion = "";
+static String autoOtaLatestUrl = "";
+static String autoOtaLatestNotes = "";
+static String autoOtaLastCheckStatus = "never";
+static bool autoOtaUpdateInProgress = false;
+static bool checkAutoOtaUpdate(bool applyIfAvailable);
+
 // ============================================
 // Runtime Settings (defaults from .env at build time; overrides from /settings)
 // ============================================
@@ -480,6 +490,8 @@ struct Settings {
   // Admin
   String adminUsername;
   String adminPassword;
+  String hotspotPassword;
+  bool showBootCredentials;
 
   // LoRa / MeshCore channel
   String channelName;
@@ -494,6 +506,7 @@ struct Settings {
   float loraBandwidth;
   int loraSpreadingFactor;
   int loraCodingRate;
+  int loraAckCount;
   bool loraDirectEnabled;
   DirectNodeConfig loraDirectNodes[MAX_DIRECT_NODES];
   int loraDirectNodeCount;
@@ -542,9 +555,75 @@ struct Settings {
   int mqttQos;
   String mqttUsername;
   String mqttPassword;
+
+  // Auto OTA
+  bool autoOtaEnabled;
+  String autoOtaUrl;
+  int autoOtaCheckInterval;  // seconds
 };
 
 Settings settings;
+
+// ============================================
+// Runtime Credential Generation
+// ============================================
+static const char* CREDENTIALS_FILE = "/credentials.json";
+static String generatedAdminPassword;
+static String generatedHotspotPassword;
+
+static String generateRandomPassword(int length = 12) {
+  const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  String result;
+  result.reserve(length);
+  for (int i = 0; i < length; i++) {
+    uint32_t r = esp_random();
+    result += charset[r % (sizeof(charset) - 1)];
+  }
+  return result;
+}
+
+static void loadOrGenerateCredentials() {
+  if (LittleFS.exists(CREDENTIALS_FILE)) {
+    File f = LittleFS.open(CREDENTIALS_FILE, "r");
+    if (f) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, f);
+      f.close();
+      if (!err) {
+        generatedAdminPassword = doc["admin_password"] | "";
+        generatedHotspotPassword = doc["hotspot_password"] | "";
+      }
+    }
+  }
+
+  bool needsWrite = false;
+  if (generatedAdminPassword.length() == 0) {
+    generatedAdminPassword = generateRandomPassword(12);
+    needsWrite = true;
+    Serial.println("[Credentials] Generated new admin password");
+  }
+  if (generatedHotspotPassword.length() == 0) {
+    generatedHotspotPassword = generateRandomPassword(12);
+    needsWrite = true;
+    Serial.println("[Credentials] Generated new hotspot password");
+  }
+
+  if (needsWrite) {
+    File f = LittleFS.open(CREDENTIALS_FILE, "w");
+    if (f) {
+      JsonDocument doc;
+      doc["admin_password"] = generatedAdminPassword;
+      doc["hotspot_password"] = generatedHotspotPassword;
+      serializeJson(doc, f);
+      f.close();
+      Serial.println("[Credentials] Saved to filesystem");
+    } else {
+      Serial.println("[Credentials] ERROR: Failed to write credentials file!");
+    }
+  } else {
+    Serial.println("[Credentials] Loaded from filesystem");
+  }
+}
 
 static void clearDirectNodeList(Settings &s) {
   s.loraDirectNodeCount = 0;
@@ -569,7 +648,9 @@ Settings defaultSettingsFromBuild() {
   s.staticDns2 = String(STATIC_DNS2);
 
   s.adminUsername = String(ADMIN_USERNAME);
-  s.adminPassword = String(ADMIN_PASSWORD);
+  s.adminPassword = "";  // Will be set from generated credentials
+  s.hotspotPassword = ""; // Will be set from generated credentials
+  s.showBootCredentials = (SHOW_BOOT_CREDENTIALS != 0);
 
   s.channelName = String(CHANNEL_NAME);
   s.channelSecret = String(CHANNEL_SECRET);
@@ -582,6 +663,7 @@ Settings defaultSettingsFromBuild() {
   s.loraBandwidth = (float)LORA_BANDWIDTH;
   s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
   s.loraCodingRate = (int)LORA_CODING_RATE;
+  s.loraAckCount = 2;
   s.loraDirectEnabled = false;
   clearDirectNodeList(s);
 
@@ -627,6 +709,11 @@ Settings defaultSettingsFromBuild() {
   if (s.mqttQos > 2) s.mqttQos = 2;
   s.mqttUsername = String(MQTT_USERNAME);
   s.mqttPassword = String(MQTT_PASSWORD);
+
+  s.autoOtaEnabled = (AUTO_OTA_ENABLED != 0);
+  s.autoOtaUrl = String(AUTO_OTA_URL);
+  s.autoOtaCheckInterval = (int)AUTO_OTA_CHECK_INTERVAL;
+  if (s.autoOtaCheckInterval < 60) s.autoOtaCheckInterval = 3600;
   return s;
 }
 
@@ -673,6 +760,8 @@ void loadSettingsOverrides() {
   
   if (doc["ADMIN_USERNAME"].is<String>()) settings.adminUsername = doc["ADMIN_USERNAME"].as<String>();
   if (doc["ADMIN_PASSWORD"].is<String>()) settings.adminPassword = doc["ADMIN_PASSWORD"].as<String>();
+  if (doc["HOTSPOT_PASSWORD"].is<String>()) settings.hotspotPassword = doc["HOTSPOT_PASSWORD"].as<String>();
+  if (doc["SHOW_BOOT_CREDENTIALS"].is<bool>()) settings.showBootCredentials = doc["SHOW_BOOT_CREDENTIALS"].as<bool>();
   if (doc["CHANNEL_NAME"].is<String>()) settings.channelName = doc["CHANNEL_NAME"].as<String>();
   if (doc["CHANNEL_SECRET"].is<String>()) settings.channelSecret = doc["CHANNEL_SECRET"].as<String>();
 
@@ -693,6 +782,9 @@ void loadSettingsOverrides() {
 
   if (doc["LORA_CODING_RATE"].is<int>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<int>();
   if (doc["LORA_CODING_RATE"].is<String>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<String>().toInt();
+
+  if (doc["LORA_ACK_COUNT"].is<int>()) settings.loraAckCount = doc["LORA_ACK_COUNT"].as<int>();
+  if (doc["LORA_ACK_COUNT"].is<String>()) settings.loraAckCount = doc["LORA_ACK_COUNT"].as<String>().toInt();
 
   if (doc["LORA_DIRECT_ENABLED"].is<bool>()) settings.loraDirectEnabled = doc["LORA_DIRECT_ENABLED"].as<bool>();
   if (doc["LORA_DIRECT_NODES"].is<JsonArray>()) {
@@ -788,6 +880,12 @@ void loadSettingsOverrides() {
   if (doc["MQTT_MESH_RELAY"].is<bool>()) settings.mqttMeshRelay = doc["MQTT_MESH_RELAY"].as<bool>();
   if (doc["MQTT_IP_ALERTS"].is<bool>()) settings.mqttIpAlerts = doc["MQTT_IP_ALERTS"].as<bool>();
 
+  // Auto OTA
+  if (doc["AUTO_OTA_ENABLED"].is<bool>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<bool>();
+  if (doc["AUTO_OTA_URL"].is<String>()) settings.autoOtaUrl = doc["AUTO_OTA_URL"].as<String>();
+  if (doc["AUTO_OTA_CHECK_INTERVAL"].is<int>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<int>();
+  if (doc["AUTO_OTA_CHECK_INTERVAL"].is<String>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<String>().toInt();
+
   // Normalize
   if (settings.mqttPort <= 0) settings.mqttPort = 1883;
   if (settings.mqttQos < 0) settings.mqttQos = 0;
@@ -816,6 +914,8 @@ bool saveSettingsOverrides() {
   
   doc["ADMIN_USERNAME"] = settings.adminUsername;
   doc["ADMIN_PASSWORD"] = settings.adminPassword;
+  doc["HOTSPOT_PASSWORD"] = settings.hotspotPassword;
+  doc["SHOW_BOOT_CREDENTIALS"] = settings.showBootCredentials;
   doc["CHANNEL_NAME"] = settings.channelName;
   doc["CHANNEL_SECRET"] = settings.channelSecret;
 
@@ -826,6 +926,7 @@ bool saveSettingsOverrides() {
   doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
   doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
   doc["LORA_CODING_RATE"] = settings.loraCodingRate;
+  doc["LORA_ACK_COUNT"] = settings.loraAckCount;
   doc["LORA_DIRECT_ENABLED"] = settings.loraDirectEnabled;
   JsonArray directNodes = doc.createNestedArray("LORA_DIRECT_NODES");
   for (int i = 0; i < settings.loraDirectNodeCount; i++) {
@@ -874,6 +975,10 @@ bool saveSettingsOverrides() {
   doc["MQTT_QOS"] = settings.mqttQos;
   doc["MQTT_USERNAME"] = settings.mqttUsername;
   doc["MQTT_PASSWORD"] = settings.mqttPassword;
+
+  doc["AUTO_OTA_ENABLED"] = settings.autoOtaEnabled;
+  doc["AUTO_OTA_URL"] = settings.autoOtaUrl;
+  doc["AUTO_OTA_CHECK_INTERVAL"] = settings.autoOtaCheckInterval;
 
   if (serializeJson(doc, file) == 0) {
     file.close();
@@ -1350,6 +1455,11 @@ static void stopCaptivePortal() {
   Serial.println("[CaptivePortal] Stopped");
 }
 
+// Returns true when WiFi SSID has been configured (not the default "Unset")
+static bool isWifiConfigured() {
+  return settings.wifiSsid.length() > 0 && settings.wifiSsid != "Unset";
+}
+
 static void startCaptivePortal() {
   if (captivePortalActive) return;
 
@@ -1365,12 +1475,12 @@ static void startCaptivePortal() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(captiveApIp, captiveApIp, captiveApNetmask);
 
-  String apPass = String(HOTSPOT_PASSWORD);
+  String apPass = settings.hotspotPassword;
   bool ok;
   if (apPass.length() >= 8) {
     ok = WiFi.softAP(captiveApSsid.c_str(), apPass.c_str());
   } else {
-    Serial.println("[CaptivePortal] HOTSPOT_PASSWORD too short (<8). Starting open AP.");
+    Serial.println("[CaptivePortal] Hotspot password too short (<8). Starting open AP.");
     ok = WiFi.softAP(captiveApSsid.c_str());
   }
 
@@ -1926,11 +2036,18 @@ static void sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   packet[pktIdx++] = (uint8_t)((ackHash >> 16) & 0xFF);
   packet[pktIdx++] = (uint8_t)((ackHash >> 24) & 0xFF);
 
-  int state = radio.transmit(packet, pktIdx);
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.printf("[LoRa] Sent ACK (hash=0x%08X, len=%u)\n", ackHash, (unsigned int)pktIdx);
-  } else {
-    Serial.printf("[LoRa] Failed to send ACK, code: %d\n", state);
+  int ackCount = settings.loraAckCount;
+  if (ackCount < 1) ackCount = 1;
+  if (ackCount > 5) ackCount = 5;
+
+  for (int ackIdx = 0; ackIdx < ackCount; ackIdx++) {
+    if (ackIdx > 0) delay(150);
+    int state = radio.transmit(packet, pktIdx);
+    if (state == RADIOLIB_ERR_NONE) {
+      Serial.printf("[LoRa] Sent ACK %d/%d (hash=0x%08X, len=%u)\n", ackIdx + 1, ackCount, ackHash, (unsigned int)pktIdx);
+    } else {
+      Serial.printf("[LoRa] Failed to send ACK %d/%d, code: %d\n", ackIdx + 1, ackCount, state);
+    }
   }
 
   radio.startReceive();
@@ -3311,8 +3428,28 @@ void setup() {
 
   // Load runtime settings: build-time defaults (.env) + optional overrides (/settings.json)
   applySettingsDefaults();
+
+  // Generate or load credentials (admin password, hotspot password)
+  loadOrGenerateCredentials();
+  settings.adminPassword = generatedAdminPassword;
+  settings.hotspotPassword = generatedHotspotPassword;
+
+  // Apply user overrides from settings.json (may override generated admin password)
   loadSettingsOverrides();
-  
+
+  // Output credentials to serial monitor on boot (if enabled)
+  if (settings.showBootCredentials) {
+    String hotspotSsid = String("ESP32NM-") + macNoColons();
+    Serial.println("-------------------------------------------");
+    Serial.println("  DEVICE CREDENTIALS");
+    Serial.println("-------------------------------------------");
+    Serial.printf("  Hotspot SSID:     %s\n", hotspotSsid.c_str());
+    Serial.printf("  Hotspot Password: %s\n", settings.hotspotPassword.c_str());
+    Serial.printf("  Hotspot IP:       %s\n", HOTSPOT_IP);
+    Serial.printf("  Admin Password:   %s\n", settings.adminPassword.c_str());
+    Serial.println("-------------------------------------------\n");
+  }
+
   // Setup WiFi (needed for forwarding and NTP sync)
   setupWiFi();
   
@@ -3321,6 +3458,18 @@ void setup() {
 
   // Load cached adverts as early as possible
   loadAdvertCache();
+
+  // Pre-populate peer cache with configured direct nodes
+  for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+    const String &pubHex = settings.loraDirectNodes[i].pubkeyHex;
+    if (pubHex.length() == 0) continue;
+    uint8_t pubkey[32];
+    if (!parseHexKeyToBytes(pubHex, pubkey)) continue;
+    String label = settings.loraDirectNodes[i].name;
+    if (label.length() == 0) label = String("node-") + String(i + 1);
+    upsertPeer(pubkey[0], pubkey, label, 0);
+    Serial.printf("[LoRa] Pre-loaded direct node '%s' into peer cache\n", label.c_str());
+  }
   
   // Sync time via NTP for proper timestamps
   if (wifiConnected) {
@@ -3406,6 +3555,7 @@ void setup() {
     doc["STATIC_DNS2"] = settings.staticDns2;
     
     doc["ADMIN_USERNAME"] = settings.adminUsername;
+    doc["SHOW_BOOT_CREDENTIALS"] = settings.showBootCredentials;
     doc["CHANNEL_NAME"] = settings.channelName;
 
     doc["LORA_ENABLED"] = settings.loraEnabled;
@@ -3415,6 +3565,7 @@ void setup() {
     doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
     doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
     doc["LORA_CODING_RATE"] = settings.loraCodingRate;
+    doc["LORA_ACK_COUNT"] = settings.loraAckCount;
     doc["LORA_DIRECT_ENABLED"] = settings.loraDirectEnabled;
     JsonArray directNodes = doc.createNestedArray("LORA_DIRECT_NODES");
     for (int i = 0; i < settings.loraDirectNodeCount; i++) {
@@ -3457,6 +3608,11 @@ void setup() {
     doc["MQTT_TOPIC"] = settings.mqttTopic;
     doc["MQTT_QOS"] = settings.mqttQos;
     doc["MQTT_USERNAME"] = settings.mqttUsername;
+
+    doc["AUTO_OTA_ENABLED"] = settings.autoOtaEnabled;
+    doc["AUTO_OTA_URL"] = settings.autoOtaUrl;
+    doc["AUTO_OTA_CHECK_INTERVAL"] = settings.autoOtaCheckInterval;
+    doc["FIRMWARE_VERSION"] = String(FIRMWARE_VERSION);
 
     String json;
     serializeJson(doc, json);
@@ -3518,6 +3674,7 @@ void setup() {
         String v = doc["ADMIN_PASSWORD"].as<String>();
         if (v.length() > 0) settings.adminPassword = v;
       }
+      if (doc["SHOW_BOOT_CREDENTIALS"].is<bool>()) settings.showBootCredentials = doc["SHOW_BOOT_CREDENTIALS"].as<bool>();
       if (doc["CHANNEL_NAME"].is<String>()) settings.channelName = doc["CHANNEL_NAME"].as<String>();
       if (doc["CHANNEL_SECRET"].is<String>()) {
         String v = doc["CHANNEL_SECRET"].as<String>();
@@ -3546,6 +3703,9 @@ void setup() {
 
       if (doc["LORA_CODING_RATE"].is<int>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<int>();
       if (doc["LORA_CODING_RATE"].is<String>()) settings.loraCodingRate = doc["LORA_CODING_RATE"].as<String>().toInt();
+
+      if (doc["LORA_ACK_COUNT"].is<int>()) settings.loraAckCount = doc["LORA_ACK_COUNT"].as<int>();
+      if (doc["LORA_ACK_COUNT"].is<String>()) settings.loraAckCount = doc["LORA_ACK_COUNT"].as<String>().toInt();
 
       if (doc["LORA_DIRECT_ENABLED"].is<bool>()) settings.loraDirectEnabled = doc["LORA_DIRECT_ENABLED"].as<bool>();
       if (doc["LORA_DIRECT_NODES"].is<JsonArray>()) {
@@ -3629,6 +3789,12 @@ void setup() {
       if (doc["MQTT_MESH_RELAY"].is<bool>()) settings.mqttMeshRelay = doc["MQTT_MESH_RELAY"].as<bool>();
       if (doc["MQTT_IP_ALERTS"].is<bool>()) settings.mqttIpAlerts = doc["MQTT_IP_ALERTS"].as<bool>();
 
+      // Auto OTA
+      if (doc["AUTO_OTA_ENABLED"].is<bool>()) settings.autoOtaEnabled = doc["AUTO_OTA_ENABLED"].as<bool>();
+      if (doc["AUTO_OTA_URL"].is<String>()) settings.autoOtaUrl = doc["AUTO_OTA_URL"].as<String>();
+      if (doc["AUTO_OTA_CHECK_INTERVAL"].is<int>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<int>();
+      if (doc["AUTO_OTA_CHECK_INTERVAL"].is<String>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<String>().toInt();
+
       // Normalize
       if (settings.webhookMethod.length() == 0) settings.webhookMethod = "POST";
 
@@ -3640,6 +3806,8 @@ void setup() {
       if (settings.loraBandwidth <= 0.0f) settings.loraBandwidth = (float)LORA_BANDWIDTH;
       if (settings.loraSpreadingFactor <= 0) settings.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
       if (settings.loraCodingRate <= 0) settings.loraCodingRate = (int)LORA_CODING_RATE;
+      if (settings.loraAckCount < 1) settings.loraAckCount = 1;
+      if (settings.loraAckCount > 5) settings.loraAckCount = 5;
 
       if (!saveSettingsOverrides()) {
         request->send(500, "application/json", "{\"error\":\"failed to save\"}");
@@ -3732,6 +3900,8 @@ void setup() {
     page += "<div class='card'><h2>Admin</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Username</label><input id='ADMIN_USERNAME' value='" + settings.adminUsername + "'></div>";
     page += "<div class='fg'><label class='lbl'>Password</label><input id='ADMIN_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
+    page += "<div class='fg'><label class='lbl'>Show Boot Credentials</label><select id='SHOW_BOOT_CREDENTIALS'><option value='true'" + String(settings.showBootCredentials ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.showBootCredentials ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='hint'>When enabled, Hotspot Name, Password, IP and Admin Password are printed to the serial monitor on each boot.</div>";
     page += "</div></div>";
 
     page += "<div class='card'><h2>LoRa / MeshCore</h2><div class='row'>";
@@ -3745,6 +3915,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Bandwidth (kHz)</label><input id='LORA_BANDWIDTH' type='number' step='0.1' value='" + String(settings.loraBandwidth, 1) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Spreading Factor</label><input id='LORA_SPREADING_FACTOR' type='number' min='6' max='12' step='1' value='" + String(settings.loraSpreadingFactor) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Coding Rate (4/x)</label><input id='LORA_CODING_RATE' type='number' min='5' max='8' step='1' value='" + String(settings.loraCodingRate) + "'></div>";
+    page += "<div class='fg'><label class='lbl'>ACK Repeat Count</label><input id='LORA_ACK_COUNT' type='number' min='1' max='5' step='1' value='" + String(settings.loraAckCount) + "'></div>";
     page += "</div></div>";
 
     page += "<div class='card'><h2>LoRa Direct Messaging</h2>";
@@ -3806,6 +3977,14 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Password</label><input id='MQTT_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
     page += "</div></div>";
 
+    page += "<div class='card'><h2>Auto OTA Updates</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Enabled</label><select id='AUTO_OTA_ENABLED'><option value='true'" + String(settings.autoOtaEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.autoOtaEnabled ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Check Interval (sec)</label><input id='AUTO_OTA_CHECK_INTERVAL' value='" + String(settings.autoOtaCheckInterval) + "'></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><label class='lbl'>Firmware URL</label><input id='AUTO_OTA_URL' value='" + settings.autoOtaUrl + "' placeholder='https://example.com/firmware'></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><label class='lbl' style='font-size:12px;color:#718096'>Current version: " + String(FIRMWARE_VERSION) + " &mdash; The server should host a version.json with {version, url, notes} and the .bin file</label></div>";
+    page += "<div class='fg' style='grid-column:1/-1'><button class='btn secondary' type='button' onclick='checkOta()'>Check Now</button> <span id='otaStatus' style='font-size:13px;color:#718096'></span></div>";
+    page += "</div></div>";
+
     page += "<div class='card'><div class='btns'>";
     page += "<button class='btn primary' onclick='save()'>Save</button>";
     page += "<button class='btn secondary' onclick='location.href=\"/\"'>Back</button>";
@@ -3823,9 +4002,9 @@ void setup() {
     page += "WIFI_SSID:val('WIFI_SSID'),WIFI_PASSWORD:val('WIFI_PASSWORD'),";
     page += "IP_MODE:val('IP_MODE'),STATIC_IP:val('STATIC_IP'),STATIC_GATEWAY:val('STATIC_GATEWAY'),STATIC_SUBNET:val('STATIC_SUBNET'),";
     page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
-    page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),";
+    page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),SHOW_BOOT_CREDENTIALS:boolVal('SHOW_BOOT_CREDENTIALS'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
     page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
@@ -3833,10 +4012,12 @@ void setup() {
     page += "EMAIL_ENABLED:boolVal('EMAIL_ENABLED'),EMAIL_MESH_RELAY:boolVal('EMAIL_MESH_RELAY'),EMAIL_IP_ALERTS:boolVal('EMAIL_IP_ALERTS'),SMTP_HOST:val('SMTP_HOST'),SMTP_PORT:val('SMTP_PORT'),EMAIL_RECIPIENT:val('EMAIL_RECIPIENT'),EMAIL_SENDER:val('EMAIL_SENDER'),SMTP_USER:val('SMTP_USER'),SMTP_PASSWORD:val('SMTP_PASSWORD')";
     page += ",MQTT_ENABLED:boolVal('MQTT_ENABLED'),MQTT_MESH_RELAY:boolVal('MQTT_MESH_RELAY'),MQTT_IP_ALERTS:boolVal('MQTT_IP_ALERTS'),MQTT_BROKER:val('MQTT_BROKER'),MQTT_PORT:val('MQTT_PORT'),MQTT_TOPIC:val('MQTT_TOPIC'),MQTT_USERNAME:val('MQTT_USERNAME'),MQTT_PASSWORD:val('MQTT_PASSWORD')";
     page += ",MQTT_QOS:val('MQTT_QOS')";
+    page += ",AUTO_OTA_ENABLED:boolVal('AUTO_OTA_ENABLED'),AUTO_OTA_URL:val('AUTO_OTA_URL'),AUTO_OTA_CHECK_INTERVAL:parseInt(val('AUTO_OTA_CHECK_INTERVAL'))||3600";
     page += "};";
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
     page += "}";
+    page += "async function checkOta(){const st=document.getElementById('otaStatus');st.textContent='Checking...';try{const r=await fetch('/api/auto-ota/check',{method:'POST',credentials:'include'});const d=await r.json();if(d.updateAvailable){st.textContent='Update available: v'+d.latestVersion+(d.latestNotes?' - '+d.latestNotes:'');st.style.color='#48bb78';}else{st.textContent='Up to date (v'+d.currentVersion+')';st.style.color='#718096';}}catch(e){st.textContent='Check failed: '+e.message;st.style.color='#e53e3e';}}";
     page += "renderDirectNodes();";
     page += "</script></body></html>";
     request->send(200, "text/html", page);
@@ -3849,7 +4030,7 @@ void setup() {
 
   // Status page (modern styled HTML)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (captivePortalActive) {
+    if (captivePortalActive && !isWifiConfigured()) {
       request->send(200, "text/html", captivePortalHtml());
       return;
     }
@@ -3922,8 +4103,9 @@ void setup() {
     html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.modal-content{padding:24px}}";
     html += "</style></head><body>";
     html += "<div class='container'>";
-    html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:6px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div>";
-    html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>MAC: " + macWithColons() + "</div></div>";
+    html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:13px;opacity:0.9;margin-top:6px'>Firmware v" + String(FIRMWARE_VERSION) + "</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div>";
+    html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>MAC: " + macWithColons() + "</div>";
+    html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>LoRa Node: " + (ourNodeName.length() > 0 ? ourNodeName : String("(not set)")) + "</div></div>";
     
     // Stats cards
     int upCount = 0, downCount = 0;
@@ -4189,31 +4371,31 @@ void setup() {
 
   // Common OS captive portal probe endpoints
   server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    if (captivePortalActive && !isWifiConfigured()) request->redirect(String("http://") + captiveApIp.toString() + "/");
     else request->send(204);
   });
   server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    if (captivePortalActive && !isWifiConfigured()) request->redirect(String("http://") + captiveApIp.toString() + "/");
     else request->send(404);
   });
   server.on("/fwlink", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    if (captivePortalActive && !isWifiConfigured()) request->redirect(String("http://") + captiveApIp.toString() + "/");
     else request->send(404);
   });
 
   // Windows captive portal checks
   server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    if (captivePortalActive && !isWifiConfigured()) request->redirect(String("http://") + captiveApIp.toString() + "/");
     else request->send(404);
   });
   server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    if (captivePortalActive && !isWifiConfigured()) request->redirect(String("http://") + captiveApIp.toString() + "/");
     else request->send(404);
   });
 
   // Apple/macOS/iOS captive portal checks
   server.on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (captivePortalActive) request->redirect(String("http://") + captiveApIp.toString() + "/");
+    if (captivePortalActive && !isWifiConfigured()) request->redirect(String("http://") + captiveApIp.toString() + "/");
     else request->send(404);
   });
 
@@ -4679,12 +4861,61 @@ void setup() {
   );
 
   server.onNotFound([](AsyncWebServerRequest *request){
-    if (captivePortalActive) {
+    if (captivePortalActive && !isWifiConfigured()) {
       // Redirect any unknown path to the portal page (helps trigger OS captive portal UX)
       request->redirect(String("http://") + captiveApIp.toString() + "/");
       return;
     }
     request->send(404, "text/plain", "Not found");
+  });
+
+  // Auto OTA status endpoint
+  server.on("/api/auto-ota/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    JsonDocument doc;
+    doc["enabled"] = settings.autoOtaEnabled;
+    doc["currentVersion"] = String(FIRMWARE_VERSION);
+    doc["latestVersion"] = autoOtaLatestVersion;
+    doc["latestUrl"] = autoOtaLatestUrl;
+    doc["latestNotes"] = autoOtaLatestNotes;
+    doc["lastCheckStatus"] = autoOtaLastCheckStatus;
+    doc["checkIntervalSec"] = settings.autoOtaCheckInterval;
+    doc["updateInProgress"] = autoOtaUpdateInProgress;
+    doc["otaUrl"] = settings.autoOtaUrl;
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // Auto OTA check-now endpoint (check only, don't apply)
+  server.on("/api/auto-ota/check", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    if (autoOtaUpdateInProgress) {
+      request->send(409, "application/json", "{\"error\":\"update already in progress\"}");
+      return;
+    }
+    bool found = checkAutoOtaUpdate(false);
+    JsonDocument doc;
+    doc["updateAvailable"] = found;
+    doc["currentVersion"] = String(FIRMWARE_VERSION);
+    doc["latestVersion"] = autoOtaLatestVersion;
+    doc["latestNotes"] = autoOtaLatestNotes;
+    doc["status"] = autoOtaLastCheckStatus;
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // Auto OTA apply-now endpoint (download and flash)
+  server.on("/api/auto-ota/apply", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    if (autoOtaUpdateInProgress) {
+      request->send(409, "application/json", "{\"error\":\"update already in progress\"}");
+      return;
+    }
+    request->send(200, "application/json", "{\"status\":\"starting update\"}");
+    // Run the update after responding (will reboot on success)
+    checkAutoOtaUpdate(true);
   });
 
   server.begin();
@@ -4695,6 +4926,169 @@ static void startWifiConnectAttempt(bool restoreCaptiveOnFail) {
   wifiAttemptInProgress = true;
   wifiAttemptStartMs = millis();
   setupWiFi(false);
+}
+
+// ============================================
+// Auto OTA Update from Web Server
+// ============================================
+
+// Compare semantic version strings: returns >0 if b > a, 0 if equal, <0 if a > b
+static int compareSemVer(const String &a, const String &b) {
+  int aMajor = 0, aMinor = 0, aPatch = 0;
+  int bMajor = 0, bMinor = 0, bPatch = 0;
+  sscanf(a.c_str(), "%d.%d.%d", &aMajor, &aMinor, &aPatch);
+  sscanf(b.c_str(), "%d.%d.%d", &bMajor, &bMinor, &bPatch);
+  if (bMajor != aMajor) return bMajor - aMajor;
+  if (bMinor != aMinor) return bMinor - aMinor;
+  return bPatch - aPatch;
+}
+
+// Check remote server for a firmware update and optionally apply it
+// Returns true if an update was found (whether or not it was applied)
+static bool checkAutoOtaUpdate(bool applyIfAvailable) {
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    Serial.println("[AutoOTA] WiFi not connected, skipping check");
+    autoOtaLastCheckStatus = "no-wifi";
+    return false;
+  }
+  if (settings.autoOtaUrl.length() == 0) {
+    Serial.println("[AutoOTA] No OTA URL configured");
+    autoOtaLastCheckStatus = "no-url";
+    return false;
+  }
+
+  String versionUrl = settings.autoOtaUrl;
+  // Ensure URL ends with /version.json
+  if (!versionUrl.endsWith("/version.json")) {
+    if (!versionUrl.endsWith("/")) versionUrl += "/";
+    versionUrl += "version.json";
+  }
+
+  Serial.printf("[AutoOTA] Checking for updates: %s\n", versionUrl.c_str());
+
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+  bool isSecure = versionUrl.startsWith("https://");
+
+  if (isSecure) {
+    secureClient.setInsecure();  // Skip certificate validation
+    http.begin(secureClient, versionUrl);
+  } else {
+    http.begin(plainClient, versionUrl);
+  }
+  http.setTimeout(15000);
+
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    Serial.printf("[AutoOTA] Version check failed, HTTP %d\n", httpCode);
+    http.end();
+    autoOtaLastCheckStatus = "http-error-" + String(httpCode);
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[AutoOTA] Failed to parse version.json: %s\n", err.c_str());
+    autoOtaLastCheckStatus = "parse-error";
+    return false;
+  }
+
+  String remoteVersion = doc["version"] | "";
+  String firmwareUrl = doc["url"] | "";
+  String notes = doc["notes"] | "";
+
+  if (remoteVersion.length() == 0) {
+    Serial.println("[AutoOTA] No version field in version.json");
+    autoOtaLastCheckStatus = "no-version";
+    return false;
+  }
+
+  autoOtaLatestVersion = remoteVersion;
+  autoOtaLatestNotes = notes;
+
+  String currentVersion = String(FIRMWARE_VERSION);
+  Serial.printf("[AutoOTA] Current: %s, Remote: %s\n", currentVersion.c_str(), remoteVersion.c_str());
+
+  int cmp = compareSemVer(currentVersion, remoteVersion);
+  if (cmp <= 0) {
+    Serial.println("[AutoOTA] Firmware is up to date");
+    autoOtaLastCheckStatus = "up-to-date";
+    autoOtaLatestUrl = "";
+    return false;
+  }
+
+  Serial.printf("[AutoOTA] Update available: %s -> %s\n", currentVersion.c_str(), remoteVersion.c_str());
+  if (notes.length() > 0) {
+    Serial.printf("[AutoOTA] Release notes: %s\n", notes.c_str());
+  }
+
+  // Resolve firmware download URL
+  if (firmwareUrl.length() == 0) {
+    // Default: same base path as version.json but with firmware.bin
+    firmwareUrl = settings.autoOtaUrl;
+    if (!firmwareUrl.endsWith("/")) firmwareUrl += "/";
+    firmwareUrl += "firmware.bin";
+  }
+  autoOtaLatestUrl = firmwareUrl;
+  autoOtaLastCheckStatus = "update-available";
+
+  if (!applyIfAvailable) {
+    return true;
+  }
+
+  // --- Download and flash the firmware ---
+  Serial.printf("[AutoOTA] Downloading firmware from: %s\n", firmwareUrl.c_str());
+  autoOtaUpdateInProgress = true;
+  autoOtaLastCheckStatus = "updating";
+
+  WiFiClient *updateClient;
+  WiFiClientSecure secureUpdateClient;
+  WiFiClient plainUpdateClient;
+  bool firmwareIsSecure = firmwareUrl.startsWith("https://");
+
+  if (firmwareIsSecure) {
+    secureUpdateClient.setInsecure();
+    updateClient = &secureUpdateClient;
+  } else {
+    updateClient = &plainUpdateClient;
+  }
+
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(false);  // We'll reboot ourselves after logging
+
+  t_httpUpdate_return ret = httpUpdate.update(*updateClient, firmwareUrl);
+
+  autoOtaUpdateInProgress = false;
+
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      Serial.printf("[AutoOTA] Update successful! %s -> %s. Rebooting...\n",
+                    currentVersion.c_str(), remoteVersion.c_str());
+      autoOtaLastCheckStatus = "update-success";
+      delay(500);
+      ESP.restart();
+      return true;
+
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("[AutoOTA] Update failed: %s (error %d)\n",
+                    httpUpdate.getLastErrorString().c_str(), httpUpdate.getLastError());
+      autoOtaLastCheckStatus = "update-failed";
+      return true;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("[AutoOTA] Server reported no update available");
+      autoOtaLastCheckStatus = "no-update";
+      return false;
+
+    default:
+      autoOtaLastCheckStatus = "unknown-error";
+      return false;
+  }
 }
 
 // ============================================
@@ -4820,6 +5214,16 @@ void loop() {
   
   // Check all services periodically
   checkAllServices();
+
+  // Periodic auto-OTA check
+  if (settings.autoOtaEnabled && !captivePortalActive && !autoOtaUpdateInProgress) {
+    unsigned long intervalMs = (unsigned long)settings.autoOtaCheckInterval * 1000UL;
+    if (intervalMs < 60000UL) intervalMs = 3600000UL;
+    if (autoOtaLastCheckMs == 0 || (millis() - autoOtaLastCheckMs >= intervalMs)) {
+      autoOtaLastCheckMs = millis();
+      checkAutoOtaUpdate(true);  // Check and apply if available
+    }
+  }
   
   delay(10);
 }
@@ -5077,10 +5481,12 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   
   // We handle PAYLOAD_TYPE_TXT (0x02), PAYLOAD_TYPE_GRP_TXT (0x05), PAYLOAD_TYPE_ADVERT (0x04),
-  // PAYLOAD_TYPE_PATH (0x08), PAYLOAD_TYPE_REQ (0x00), and PAYLOAD_TYPE_RESPONSE (0x01)
+  // PAYLOAD_TYPE_PATH (0x08), PAYLOAD_TYPE_REQ (0x00), PAYLOAD_TYPE_RESPONSE (0x01),
+  // and PAYLOAD_TYPE_ANON_REQ (0x07)
   if (payloadType != PAYLOAD_TYPE_TXT && payloadType != PAYLOAD_TYPE_GRP_TXT && 
       payloadType != PAYLOAD_TYPE_ADVERT && payloadType != PAYLOAD_TYPE_PATH &&
-      payloadType != PAYLOAD_TYPE_REQ && payloadType != PAYLOAD_TYPE_RESPONSE) {
+      payloadType != PAYLOAD_TYPE_REQ && payloadType != PAYLOAD_TYPE_RESPONSE &&
+      payloadType != PAYLOAD_TYPE_ANON_REQ) {
     Serial.printf("Unsupported payload type: %d\n", payloadType);
     return;
   }
@@ -5232,6 +5638,122 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     text = String(textMessage);
     Serial.printf("[LoRa][%s] Group message: %s\n", matchedChannelName.c_str(), text.c_str());
     
+  } else if (payloadType == PAYLOAD_TYPE_ANON_REQ) {
+    // Anonymous request: [destHash(1)][senderPubKey(32)][MAC(2) + ciphertext]
+    // Sender includes their full 32-byte Ed25519 public key instead of a 1-byte srcHash
+    Serial.println("Processing as ANON_REQ (anonymous request with embedded public key)");
+
+    size_t minAnonSize = 1 + 32 + CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE;
+    if ((messageLen - idx) < minAnonSize) {
+      Serial.printf("ANON_REQ too short: have %d bytes after path, need at least %d\n",
+                    (int)(messageLen - idx), (int)minAnonSize);
+      return;
+    }
+    uint8_t destHash = message[idx++];
+
+    // Extract sender's full 32-byte Ed25519 public key
+    static uint8_t anonSenderPub[32];
+    memcpy(anonSenderPub, message + idx, 32);
+    idx += 32;
+
+    senderHash = anonSenderPub[0];
+    Serial.printf("ANON_REQ: destHash=0x%02X senderPubKey=%02X%02X%02X%02X... (our hash=0x%02X)\n",
+                  destHash, anonSenderPub[0], anonSenderPub[1], anonSenderPub[2], anonSenderPub[3], ourNodeHash);
+
+    // Check if message is addressed to us
+    uint8_t pubKeyFirstByte = ed25519_public_key[0];
+    bool isForUs = (destHash == pubKeyFirstByte || destHash == ourNodeHashAlt);
+    if (!isForUs) {
+      Serial.printf("ANON_REQ not addressed to us; ignoring (dest=0x%02X)\n", destHash);
+      return;
+    }
+
+    Serial.println("ANON_REQ is for us! Adding sender to peer cache...");
+
+    // Add sender to peer cache (and advert cache for persistence)
+    upsertPeer(anonSenderPub[0], anonSenderPub, String(""), (uint32_t)time(nullptr));
+    updateAdvertCache(anonSenderPub, String(""), (uint32_t)time(nullptr));
+    senderPubKey = anonSenderPub;
+
+    uint8_t shared[32];
+    if (!deriveSharedSecretWithPeer(senderPubKey, shared)) {
+      Serial.println("Failed to derive shared secret for ANON_REQ");
+      return;
+    }
+    memcpy(channelKey, shared, 32);
+    channelKeyLen = 32;
+
+    // Decrypt
+    size_t encryptedLen = messageLen - idx;
+    Serial.printf("ANON_REQ encrypted payload length: %d bytes\n", (int)encryptedLen);
+
+    size_t minEncryptedLen = CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE;
+    if (encryptedLen < minEncryptedLen) {
+      Serial.printf("ANON_REQ payload too short (need %d, got %d)\n", (int)minEncryptedLen, (int)encryptedLen);
+      return;
+    }
+
+    const uint8_t* encrypted = message + idx;
+    uint8_t decrypted[256];
+
+    size_t decryptedLen = verifyAndDecrypt(channelKey, channelKeyLen, decrypted, encrypted, encryptedLen);
+    if (decryptedLen == 0) {
+      uint8_t derivedKey[32];
+      deriveDirectKeyFromShared(shared, derivedKey);
+      decryptedLen = verifyAndDecrypt(derivedKey, 32, decrypted, encrypted, encryptedLen);
+      if (decryptedLen > 0) {
+        Serial.println("[LoRa] ANON_REQ decrypted using SHA-256 derived key");
+      }
+    }
+
+    if (decryptedLen == 0) {
+      Serial.println("ANON_REQ decryption or MAC verification failed");
+      return;
+    }
+
+    Serial.printf("ANON_REQ decrypted %d bytes successfully\n", (int)decryptedLen);
+
+    // Parse as REQ payload — for now log and send our advert so peer can reach us next time
+    Serial.printf("[LoRa] Received ANON_REQ from peer (pubkey=%02X%02X...), %d decrypted bytes\n",
+                  anonSenderPub[0], anonSenderPub[1], (int)decryptedLen);
+    Serial.println("Sending our advert so peer can send direct messages next time...");
+    sendBootAdvert();
+
+    // If the decrypted payload looks like a TXT message (timestamp + type + text), extract it
+    if (decryptedLen >= 5) {
+      uint32_t timestamp = decrypted[0] | (decrypted[1] << 8) | (decrypted[2] << 16) | (decrypted[3] << 24);
+      uint8_t txtType = decrypted[4];
+      size_t textLen = decryptedLen - 5;
+      char textMessage[256];
+      memcpy(textMessage, &decrypted[5], textLen);
+      textMessage[textLen] = '\0';
+
+      // Strip trailing null padding
+      for (int i = textLen - 1; i >= 0; i--) {
+        if (textMessage[i] == '\0') continue;
+        break;
+      }
+
+      // Send ACK
+      size_t rawTextLen = strlen((const char*)&decrypted[5]);
+      uint8_t txtTypeFlags = (txtType >> 2) & 0x3F;
+      if (txtTypeFlags == TXT_TYPE_PLAIN && senderPubKey != nullptr) {
+        size_t ackDataLen = 5 + rawTextLen;
+        if (ackDataLen <= decryptedLen) {
+          uint32_t ackHash = computeAckHash(decrypted, ackDataLen, senderPubKey);
+          sendLoRaAck(ackHash, replyPath, replyPathLen);
+        }
+      }
+
+      matchedChannelName = "Direct";
+      text = String(textMessage);
+      Serial.printf("[LoRa][Direct/ANON_REQ] Message: %s\n", text.c_str());
+    } else {
+      Serial.println("ANON_REQ payload too short for text extraction");
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+
   } else if (payloadType == PAYLOAD_TYPE_TXT || payloadType == PAYLOAD_TYPE_PATH ||
              payloadType == PAYLOAD_TYPE_REQ || payloadType == PAYLOAD_TYPE_RESPONSE) {
     // Direct/peer messages: [destHash(1)][srcHash(1)][MAC(2) + ciphertext]
@@ -5274,11 +5796,83 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       Serial.printf("Sender resolved from cache (hash=pubkey[0]) pubkey=%02X%02X%02X%02X...\n",
                     senderPubKey[0], senderPubKey[1], senderPubKey[2], senderPubKey[3]);
     } else {
-      Serial.printf("Unknown sender for direct message (srcHash=0x%02X not in cache)\n", srcHash);
-      Serial.println("MeshCore TXT messages do not include sender pubkey; awaiting advert to decrypt.");
-      Serial.println("Sending our advert to establish peer relationship...");
-      sendBootAdvert();
-      return;
+      // Sender not in peer/advert cache — try configured direct nodes by matching srcHash
+      Serial.printf("Sender not in cache (srcHash=0x%02X). Trying configured direct nodes...\n", srcHash);
+      static uint8_t directNodePubkey[32];  // static to persist beyond this scope
+      bool foundViaDirectNode = false;
+
+      for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+        const String &pubHex = settings.loraDirectNodes[i].pubkeyHex;
+        if (pubHex.length() == 0) continue;
+
+        uint8_t candidatePub[32];
+        if (!parseHexKeyToBytes(pubHex, candidatePub)) continue;
+
+        uint8_t candidateHash = candidatePub[0];
+        uint8_t candidateAltHash = computeNodeHashSha256(candidatePub);
+
+        if (srcHash == candidateHash || srcHash == candidateAltHash) {
+          String label = settings.loraDirectNodes[i].name;
+          if (label.length() == 0) label = String("node-") + String(i + 1);
+          Serial.printf("Matched configured direct node '%s' (pubkey[0]=0x%02X)\n", label.c_str(), candidateHash);
+
+          memcpy(directNodePubkey, candidatePub, 32);
+          // Add to peer + advert cache for future messages
+          upsertPeer(candidatePub[0], candidatePub, label, (uint32_t)time(nullptr));
+          updateAdvertCache(candidatePub, label, (uint32_t)time(nullptr));
+
+          senderPubKey = directNodePubkey;
+          foundViaDirectNode = true;
+          break;
+        }
+      }
+
+      if (!foundViaDirectNode) {
+        // Last resort: brute-force try each configured direct node's key for decryption
+        Serial.println("No hash match. Trying all configured direct nodes by decryption...");
+        const uint8_t* encrypted = message + idx;
+        size_t encryptedLen = messageLen - idx;
+
+        for (int i = 0; i < settings.loraDirectNodeCount; i++) {
+          const String &pubHex = settings.loraDirectNodes[i].pubkeyHex;
+          if (pubHex.length() == 0) continue;
+
+          uint8_t candidatePub[32];
+          if (!parseHexKeyToBytes(pubHex, candidatePub)) continue;
+
+          uint8_t tryShared[32];
+          if (!deriveSharedSecretWithPeer(candidatePub, tryShared)) continue;
+
+          uint8_t tryDecrypted[256];
+          size_t tryLen = verifyAndDecrypt(tryShared, 32, tryDecrypted, encrypted, encryptedLen);
+          if (tryLen == 0) {
+            uint8_t derivedKey[32];
+            deriveDirectKeyFromShared(tryShared, derivedKey);
+            tryLen = verifyAndDecrypt(derivedKey, 32, tryDecrypted, encrypted, encryptedLen);
+          }
+
+          if (tryLen > 0) {
+            String label = settings.loraDirectNodes[i].name;
+            if (label.length() == 0) label = String("node-") + String(i + 1);
+            Serial.printf("Decryption succeeded with configured node '%s'!\n", label.c_str());
+
+            memcpy(directNodePubkey, candidatePub, 32);
+            upsertPeer(candidatePub[0], candidatePub, label, (uint32_t)time(nullptr));
+            updateAdvertCache(candidatePub, label, (uint32_t)time(nullptr));
+
+            senderPubKey = directNodePubkey;
+            foundViaDirectNode = true;
+            break;
+          }
+        }
+      }
+
+      if (!foundViaDirectNode) {
+        Serial.printf("Unknown sender for direct message (srcHash=0x%02X not resolved)\n", srcHash);
+        Serial.println("Sending our advert to establish peer relationship...");
+        sendBootAdvert();
+        return;
+      }
     }
 
     uint8_t shared[32];
@@ -5421,6 +6015,14 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   // Check if this is our own message by checking if the message starts with our node name
   if (msgStr.startsWith(ourNodeName + ":")) {
     Serial.println("This is our own message, not forwarding to notification services");
+    Serial.println("=== Packet Processing Complete ===\n");
+    return;
+  }
+  
+  // Only process direct messages and messages from the configured channel.
+  // Public channel messages are monitored for logging but NOT relayed or acted upon.
+  if (matchedChannelName == "Public") {
+    Serial.println("[LoRa] Public channel message ignored (not relaying to notification services)");
     Serial.println("=== Packet Processing Complete ===\n");
     return;
   }
