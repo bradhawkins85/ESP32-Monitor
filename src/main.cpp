@@ -124,6 +124,13 @@ struct Service {
   unsigned long lastPush;
   // Pause fields
   unsigned long pauseUntil;
+  // Per-service alert channel overrides (true = use this channel if globally enabled)
+  bool alertLora;
+  bool alertNtfy;
+  bool alertDiscord;
+  bool alertWebhook;
+  bool alertEmail;
+  bool alertMqtt;
 };
 
 // ============================================
@@ -1634,6 +1641,13 @@ void saveServices() {
     svc["uptimeThreshold"] = services[i].uptimeThreshold;
     svc["uptimeCompareOp"] = (int)services[i].uptimeCompareOp;
     svc["pushToken"] = services[i].pushToken;
+    // Per-service alert channel overrides
+    svc["alertLora"] = services[i].alertLora;
+    svc["alertNtfy"] = services[i].alertNtfy;
+    svc["alertDiscord"] = services[i].alertDiscord;
+    svc["alertWebhook"] = services[i].alertWebhook;
+    svc["alertEmail"] = services[i].alertEmail;
+    svc["alertMqtt"] = services[i].alertMqtt;
   }
   
   serializeJson(doc, file);
@@ -1695,6 +1709,13 @@ void loadServices() {
     services[serviceCount].uptimeThreshold = svc["uptimeThreshold"].as<int>();
     services[serviceCount].uptimeCompareOp = (CompareOp)svc["uptimeCompareOp"].as<int>();
     services[serviceCount].pushToken = svc["pushToken"].as<String>();
+    // Per-service alert channel overrides (default true for backward compatibility)
+    services[serviceCount].alertLora = svc["alertLora"].isNull() ? true : svc["alertLora"].as<bool>();
+    services[serviceCount].alertNtfy = svc["alertNtfy"].isNull() ? true : svc["alertNtfy"].as<bool>();
+    services[serviceCount].alertDiscord = svc["alertDiscord"].isNull() ? true : svc["alertDiscord"].as<bool>();
+    services[serviceCount].alertWebhook = svc["alertWebhook"].isNull() ? true : svc["alertWebhook"].as<bool>();
+    services[serviceCount].alertEmail = svc["alertEmail"].isNull() ? true : svc["alertEmail"].as<bool>();
+    services[serviceCount].alertMqtt = svc["alertMqtt"].isNull() ? true : svc["alertMqtt"].as<bool>();
 
     if (services[serviceCount].type == TYPE_PUSH && services[serviceCount].pushToken.length() == 0) {
       services[serviceCount].pushToken = generatePushToken();
@@ -1737,6 +1758,12 @@ void initDemoServices() {
   httpSvc.hasBeenUp = false;
   httpSvc.isPending = true;
   httpSvc.lastCheck = 0;
+  httpSvc.alertLora = true;
+  httpSvc.alertNtfy = true;
+  httpSvc.alertDiscord = true;
+  httpSvc.alertWebhook = true;
+  httpSvc.alertEmail = true;
+  httpSvc.alertMqtt = true;
   services[serviceCount++] = httpSvc;
 
   // Example Ping service
@@ -1755,6 +1782,12 @@ void initDemoServices() {
   pingSvc.hasBeenUp = false;
   pingSvc.isPending = true;
   pingSvc.lastCheck = 0;
+  pingSvc.alertLora = true;
+  pingSvc.alertNtfy = true;
+  pingSvc.alertDiscord = true;
+  pingSvc.alertWebhook = true;
+  pingSvc.alertEmail = true;
+  pingSvc.alertMqtt = true;
   services[serviceCount++] = pingSvc;
 
   // Example SNMP service (stub)
@@ -1777,6 +1810,12 @@ void initDemoServices() {
   snmpSvc.hasBeenUp = false;
   snmpSvc.isPending = true;
   snmpSvc.lastCheck = 0;
+  snmpSvc.alertLora = true;
+  snmpSvc.alertNtfy = true;
+  snmpSvc.alertDiscord = true;
+  snmpSvc.alertWebhook = true;
+  snmpSvc.alertEmail = true;
+  snmpSvc.alertMqtt = true;
   services[serviceCount++] = snmpSvc;
 }
 
@@ -1863,7 +1902,28 @@ String getServicesJson() {
     obj["checkInterval"] = services[i].checkInterval;
     obj["passThreshold"] = services[i].passThreshold;
     obj["failThreshold"] = services[i].failThreshold;
+    obj["alertLora"] = services[i].alertLora;
+    obj["alertNtfy"] = services[i].alertNtfy;
+    obj["alertDiscord"] = services[i].alertDiscord;
+    obj["alertWebhook"] = services[i].alertWebhook;
+    obj["alertEmail"] = services[i].alertEmail;
+    obj["alertMqtt"] = services[i].alertMqtt;
   }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+// Helper: which alert channels are globally enabled (for UI)
+String getGlobalAlertChannelsJson() {
+  DynamicJsonDocument doc(256);
+  JsonObject obj = doc.to<JsonObject>();
+  obj["lora"] = settings.loraEnabled;
+  obj["ntfy"] = settings.ntfyEnabled;
+  obj["discord"] = settings.discordEnabled;
+  obj["webhook"] = settings.webhookEnabled;
+  obj["email"] = settings.emailEnabled;
+  obj["mqtt"] = settings.mqttEnabled;
   String json;
   serializeJson(doc, json);
   return json;
@@ -2984,16 +3044,29 @@ void updateServiceStatus(Service& service, bool checkResult) {
     }
   }
   
-  // Send LoRa notification on status change (but not for initial pending -> up/down transition)
+  // Send notifications on status change (but not for initial pending -> up/down transition)
   if (wasUp != service.isUp && !wasPending) {
     appendServiceStatusEvent(service, service.isUp);
-    if (service.isUp) {
-      Serial.printf("[Status] %s is now UP\n", service.name.c_str());
-      sendLoRaNotification(service.name, true, service.lastError);
-    } else {
-      Serial.printf("[Status] %s is now DOWN\n", service.name.c_str());
-      sendLoRaNotification(service.name, false, service.lastError);
+    String statusStr = service.isUp ? "UP" : "DOWN";
+    Serial.printf("[Status] %s is now %s\n", service.name.c_str(), statusStr.c_str());
+    String alertMsg = "[Monitor] " + service.name + ": " + statusStr;
+    if (service.lastError.length() > 0) {
+      alertMsg += " - " + service.lastError;
     }
+
+    // LoRa channel notification
+    if (service.alertLora) {
+      sendLoRaNotification(service.name, service.isUp, service.lastError);
+    }
+
+    // Internet channel notifications (per-service overrides)
+    String messageId = messageIdForBody(alertMsg);
+    String bodyWithId = addMessageIdPrefix(alertMsg, messageId);
+    if (service.alertNtfy && settings.ntfyEnabled) forwardToNtfy(bodyWithId);
+    if (service.alertDiscord && settings.discordEnabled) forwardToDiscord(bodyWithId);
+    if (service.alertWebhook && settings.webhookEnabled) forwardToWebhook(bodyWithId);
+    if (service.alertEmail && settings.emailEnabled) forwardToEmail(bodyWithId);
+    if (service.alertMqtt && settings.mqttEnabled) forwardToMqtt(alertMsg);
   } else if (wasPending && !service.isPending) {
     Serial.printf("[Status] %s initial state: %s\n", service.name.c_str(), service.isUp ? "UP" : "DOWN");
   }
@@ -4294,6 +4367,17 @@ void setup() {
       if (services[i].lastError.length() > 0) {
         html += "<div class='service-error'>" + services[i].lastError + "</div>";
       }
+      // Show enabled alert channels (only show those that are globally enabled)
+      String channels = "";
+      if (settings.loraEnabled && services[i].alertLora) channels += "📡";
+      if (settings.ntfyEnabled && services[i].alertNtfy) channels += "🔔";
+      if (settings.discordEnabled && services[i].alertDiscord) channels += "💬";
+      if (settings.webhookEnabled && services[i].alertWebhook) channels += "🌐";
+      if (settings.emailEnabled && services[i].alertEmail) channels += "📧";
+      if (settings.mqttEnabled && services[i].alertMqtt) channels += "📨";
+      if (channels.length() > 0) {
+        html += "<div class='service-info' style='margin-top:4px;font-size:12px;opacity:0.85'>Alerts: " + channels + "</div>";
+      }
       html += "</div>";
     }
     html += "</div></div>";
@@ -4375,6 +4459,9 @@ void setup() {
     html += "<input type='number' id='servicePassThreshold' class='form-input' value='1'></div></div>";
     html += "<div class='form-group'><label class='form-label'>Fail Threshold</label>";
     html += "<input type='number' id='serviceFailThreshold' class='form-input' value='2'></div>";
+    // Alert channel toggles (only globally-enabled channels shown via JS)
+    html += "<div class='form-group' id='alertChannelsGroup'><label class='form-label'>Alert Channels</label>";
+    html += "<div id='alertChannelsContainer' style='display:flex;flex-wrap:wrap;gap:12px;margin-top:4px'></div></div>";
     html += "<div class='btn-group'>";
     html += "<button type='submit' class='btn btn-primary' style='flex:1'>Save Service</button>";
     html += "<button type='button' class='btn btn-cancel' onclick='closeModal()'>Cancel</button></div>";
@@ -4390,14 +4477,20 @@ void setup() {
     // JavaScript
     html += "<script>";
     html += "const services=" + getServicesJson() + ";";
+    html += "const globalChannels=" + getGlobalAlertChannelsJson() + ";";
     html += "const isAuthed=" + String(isAuthed ? "true" : "false") + ";";
     html += "let modalOpen=false;";
+    // Alert channel rendering helper
+    html += "const channelDefs=[{key:'lora',label:'📡 LoRa',field:'alertLora'},{key:'ntfy',label:'🔔 Ntfy',field:'alertNtfy'},{key:'discord',label:'💬 Discord',field:'alertDiscord'},{key:'webhook',label:'🌐 Webhook',field:'alertWebhook'},{key:'email',label:'📧 Email',field:'alertEmail'},{key:'mqtt',label:'📨 MQTT',field:'alertMqtt'}];";
+    html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]!==false;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';}";
+    html += "function getAlertChannelValues(){const v={};channelDefs.forEach(ch=>{const el=document.getElementById('alert_'+ch.field);v[ch.field]=el?el.checked:true;});return v;}";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
     html += "function setPushDetails(token){const hidden=document.getElementById('servicePushToken');const url=document.getElementById('servicePushUrl');hidden.value=token||'';if(token){url.value=location.origin+'/push/'+token;url.placeholder='';}else{url.value='';url.placeholder='Generated after saving';}}";
     html += "function showAddModal(){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Add Service';";
     html += "document.getElementById('serviceForm').reset();document.getElementById('serviceIndex').value='-1';setPushDetails('');";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
+    html += "renderAlertChannels({});";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show');modalOpen=false;}";
 
@@ -4437,6 +4530,7 @@ void setup() {
     html += "document.getElementById('servicePassThreshold').value=s.passThreshold;";
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
     html += "updateFieldVisibility(s.type);";
+    html += "renderAlertChannels(s);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
     html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
@@ -4458,6 +4552,7 @@ void setup() {
     html += "checkInterval:parseInt(document.getElementById('serviceCheckInterval').value),";
     html += "passThreshold:parseInt(document.getElementById('servicePassThreshold').value),";
     html += "failThreshold:parseInt(document.getElementById('serviceFailThreshold').value)};";
+    html += "Object.assign(data,getAlertChannelValues());";
     html += "const idx=document.getElementById('serviceIndex').value;";
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
     html += "const method=idx==='-1'?'POST':'PUT';";
@@ -4643,6 +4738,12 @@ void setup() {
       obj["uptimeThreshold"] = services[i].uptimeThreshold;
       obj["uptimeCompareOp"] = services[i].uptimeCompareOp;
       obj["pushToken"] = services[i].pushToken;
+      obj["alertLora"] = services[i].alertLora;
+      obj["alertNtfy"] = services[i].alertNtfy;
+      obj["alertDiscord"] = services[i].alertDiscord;
+      obj["alertWebhook"] = services[i].alertWebhook;
+      obj["alertEmail"] = services[i].alertEmail;
+      obj["alertMqtt"] = services[i].alertMqtt;
     }
     String json;
     serializeJson(doc, json);
@@ -4689,6 +4790,12 @@ void setup() {
             svc.uptimeThreshold = obj["uptimeThreshold"].as<int>();
             svc.uptimeCompareOp = (CompareOp)obj["uptimeCompareOp"].as<int>();
             svc.pushToken = obj["pushToken"].as<String>();
+            svc.alertLora = obj["alertLora"].isNull() ? true : obj["alertLora"].as<bool>();
+            svc.alertNtfy = obj["alertNtfy"].isNull() ? true : obj["alertNtfy"].as<bool>();
+            svc.alertDiscord = obj["alertDiscord"].isNull() ? true : obj["alertDiscord"].as<bool>();
+            svc.alertWebhook = obj["alertWebhook"].isNull() ? true : obj["alertWebhook"].as<bool>();
+            svc.alertEmail = obj["alertEmail"].isNull() ? true : obj["alertEmail"].as<bool>();
+            svc.alertMqtt = obj["alertMqtt"].isNull() ? true : obj["alertMqtt"].as<bool>();
             svc.consecutivePasses = 0;
             svc.consecutiveFails = 0;
             svc.isUp = false;
@@ -4738,6 +4845,12 @@ void setup() {
       svc.checkInterval = doc["checkInterval"].as<int>();
       svc.passThreshold = doc["passThreshold"].as<int>();
       svc.failThreshold = doc["failThreshold"].as<int>();
+      svc.alertLora = doc["alertLora"].isNull() ? true : doc["alertLora"].as<bool>();
+      svc.alertNtfy = doc["alertNtfy"].isNull() ? true : doc["alertNtfy"].as<bool>();
+      svc.alertDiscord = doc["alertDiscord"].isNull() ? true : doc["alertDiscord"].as<bool>();
+      svc.alertWebhook = doc["alertWebhook"].isNull() ? true : doc["alertWebhook"].as<bool>();
+      svc.alertEmail = doc["alertEmail"].isNull() ? true : doc["alertEmail"].as<bool>();
+      svc.alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
       if (svc.type == TYPE_PUSH && svc.pushToken.length() == 0) {
         svc.pushToken = generatePushToken();
       }
@@ -4788,6 +4901,12 @@ void setup() {
       services[idx].checkInterval = doc["checkInterval"].as<int>();
       services[idx].passThreshold = doc["passThreshold"].as<int>();
       services[idx].failThreshold = doc["failThreshold"].as<int>();
+      services[idx].alertLora = doc["alertLora"].isNull() ? true : doc["alertLora"].as<bool>();
+      services[idx].alertNtfy = doc["alertNtfy"].isNull() ? true : doc["alertNtfy"].as<bool>();
+      services[idx].alertDiscord = doc["alertDiscord"].isNull() ? true : doc["alertDiscord"].as<bool>();
+      services[idx].alertWebhook = doc["alertWebhook"].isNull() ? true : doc["alertWebhook"].as<bool>();
+      services[idx].alertEmail = doc["alertEmail"].isNull() ? true : doc["alertEmail"].as<bool>();
+      services[idx].alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
       saveServices();  // Persist to LittleFS
       request->send(200, "text/plain", "Service updated");
   });
