@@ -570,6 +570,7 @@ Settings settings;
 static const char* CREDENTIALS_FILE = "/credentials.json";
 static String generatedAdminPassword;
 static String generatedHotspotPassword;
+static String generatedLoraCommandPin;
 
 static String generateRandomPassword(int length = 12) {
   const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -578,6 +579,16 @@ static String generateRandomPassword(int length = 12) {
   for (int i = 0; i < length; i++) {
     uint32_t r = esp_random();
     result += charset[r % (sizeof(charset) - 1)];
+  }
+  return result;
+}
+
+static String generateRandomPin(int length = 4) {
+  String result;
+  result.reserve(length);
+  for (int i = 0; i < length; i++) {
+    uint32_t r = esp_random();
+    result += String((char)('0' + (r % 10)));
   }
   return result;
 }
@@ -592,6 +603,7 @@ static void loadOrGenerateCredentials() {
       if (!err) {
         generatedAdminPassword = doc["admin_password"] | "";
         generatedHotspotPassword = doc["hotspot_password"] | "";
+        generatedLoraCommandPin = doc["lora_command_pin"] | "";
       }
     }
   }
@@ -607,6 +619,11 @@ static void loadOrGenerateCredentials() {
     needsWrite = true;
     Serial.println("[Credentials] Generated new hotspot password");
   }
+  if (generatedLoraCommandPin.length() == 0) {
+    generatedLoraCommandPin = generateRandomPin(4);
+    needsWrite = true;
+    Serial.println("[Credentials] Generated new LoRa command PIN");
+  }
 
   if (needsWrite) {
     File f = LittleFS.open(CREDENTIALS_FILE, "w");
@@ -614,6 +631,7 @@ static void loadOrGenerateCredentials() {
       JsonDocument doc;
       doc["admin_password"] = generatedAdminPassword;
       doc["hotspot_password"] = generatedHotspotPassword;
+      doc["lora_command_pin"] = generatedLoraCommandPin;
       serializeJson(doc, f);
       f.close();
       Serial.println("[Credentials] Saved to filesystem");
@@ -658,7 +676,7 @@ Settings defaultSettingsFromBuild() {
   s.loraEnabled = (LORA_ENABLED != 0);
   s.loraIpAlerts = (LORA_IP_ALERTS != 0);
   s.loraNodeName = String(LORA_NODE_NAME);
-  s.loraCommandPin = String(LORA_COMMAND_PIN);
+  s.loraCommandPin = "";  // Will be set from generated credentials
   s.loraFreq = (float)LORA_FREQ;
   s.loraBandwidth = (float)LORA_BANDWIDTH;
   s.loraSpreadingFactor = (int)LORA_SPREADING_FACTOR;
@@ -3441,6 +3459,7 @@ void setup() {
   loadOrGenerateCredentials();
   settings.adminPassword = generatedAdminPassword;
   settings.hotspotPassword = generatedHotspotPassword;
+  settings.loraCommandPin = generatedLoraCommandPin;
 
   // Apply user overrides from settings.json (may override generated admin password)
   loadSettingsOverrides();
@@ -3455,7 +3474,13 @@ void setup() {
     Serial.printf("  Hotspot Password: %s\n", settings.hotspotPassword.c_str());
     Serial.printf("  Hotspot IP:       %s\n", HOTSPOT_IP);
     Serial.printf("  Admin Password:   %s\n", settings.adminPassword.c_str());
+    Serial.printf("  LoRa Command PIN: %s\n", settings.loraCommandPin.c_str());
     Serial.println("-------------------------------------------\n");
+
+    // Auto-disable after showing once; admin must re-enable to see again
+    settings.showBootCredentials = false;
+    saveSettingsOverrides();
+    Serial.println("[Credentials] Boot credential display auto-disabled.");
   }
 
   // Setup WiFi (needed for forwarding and NTP sync)
@@ -3909,7 +3934,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>Username</label><input id='ADMIN_USERNAME' value='" + settings.adminUsername + "'></div>";
     page += "<div class='fg'><label class='lbl'>Password</label><input id='ADMIN_PASSWORD' type='password' value='' placeholder='(unchanged)'></div>";
     page += "<div class='fg'><label class='lbl'>Show Boot Credentials</label><select id='SHOW_BOOT_CREDENTIALS'><option value='true'" + String(settings.showBootCredentials ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.showBootCredentials ? " selected" : "") + ">No</option></select></div>";
-    page += "<div class='hint'>When enabled, Hotspot Name, Password, IP and Admin Password are printed to the serial monitor on each boot.</div>";
+    page += "<div class='hint'>When enabled, Hotspot Name, Password, IP, Admin Password and LoRa Command PIN are printed to the serial monitor on each boot.</div>";
     page += "</div></div>";
 
     page += "<div class='card'><h2>LoRa / MeshCore</h2><div class='row'>";
