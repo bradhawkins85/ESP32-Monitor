@@ -349,7 +349,7 @@
 #endif
 
 #ifndef AUTO_OTA_URL
-#define AUTO_OTA_URL ""  // Base URL for firmware (e.g. https://example.com/firmware)
+#define AUTO_OTA_URL "https://github.com/bradhawkins85/ESP32-Monitor/releases/latest/download"  // GitHub Releases OTA
 #endif
 
 #ifndef AUTO_OTA_CHECK_INTERVAL

@@ -1,0 +1,80 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0, v1.2.3, etc.
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Strip 'v' prefix from tag: v1.0.1 -> 1.0.1
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building firmware version: $VERSION"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          pip install platformio
+
+      - name: Create CI .env
+        run: |
+          cat > .env << EOF
+          FIRMWARE_VERSION=${{ steps.version.outputs.version }}
+          AUTO_OTA_ENABLED=true
+          AUTO_OTA_URL=https://github.com/${{ github.repository }}/releases/latest/download
+          AUTO_OTA_CHECK_INTERVAL=3600
+          EOF
+
+      - name: Build firmware
+        run: |
+          pio run --environment heltec-wireless-stick-lite-v3
+
+      - name: Prepare release assets
+        run: |
+          # Copy firmware binary
+          cp .pio/build/heltec-wireless-stick-lite-v3/firmware.bin firmware.bin
+
+          # Create version.json for OTA version checking
+          cat > version.json << EOF
+          {
+            "version": "${{ steps.version.outputs.version }}",
+            "url": "https://github.com/${{ github.repository }}/releases/latest/download/firmware.bin",
+            "notes": "Release ${{ steps.version.outputs.version }}"
+          }
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "v${{ steps.version.outputs.version }}"
+          body: |
+            ## Firmware v${{ steps.version.outputs.version }}
+
+            ### OTA Update
+            Devices with Auto OTA enabled will automatically download this update.
+
+            **OTA URL:** `https://github.com/${{ github.repository }}/releases/latest/download`
+
+            ### Manual Flash
+            Download `firmware.bin` and flash via the device web UI or USB.
+          files: |
+            firmware.bin
+            version.json
+          generate_release_notes: true
