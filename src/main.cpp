@@ -5076,7 +5076,14 @@ void setup() {
     for (int i = 0; i < MAX_PEERS; i++) {
       if (!peers[i].inUse) continue;
       JsonObject p = peersArr.add<JsonObject>();
-      p["name"] = peers[i].name;
+      // Sanitize peer name: strip control characters that break JSON
+      String safeName;
+      safeName.reserve(peers[i].name.length());
+      for (unsigned int c = 0; c < peers[i].name.length(); c++) {
+        char ch = peers[i].name[c];
+        if (ch >= 0x20 && ch != 0x7F) safeName += ch;  // printable ASCII only
+      }
+      p["name"] = safeName;
       p["hash"] = peers[i].hash;
       p["type"] = nodeTypeName(peers[i].nodeType);
       p["typeId"] = peers[i].nodeType;
@@ -5093,6 +5100,7 @@ void setup() {
     doc["usedBytes"] = (unsigned long)LittleFS.usedBytes();
 
     String json;
+    json.reserve(measureJson(doc) + 1);
     serializeJson(doc, json);
     request->send(200, "application/json", json);
   });
@@ -5118,133 +5126,147 @@ void setup() {
   server.on("/lora", HTTP_GET, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
 
-    String page = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>LoRa Stats</title>";
-    page += "<style>";
-    page += "*{margin:0;padding:0;box-sizing:border-box}";
-    page += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px;color:#2d3748}";
-    page += ".container{max-width:1000px;margin:0 auto}";
-    page += ".card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}";
-    page += "h1{font-size:22px;margin-bottom:6px;color:#2d3748}";
-    page += "h2{font-size:16px;margin:0 0 12px;color:#4a5568}";
-    page += ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:16px}";
-    page += ".stat-card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:12px;padding:18px;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06)}";
-    page += ".stat-value{font-size:28px;font-weight:700;color:#2d3748;margin-bottom:2px}";
-    page += ".stat-label{font-size:11px;color:#718096;text-transform:uppercase;letter-spacing:1px}";
-    page += "table{width:100%;border-collapse:collapse;font-size:13px}";
-    page += "th{text-align:left;padding:10px 8px;border-bottom:2px solid #e2e8f0;font-weight:600;color:#4a5568;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}";
-    page += "td{padding:8px;border-bottom:1px solid #edf2f7;color:#2d3748}";
-    page += "tr:hover{background:#f7fafc}";
-    page += ".badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}";
-    page += ".badge-client{background:#ebf4ff;color:#3182ce}";
-    page += ".badge-repeater{background:#fefcbf;color:#b7791f}";
-    page += ".badge-router{background:#c6f6d5;color:#276749}";
-    page += ".badge-unknown{background:#edf2f7;color:#718096}";
-    page += ".badge-ok{background:#c6f6d5;color:#276749}";
-    page += ".badge-fail{background:#fed7d7;color:#c53030}";
-    page += ".badge-sent{background:#e9d8fd;color:#6b46c1}";
-    page += ".badge-recv{background:#bee3f8;color:#2b6cb0}";
-    page += ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:11px}";
-    page += ".btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}";
-    page += ".btn{padding:10px 14px;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-size:13px;text-decoration:none;display:inline-flex;align-items:center;gap:6px}";
-    page += ".primary{background:#667eea;color:#fff}";
-    page += ".secondary{background:#e2e8f0;color:#2d3748}";
-    page += ".danger{background:#fed7d7;color:#c53030}";
-    page += ".truncate{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:middle}";
-    page += ".hint{font-size:12px;color:#718096;margin-top:6px}";
-    page += ".empty{text-align:center;padding:24px;color:#a0aec0;font-size:14px}";
-    page += ".storage-bar{width:100%;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-top:8px}";
-    page += ".storage-fill{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:4px;transition:width 0.3s}";
-    page += "@media(max-width:700px){.stats{grid-template-columns:1fr 1fr}table{font-size:12px}.truncate{max-width:140px}}";
-    page += "</style></head><body><div class='container'>";
+    AsyncResponseStream *response = request->beginResponseStream("text/html");
+
+    // Head + CSS
+    response->print("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>LoRa Stats</title>");
+    response->print("<style>");
+    response->print("*{margin:0;padding:0;box-sizing:border-box}");
+    response->print("body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px;color:#2d3748}");
+    response->print(".container{max-width:1000px;margin:0 auto}");
+    response->print(".card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}");
+    response->print("h1{font-size:22px;margin-bottom:6px;color:#2d3748}");
+    response->print("h2{font-size:16px;margin:0 0 12px;color:#4a5568}");
+    response->print(".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:16px}");
+    response->print(".stat-card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:12px;padding:18px;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06)}");
+    response->print(".stat-value{font-size:28px;font-weight:700;color:#2d3748;margin-bottom:2px}");
+    response->print(".stat-label{font-size:11px;color:#718096;text-transform:uppercase;letter-spacing:1px}");
+    response->print("table{width:100%;border-collapse:collapse;font-size:13px}");
+    response->print("th{text-align:left;padding:10px 8px;border-bottom:2px solid #e2e8f0;font-weight:600;color:#4a5568;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}");
+    response->print("td{padding:8px;border-bottom:1px solid #edf2f7;color:#2d3748}");
+    response->print("tr:hover{background:#f7fafc}");
+    response->print(".badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}");
+    response->print(".badge-client{background:#ebf4ff;color:#3182ce}");
+    response->print(".badge-repeater{background:#fefcbf;color:#b7791f}");
+    response->print(".badge-router{background:#c6f6d5;color:#276749}");
+    response->print(".badge-unknown{background:#edf2f7;color:#718096}");
+    response->print(".badge-ok{background:#c6f6d5;color:#276749}");
+    response->print(".badge-fail{background:#fed7d7;color:#c53030}");
+    response->print(".badge-sent{background:#e9d8fd;color:#6b46c1}");
+    response->print(".badge-recv{background:#bee3f8;color:#2b6cb0}");
+    response->print(".mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:11px}");
+    response->print(".btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}");
+    response->print(".btn{padding:10px 14px;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-size:13px;text-decoration:none;display:inline-flex;align-items:center;gap:6px}");
+    response->print(".primary{background:#667eea;color:#fff}");
+    response->print(".secondary{background:#e2e8f0;color:#2d3748}");
+    response->print(".danger{background:#fed7d7;color:#c53030}");
+    response->print(".truncate{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:middle}");
+    response->print(".hint{font-size:12px;color:#718096;margin-top:6px}");
+    response->print(".empty{text-align:center;padding:24px;color:#a0aec0;font-size:14px}");
+    response->print(".storage-bar{width:100%;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-top:8px}");
+    response->print(".storage-fill{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:4px;transition:width 0.3s}");
+    response->print("@media(max-width:700px){.stats{grid-template-columns:1fr 1fr}table{font-size:12px}.truncate{max-width:140px}}");
+    response->print("</style></head><body><div class='container'>");
 
     // Header
-    page += "<div class='card'><h1>📡 LoRa Stats</h1>";
-    page += "<div class='hint'>Radio statistics, known peers, and message history.</div>";
-    page += "<div class='btns'><a href='/' class='btn secondary'>← Dashboard</a>";
-    page += "<button class='btn secondary' onclick='location.reload()'>↻ Refresh</button>";
-    page += "<button class='btn danger' id='clearBtn' onclick='clearLog()'>🗑 Clear Log</button></div></div>";
+    response->printf("<div class='card'><h1>%s LoRa Stats</h1>", "\xF0\x9F\x93\xA1");
+    response->print("<div class='hint'>Radio statistics, known peers, and message history.</div>");
+    response->printf("<div class='btns'><a href='/' class='btn secondary'>%s Dashboard</a>", "\xE2\x86\x90");
+    response->printf("<button class='btn secondary' onclick='location.reload()'>%s Refresh</button>", "\xE2\x86\xBB");
+    response->printf("<button class='btn danger' id='clearBtn' onclick='clearLog()'>%s Clear Log</button></div></div>", "\xF0\x9F\x97\x91");
 
-    // Stats cards (populated via JS)
-    page += "<div class='stats'>";
-    page += "<div class='stat-card'><div class='stat-value' id='msgCount'>-</div><div class='stat-label'>Messages</div></div>";
-    page += "<div class='stat-card'><div class='stat-value' id='peerCount'>-</div><div class='stat-label'>Known Peers</div></div>";
-    page += "<div class='stat-card'><div class='stat-value' id='rssiVal'>-</div><div class='stat-label'>Last RSSI</div></div>";
-    page += "<div class='stat-card'><div class='stat-value' id='snrVal'>-</div><div class='stat-label'>Last SNR</div></div>";
-    page += "</div>";
+    // Stats cards
+    response->print("<div class='stats'>");
+    response->print("<div class='stat-card'><div class='stat-value' id='msgCount'>-</div><div class='stat-label'>Messages</div></div>");
+    response->print("<div class='stat-card'><div class='stat-value' id='peerCount'>-</div><div class='stat-label'>Known Peers</div></div>");
+    response->print("<div class='stat-card'><div class='stat-value' id='rssiVal'>-</div><div class='stat-label'>Last RSSI</div></div>");
+    response->print("<div class='stat-card'><div class='stat-value' id='snrVal'>-</div><div class='stat-label'>Last SNR</div></div>");
+    response->print("</div>");
 
     // Peers table
-    page += "<div class='card'><h2>Known Peers</h2>";
-    page += "<div id='peersTable'><div class='empty'>Loading...</div></div></div>";
+    response->print("<div class='card'><h2>Known Peers</h2>");
+    response->print("<div id='peersTable'><div class='empty'>Loading...</div></div></div>");
 
     // Message log table
-    page += "<div class='card'><h2>Message History</h2>";
-    page += "<div id='storageInfo'></div>";
-    page += "<div id='logTable'><div class='empty'>Loading...</div></div></div>";
+    response->print("<div class='card'><h2>Message History</h2>");
+    response->print("<div id='storageInfo'></div>");
+    response->print("<div id='logTable'><div class='empty'>Loading...</div></div></div>");
 
-    page += "</div>";
+    response->print("</div>");
 
     // JavaScript
-    page += "<script>";
-    page += "const typeLabels={D:'Direct',G:'Group',A:'ACK',N:'Notification',V:'Advert'};";
-    page += "const typeBadge={Client:'badge-client',Repeater:'badge-repeater',Router:'badge-router',Unknown:'badge-unknown'};";
-    page += "function ago(ts){if(!ts)return 'Never';const s=Math.floor(Date.now()/1000)-ts;if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}";
-    page += "function fmtTime(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleString();}";
+    response->print("<script>");
+    response->print("const typeLabels={D:'Direct',G:'Group',A:'ACK',N:'Notification',V:'Advert'};");
+    response->print("const typeBadge={Client:'badge-client',Repeater:'badge-repeater',Router:'badge-router',Unknown:'badge-unknown'};");
+    response->print("function ago(ts){if(!ts)return 'Never';const s=Math.floor(Date.now()/1000)-ts;if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}");
+    response->print("function fmtTime(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleString();}");
 
-    page += "async function loadStats(){try{";
-    page += "const res=await fetch('/api/lora-stats',{credentials:'include'});if(!res.ok)return;";
-    page += "const d=await res.json();";
-    page += "document.getElementById('msgCount').textContent=d.messageCount||0;";
-    page += "document.getElementById('peerCount').textContent=d.peers?d.peers.length:0;";
-    page += "document.getElementById('rssiVal').textContent=d.lastRssi?d.lastRssi+' dBm':'-';";
-    page += "document.getElementById('snrVal').textContent=d.lastSnr?(d.lastSnr).toFixed(1)+' dB':'-';";
+    // loadStats with error handling and retry
+    response->print("let statsRetry=0;");
+    response->print("async function loadStats(){try{");
+    response->print("const res=await fetch('/api/lora-stats',{credentials:'include'});");
+    response->print("if(!res.ok){document.getElementById('peersTable').innerHTML='<div class=\"empty\">Failed to load peers (HTTP '+res.status+'). <a href=\"#\" onclick=\"loadStats();return false\">Retry</a></div>';return;}");
+    response->print("const d=await res.json();");
+    response->print("statsRetry=0;");
+    response->print("document.getElementById('msgCount').textContent=d.messageCount||0;");
+    response->print("document.getElementById('peerCount').textContent=d.peers?d.peers.length:0;");
+    response->print("document.getElementById('rssiVal').textContent=d.lastRssi?d.lastRssi+' dBm':'-';");
+    response->print("document.getElementById('snrVal').textContent=d.lastSnr?(d.lastSnr).toFixed(1)+' dB':'-';");
 
     // Peers table
-    page += "if(d.peers&&d.peers.length>0){";
-    page += "let h='<table><tr><th>Name</th><th>Type</th><th>Hash</th><th>Last Seen</th></tr>';";
-    page += "for(const p of d.peers){";
-    page += "const cls=typeBadge[p.type]||'badge-unknown';";
-    page += "h+='<tr><td>'+(p.name||'<em>unnamed</em>')+'</td>';";
-    page += "h+='<td><span class=\"badge '+cls+'\">'+p.type+'</span></td>';";
-    page += "h+='<td class=\"mono\">0x'+p.hash.toString(16).toUpperCase().padStart(2,'0')+'</td>';";
-    page += "h+='<td>'+ago(p.lastAdvert)+'</td></tr>';}";
-    page += "h+='</table>';document.getElementById('peersTable').innerHTML=h;";
-    page += "}else{document.getElementById('peersTable').innerHTML='<div class=\"empty\">No peers discovered yet</div>';}";
+    response->print("if(d.peers&&d.peers.length>0){");
+    response->print("let h='<table><tr><th>Name</th><th>Type</th><th>Hash</th><th>Last Seen</th></tr>';");
+    response->print("for(const p of d.peers){");
+    response->print("const cls=typeBadge[p.type]||'badge-unknown';");
+    response->print("h+='<tr><td>'+(p.name||'<em>unnamed</em>')+'</td>';");
+    response->print("h+='<td><span class=\"badge '+cls+'\">'+p.type+'</span></td>';");
+    response->print("h+='<td class=\"mono\">0x'+p.hash.toString(16).toUpperCase().padStart(2,'0')+'</td>';");
+    response->print("h+='<td>'+ago(p.lastAdvert)+'</td></tr>';}");
+    response->print("h+='</table>';document.getElementById('peersTable').innerHTML=h;");
+    response->print("}else{document.getElementById('peersTable').innerHTML='<div class=\"empty\">No peers discovered yet</div>';}");
 
     // Storage bar
-    page += "if(d.totalBytes){const pct=Math.min(100,((d.usedBytes||0)/d.totalBytes*100)).toFixed(1);";
-    page += "const logPct=((d.logBudget||0)/d.totalBytes*100).toFixed(1);";
-    page += "document.getElementById('storageInfo').innerHTML='<div class=\"hint\">Storage: '+(d.usedBytes/1024).toFixed(0)+'KB / '+(d.totalBytes/1024).toFixed(0)+'KB used ('+pct+'%). LoRa log budget: '+(d.logBudget/1024).toFixed(0)+'KB ('+logPct+'%)</div><div class=\"storage-bar\"><div class=\"storage-fill\" style=\"width:'+pct+'%\"></div></div>';}";
+    response->print("if(d.totalBytes){const pct=Math.min(100,((d.usedBytes||0)/d.totalBytes*100)).toFixed(1);");
+    response->print("const logPct=((d.logBudget||0)/d.totalBytes*100).toFixed(1);");
+    response->print("document.getElementById('storageInfo').innerHTML='<div class=\"hint\">Storage: '+(d.usedBytes/1024).toFixed(0)+'KB / '+(d.totalBytes/1024).toFixed(0)+'KB used ('+pct+'%). LoRa log budget: '+(d.logBudget/1024).toFixed(0)+'KB ('+logPct+'%)</div><div class=\"storage-bar\"><div class=\"storage-fill\" style=\"width:'+pct+'%\"></div></div>';}");
 
-    page += "}catch(e){console.error(e);}}";
+    response->print("}catch(e){console.error('loadStats error:',e);");
+    response->print("document.getElementById('peersTable').innerHTML='<div class=\"empty\">Error loading peers: '+e.message+'. <a href=\"#\" onclick=\"loadStats();return false\">Retry</a></div>';");
+    response->print("if(statsRetry<3){statsRetry++;setTimeout(loadStats,2000);}}}");
 
-    // Log table
-    page += "async function loadLog(){try{";
-    page += "const res=await fetch('/api/lora-log',{credentials:'include'});if(!res.ok)return;";
-    page += "const txt=await res.text();";
-    page += "const lines=txt.split('\\n').filter(l=>l.trim().length);";
-    page += "if(lines.length===0){document.getElementById('logTable').innerHTML='<div class=\"empty\">No messages logged yet</div>';return;}";
-    page += "lines.reverse();";  // newest first
-    page += "let h='<table><tr><th>Time</th><th>Dir</th><th>Type</th><th>Peer</th><th>Message</th><th>Status</th></tr>';";
-    page += "const max=200;const show=lines.slice(0,max);";
-    page += "for(const line of show){const p=line.split(',');if(p.length<6)continue;";
-    page += "const ts=parseInt(p[0]);const dir=p[1];const typ=p[2];const peer=p[3];const msg=p.slice(4,p.length-1).join(',');const st=p[p.length-1];";
-    page += "h+='<tr><td>'+fmtTime(ts)+'</td>';";
-    page += "h+='<td><span class=\"badge '+(dir==='S'?'badge-sent':'badge-recv')+'\">'+(dir==='S'?'Sent':'Recv')+'</span></td>';";
-    page += "h+='<td>'+(typeLabels[typ]||typ)+'</td>';";
-    page += "h+='<td>'+(peer||'-')+'</td>';";
-    page += "h+='<td><span class=\"truncate\">'+(msg||'-')+'</span></td>';";
-    page += "h+='<td><span class=\"badge '+(st==='ok'?'badge-ok':'badge-fail')+'\">'+(st||'-')+'</span></td></tr>';}";
-    page += "if(lines.length>max)h+='<tr><td colspan=\"6\" class=\"hint\">Showing '+max+' of '+lines.length+' entries</td></tr>';";
-    page += "h+='</table>';document.getElementById('logTable').innerHTML=h;";
-    page += "}catch(e){console.error(e);}}";
+    // loadLog with error handling and retry
+    response->print("let logRetry=0;");
+    response->print("async function loadLog(){try{");
+    response->print("const res=await fetch('/api/lora-log',{credentials:'include'});");
+    response->print("if(!res.ok){document.getElementById('logTable').innerHTML='<div class=\"empty\">Failed to load log (HTTP '+res.status+'). <a href=\"#\" onclick=\"loadLog();return false\">Retry</a></div>';return;}");
+    response->print("logRetry=0;");
+    response->print("const txt=await res.text();");
+    response->print("const lines=txt.split('\\n').filter(l=>l.trim().length);");
+    response->print("if(lines.length===0){document.getElementById('logTable').innerHTML='<div class=\"empty\">No messages logged yet</div>';return;}");
+    response->print("lines.reverse();");
+    response->print("let h='<table><tr><th>Time</th><th>Dir</th><th>Type</th><th>Peer</th><th>Message</th><th>Status</th></tr>';");
+    response->print("const max=200;const show=lines.slice(0,max);");
+    response->print("for(const line of show){const p=line.split(',');if(p.length<6)continue;");
+    response->print("const ts=parseInt(p[0]);const dir=p[1];const typ=p[2];const peer=p[3];const msg=p.slice(4,p.length-1).join(',');const st=p[p.length-1];");
+    response->print("h+='<tr><td>'+fmtTime(ts)+'</td>';");
+    response->print("h+='<td><span class=\"badge '+(dir==='S'?'badge-sent':'badge-recv')+'\">'+(dir==='S'?'Sent':'Recv')+'</span></td>';");
+    response->print("h+='<td>'+(typeLabels[typ]||typ)+'</td>';");
+    response->print("h+='<td>'+(peer||'-')+'</td>';");
+    response->print("h+='<td><span class=\"truncate\">'+(msg||'-')+'</span></td>';");
+    response->print("h+='<td><span class=\"badge '+(st==='ok'?'badge-ok':'badge-fail')+'\">'+(st||'-')+'</span></td></tr>';}");
+    response->print("if(lines.length>max)h+='<tr><td colspan=\"6\" class=\"hint\">Showing '+max+' of '+lines.length+' entries</td></tr>';");
+    response->print("h+='</table>';document.getElementById('logTable').innerHTML=h;");
+    response->print("}catch(e){console.error('loadLog error:',e);");
+    response->print("document.getElementById('logTable').innerHTML='<div class=\"empty\">Error loading log: '+e.message+'. <a href=\"#\" onclick=\"loadLog();return false\">Retry</a></div>';");
+    response->print("if(logRetry<3){logRetry++;setTimeout(loadLog,2000);}}}");
 
-    page += "async function clearLog(){if(!confirm('Clear LoRa message log?'))return;";
-    page += "await fetch('/api/lora-log',{method:'DELETE',credentials:'include'});location.reload();}";
+    response->print("async function clearLog(){if(!confirm('Clear LoRa message log?'))return;");
+    response->print("await fetch('/api/lora-log',{method:'DELETE',credentials:'include'});location.reload();}");
 
-    page += "loadStats();loadLog();";
-    page += "</script></body></html>";
+    response->print("loadStats();loadLog();");
+    response->print("</script></body></html>");
 
-    request->send(200, "text/html", page);
+    request->send(response);
   });
 
   server.begin();
