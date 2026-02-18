@@ -339,7 +339,15 @@ static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint
   peers[idx].hash = pub[0];
   peers[idx].altHash = computeNodeHashSha256(pub);
   memcpy(peers[idx].ed25519_pub, pub, 32);
-  peers[idx].name = name;
+  // Sanitize name: keep only printable ASCII (0x20-0x7E) and trim
+  String clean;
+  clean.reserve(name.length());
+  for (unsigned int ci = 0; ci < name.length(); ci++) {
+    char ch = name.charAt(ci);
+    if (ch >= 0x20 && ch <= 0x7E) clean += ch;
+  }
+  clean.trim();
+  peers[idx].name = clean;
   peers[idx].lastAdvert = lastAdvert;
   peers[idx].nodeType = nodeType;
   peers[idx].inUse = true;
@@ -6082,14 +6090,25 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     if (appDataIdx < messageLen) {
       uint8_t appFlags = message[appDataIdx++];
       peerNodeType = appFlags & 0x0F;  // Lower nibble = role (1=Client,2=Repeater,3=Router)
-      // Check if name flag is set (bit 7)
+      // Bit 4 = has location: skip lat(4) + lon(4) = 8 bytes of GPS coords
+      if ((appFlags & 0x10) && appDataIdx + 8 <= messageLen) {
+        appDataIdx += 8;
+      }
+      // Bit 7 = has name: remaining bytes are the node name
       if ((appFlags & 0x80) && appDataIdx < messageLen) {
         size_t nameLen = messageLen - appDataIdx;
         if (nameLen > 0 && nameLen < 64) {
           char nameBuf[64];
           memcpy(nameBuf, message + appDataIdx, nameLen);
           nameBuf[nameLen] = '\0';
-          name = String(nameBuf);
+          // Strip any leading/trailing non-printable characters
+          String raw = String(nameBuf);
+          raw.trim();
+          name = "";
+          for (unsigned int ci = 0; ci < raw.length(); ci++) {
+            char ch = raw.charAt(ci);
+            if (ch >= 0x20 && ch <= 0x7E) name += ch;
+          }
         }
       }
     }

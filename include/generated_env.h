@@ -27,7 +27,7 @@
 #define MQTT_TOPIC "esp32-monitor/alerts"
 #define MQTT_USERNAME ""
 #define MQTT_PASSWORD ""
-#define FIRMWARE_VERSION "b956eca"
+#define FIRMWARE_VERSION "a5e38d3"
 #define AUTO_OTA_URL "https://github.com/bradhawkins85/ESP32-Monitor/releases/latest/download"
 #define LED_PIN 35
 #define LORA_SPREADING_FACTOR 8
