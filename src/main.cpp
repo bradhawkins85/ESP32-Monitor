@@ -4085,8 +4085,9 @@ void setup() {
     if (!isAuthenticated(request)) return;
     String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
     page += "<title>Settings</title><style>";
-    page += "*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f7fafc;padding:20px;color:#2d3748}";
-    page += ".container{max-width:900px;margin:0 auto}.card{background:#fff;border-radius:14px;padding:22px;box-shadow:0 8px 24px rgba(0,0,0,0.08);margin-bottom:16px}";
+    page += "*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;min-height:100vh;padding:20px;color:#2d3748;overflow-x:hidden}";
+    page += "#meshBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}";
+    page += ".container{max-width:900px;margin:0 auto;position:relative;z-index:1}.card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:22px;box-shadow:0 8px 32px rgba(0,0,0,0.1);margin-bottom:16px}";
     page += "h1{font-size:22px;margin-bottom:10px}h2{font-size:16px;margin:18px 0 10px;color:#4a5568}";
     page += ".row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fg{margin-bottom:12px}.lbl{display:block;font-weight:600;margin-bottom:6px;font-size:13px;color:#2d3748}";
     page += "input,select{width:100%;padding:10px 12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px}input:focus,select:focus{outline:none;border-color:#667eea}";
@@ -4094,7 +4095,7 @@ void setup() {
     page += ".primary{background:#667eea;color:#fff}.secondary{background:#e2e8f0;color:#2d3748}.hint{font-size:12px;color:#718096;margin-top:6px}";
     page += ".node-row{display:grid;grid-template-columns:1fr 2fr auto;gap:10px;align-items:center;margin-bottom:10px}.node-actions{display:flex;gap:6px;align-items:center}.btn-small{padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px}";
     page += "@media(max-width:700px){.row{grid-template-columns:1fr}}";
-    page += "</style></head><body><div class='container'>";
+    page += "</style></head><body><canvas id='meshBg'></canvas><div class='container'>";
     page += "<div class='card'><h1>Settings</h1><div class='hint'>Saved settings override build-time .env defaults. Passwords/tokens are never displayed; leaving them blank keeps the existing value.</div></div>";
 
     page += "<div class='card'><h2>WiFi</h2><div class='row'>";
@@ -4239,6 +4240,21 @@ void setup() {
     page += "async function checkOta(){const btn=document.getElementById('otaBtn');const st=document.getElementById('otaStatus');btn.disabled=true;st.textContent='Checking...';try{const r=await fetch('/api/auto-ota/check',{method:'POST',credentials:'include'});const d=await r.json();if(d.updateAvailable){st.textContent='Update available: v'+d.latestVersion+(d.latestNotes?' - '+d.latestNotes:'');st.style.color='#48bb78';btn.textContent='Install Now';btn.className='btn primary';btn.onclick=installOta;btn.disabled=false;}else{st.textContent='Up to date (v'+d.currentVersion+')';st.style.color='#718096';btn.disabled=false;}}catch(e){st.textContent='Check failed: '+e.message;st.style.color='#e53e3e';btn.disabled=false;}}";
     page += "async function installOta(){const btn=document.getElementById('otaBtn');const st=document.getElementById('otaStatus');if(!confirm('Install firmware update now? The device will reboot.'))return;btn.disabled=true;btn.textContent='Installing...';st.textContent='Downloading and flashing firmware...';st.style.color='#ecc94b';try{const r=await fetch('/api/auto-ota/apply',{method:'POST',credentials:'include'});const d=await r.json();if(d.error){st.textContent='Install failed: '+d.error;st.style.color='#e53e3e';btn.textContent='Install Now';btn.disabled=false;}else{st.textContent='Update started. Device will reboot shortly...';st.style.color='#48bb78';}}catch(e){st.textContent='Install failed: '+e.message;st.style.color='#e53e3e';btn.textContent='Install Now';btn.disabled=false;}}";
     page += "renderDirectNodes();";
+    page += "</script><script>";
+    page += "(function(){";
+    page += "var c=document.getElementById('meshBg'),ctx=c.getContext('2d');";
+    page += "var dots=[],MAX=60,DIST=120;";
+    page += "function resize(){c.width=window.innerWidth;c.height=window.innerHeight;}";
+    page += "window.addEventListener('resize',resize);resize();";
+    page += "for(var i=0;i<MAX;i++){dots.push({x:Math.random()*c.width,y:Math.random()*c.height,vx:(Math.random()-0.5)*0.6,vy:(Math.random()-0.5)*0.6,r:Math.random()*1.5+1});}";
+    page += "function draw(){ctx.clearRect(0,0,c.width,c.height);";
+    page += "for(var i=0;i<dots.length;i++){var d=dots[i];d.x+=d.vx;d.y+=d.vy;";
+    page += "if(d.x<0||d.x>c.width)d.vx*=-1;if(d.y<0||d.y>c.height)d.vy*=-1;";
+    page += "ctx.beginPath();ctx.arc(d.x,d.y,d.r,0,Math.PI*2);ctx.fillStyle='rgba(72,187,120,0.8)';ctx.fill();";
+    page += "for(var j=i+1;j<dots.length;j++){var e=dots[j],dx=d.x-e.x,dy=d.y-e.y,dist=Math.sqrt(dx*dx+dy*dy);";
+    page += "if(dist<DIST){ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);";
+    page += "ctx.strokeStyle='rgba(72,187,120,'+(1-dist/DIST)*0.4+')';ctx.lineWidth=0.8;ctx.stroke();}}}";
+    page += "requestAnimationFrame(draw);}draw();})();";
     page += "</script></body></html>";
     request->send(200, "text/html", page);
   });
@@ -5024,15 +5040,16 @@ void setup() {
   server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
     String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    page += "<title>OTA Update</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f7fafc;padding:24px;color:#2d3748;}";
-    page += ".card{max-width:520px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 8px 24px rgba(0,0,0,0.08);}";
+    page += "<title>OTA Update</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#000;min-height:100vh;padding:24px;color:#2d3748;overflow-x:hidden;}";
+    page += "#meshBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}";
+    page += ".card{max-width:520px;margin:0 auto;background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,0.1);position:relative;z-index:1;}";
     page += "h1{margin:0 0 12px;font-size:24px;}p{margin:0 0 16px;color:#4a5568;}.warn{color:#e53e3e;font-size:14px;margin-bottom:16px;}";
     page += "input[type=file]{width:100%;padding:12px;border:2px dashed #cbd5e0;border-radius:10px;background:#f8fafc;cursor:pointer;margin-bottom:16px;}";
     page += "button{padding:12px 18px;border:none;border-radius:8px;background:#667eea;color:#fff;font-weight:600;cursor:pointer;}";
     page += "button:disabled{opacity:0.6;cursor:not-allowed;}";
     page += "#status{margin-top:12px;font-weight:600;}.progress-bar{width:100%;height:8px;background:#e2e8f0;border-radius:4px;margin:12px 0;overflow:hidden;}";
     page += ".progress-fill{height:100%;background:#667eea;width:0;transition:width 0.3s;}";
-    page += "</style></head><body><div class='card'><h1>OTA Firmware Update</h1><p>Select a .bin file to upload and flash. Device will reboot after a successful update.</p>";
+    page += "</style></head><body><canvas id='meshBg'></canvas><div class='card'><h1>OTA Firmware Update</h1><p>Select a .bin file to upload and flash. Device will reboot after a successful update.</p>";
     page += "<p class='warn'>⚠️ Do not close this page or disconnect power during upload.</p>";
     page += "<input type='file' id='file' accept='.bin,.bin.gz'><div id='fileSize'></div>";
     page += "<button id='uploadBtn'>Upload & Flash</button><div class='progress-bar'><div id='progressFill' class='progress-fill'></div></div><div id='status'></div>";
@@ -5045,7 +5062,23 @@ void setup() {
     page += "xhr.onerror=()=>{statusEl.textContent='✗ Connection error during upload';statusEl.style.color='#e53e3e';btn.disabled=false;progressFill.style.width='0%';};";
     page += "xhr.ontimeout=()=>{statusEl.textContent='✗ Upload timeout (file too large or device busy)';statusEl.style.color='#e53e3e';btn.disabled=false;progressFill.style.width='0%';};";
     page += "xhr.open('POST','/ota/upload');xhr.timeout=120000;xhr.send(fd);};";
-    page += "</script></div></body></html>";
+    page += "</script></div>";
+    page += "<script>";
+    page += "(function(){";
+    page += "var c=document.getElementById('meshBg'),ctx=c.getContext('2d');";
+    page += "var dots=[],MAX=60,DIST=120;";
+    page += "function resize(){c.width=window.innerWidth;c.height=window.innerHeight;}";
+    page += "window.addEventListener('resize',resize);resize();";
+    page += "for(var i=0;i<MAX;i++){dots.push({x:Math.random()*c.width,y:Math.random()*c.height,vx:(Math.random()-0.5)*0.6,vy:(Math.random()-0.5)*0.6,r:Math.random()*1.5+1});}";
+    page += "function draw(){ctx.clearRect(0,0,c.width,c.height);";
+    page += "for(var i=0;i<dots.length;i++){var d=dots[i];d.x+=d.vx;d.y+=d.vy;";
+    page += "if(d.x<0||d.x>c.width)d.vx*=-1;if(d.y<0||d.y>c.height)d.vy*=-1;";
+    page += "ctx.beginPath();ctx.arc(d.x,d.y,d.r,0,Math.PI*2);ctx.fillStyle='rgba(72,187,120,0.8)';ctx.fill();";
+    page += "for(var j=i+1;j<dots.length;j++){var e=dots[j],dx=d.x-e.x,dy=d.y-e.y,dist=Math.sqrt(dx*dx+dy*dy);";
+    page += "if(dist<DIST){ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);";
+    page += "ctx.strokeStyle='rgba(72,187,120,'+(1-dist/DIST)*0.4+')';ctx.lineWidth=0.8;ctx.stroke();}}}";
+    page += "requestAnimationFrame(draw);}draw();})();";
+    page += "</script></body></html>";
     request->send(200, "text/html", page);
   });
 
@@ -5296,8 +5329,9 @@ void setup() {
     response->print("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>LoRa Stats</title>");
     response->print("<style>");
     response->print("*{margin:0;padding:0;box-sizing:border-box}");
-    response->print("body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px;color:#2d3748}");
-    response->print(".container{max-width:1000px;margin:0 auto}");
+    response->print("body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;min-height:100vh;padding:20px;color:#2d3748;overflow-x:hidden}");
+    response->print("#meshBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}");
+    response->print(".container{max-width:1000px;margin:0 auto;position:relative;z-index:1}");
     response->print(".card{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}");
     response->print("h1{font-size:22px;margin-bottom:6px;color:#2d3748}");
     response->print("h2{font-size:16px;margin:0 0 12px;color:#4a5568}");
@@ -5330,7 +5364,7 @@ void setup() {
     response->print(".storage-bar{width:100%;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-top:8px}");
     response->print(".storage-fill{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:4px;transition:width 0.3s}");
     response->print("@media(max-width:700px){.stats{grid-template-columns:1fr 1fr}table{font-size:12px}.truncate{max-width:140px}}");
-    response->print("</style></head><body><div class='container'>");
+    response->print("</style></head><body><canvas id='meshBg'></canvas><div class='container'>");
 
     // Header
     response->printf("<div class='card'><h1>%s LoRa Stats</h1>", "\xF0\x9F\x93\xA1");
@@ -5428,6 +5462,21 @@ void setup() {
     response->print("await fetch('/api/lora-log',{method:'DELETE',credentials:'include'});location.reload();}");
 
     response->print("loadStats();loadLog();");
+    response->print("</script><script>");
+    response->print("(function(){");
+    response->print("var c=document.getElementById('meshBg'),ctx=c.getContext('2d');");
+    response->print("var dots=[],MAX=60,DIST=120;");
+    response->print("function resize(){c.width=window.innerWidth;c.height=window.innerHeight;}");
+    response->print("window.addEventListener('resize',resize);resize();");
+    response->print("for(var i=0;i<MAX;i++){dots.push({x:Math.random()*c.width,y:Math.random()*c.height,vx:(Math.random()-0.5)*0.6,vy:(Math.random()-0.5)*0.6,r:Math.random()*1.5+1});}");
+    response->print("function draw(){ctx.clearRect(0,0,c.width,c.height);");
+    response->print("for(var i=0;i<dots.length;i++){var d=dots[i];d.x+=d.vx;d.y+=d.vy;");
+    response->print("if(d.x<0||d.x>c.width)d.vx*=-1;if(d.y<0||d.y>c.height)d.vy*=-1;");
+    response->print("ctx.beginPath();ctx.arc(d.x,d.y,d.r,0,Math.PI*2);ctx.fillStyle='rgba(72,187,120,0.8)';ctx.fill();");
+    response->print("for(var j=i+1;j<dots.length;j++){var e=dots[j],dx=d.x-e.x,dy=d.y-e.y,dist=Math.sqrt(dx*dx+dy*dy);");
+    response->print("if(dist<DIST){ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);");
+    response->print("ctx.strokeStyle='rgba(72,187,120,'+(1-dist/DIST)*0.4+')';ctx.lineWidth=0.8;ctx.stroke();}}}");
+    response->print("requestAnimationFrame(draw);}draw();})();");
     response->print("</script></body></html>");
 
     request->send(response);
