@@ -24,6 +24,8 @@
 #include <lwip/sys.h>
 #include <lwip/netdb.h>
 #include <lwip/dns.h>
+#include <lwip/etharp.h>
+#include <lwip/netif.h>
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
 // #include <ElegantOTA.h>  // Temporarily disabled due to header conflicts
@@ -131,6 +133,8 @@ struct Service {
   bool alertWebhook;
   bool alertEmail;
   bool alertMqtt;
+  bool alertWol;
+  String wolMacAddress;
 };
 
 // ============================================
@@ -1379,6 +1383,151 @@ static void fanOutInternetNotificationsWithId(const String &message) {
   if (settings.mqttEnabled) forwardToMqtt(message);  // forwardToMqtt adds its own MessageID prefix and de-dups
 }
 
+// ============================================
+// Wake-on-LAN Helpers
+// ============================================
+
+// Extract the bare IP address from a URL or host string.
+// Handles "https://192.168.1.1/health", "http://10.0.0.1:8080/api", "192.168.1.1", etc.
+static String extractIpFromUrl(const String &input) {
+  String s = input;
+  // Strip scheme
+  int schemeEnd = s.indexOf("://");
+  if (schemeEnd >= 0) s = s.substring(schemeEnd + 3);
+  // Strip path (after host)
+  int slashPos = s.indexOf('/');
+  if (slashPos >= 0) s = s.substring(0, slashPos);
+  // Strip port
+  int colonPos = s.indexOf(':');
+  if (colonPos >= 0) s = s.substring(0, colonPos);
+  // Strip userinfo (user@host)
+  int atPos = s.indexOf('@');
+  if (atPos >= 0) s = s.substring(atPos + 1);
+  s.trim();
+  return s;
+}
+
+// Parse "AA:BB:CC:DD:EE:FF" or "AA-BB-CC-DD-EE-FF" into 6-byte array.
+// Returns true on success.
+static bool parseMacAddress(const String &macStr, uint8_t mac[6]) {
+  if (macStr.length() < 17) return false;
+  char sep = macStr.charAt(2);
+  if (sep != ':' && sep != '-') return false;
+  for (int i = 0; i < 6; i++) {
+    String octet = macStr.substring(i * 3, i * 3 + 2);
+    mac[i] = (uint8_t)strtoul(octet.c_str(), NULL, 16);
+  }
+  return true;
+}
+
+// Format a 6-byte MAC into "AA:BB:CC:DD:EE:FF".
+static String formatMacAddress(const uint8_t mac[6]) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+// Attempt to discover the MAC address for an IP via ARP.
+// Sends a ping first to populate the ARP table, then queries it.
+static String discoverMacFromIp(const String &ipStr) {
+  IPAddress ip;
+  if (!ip.fromString(ipStr)) {
+    Serial.printf("[WoL] Invalid IP for MAC discovery: %s\n", ipStr.c_str());
+    return "";
+  }
+
+  // Send a quick ICMP ping to populate ARP table
+  int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+  if (sock >= 0) {
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = (uint32_t)ip;
+
+    uint8_t icmpPkt[8];
+    memset(icmpPkt, 0, sizeof(icmpPkt));
+    icmpPkt[0] = 8; // ICMP Echo Request
+    icmpPkt[4] = 0x12; icmpPkt[5] = 0x34; // id
+    // Checksum
+    uint32_t sum = 0;
+    for (int i = 0; i < 8; i += 2) sum += (icmpPkt[i] << 8) | icmpPkt[i + 1];
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    uint16_t cksum = ~sum;
+    icmpPkt[2] = cksum >> 8;
+    icmpPkt[3] = cksum & 0xFF;
+
+    struct timeval tv = {1, 0}; // 1 second timeout
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sendto(sock, icmpPkt, sizeof(icmpPkt), 0, (struct sockaddr *)&dest, sizeof(dest));
+
+    // Wait briefly for reply (to let ARP resolve)
+    uint8_t recvBuf[64];
+    struct sockaddr_in from;
+    socklen_t fromLen = sizeof(from);
+    recvfrom(sock, recvBuf, sizeof(recvBuf), 0, (struct sockaddr *)&from, &fromLen);
+    close(sock);
+  }
+  delay(100); // Give ARP table time to update
+
+  // Query the ARP table via ESP-IDF/lwIP
+  ip4_addr_t lwip_ip;
+  IP4_ADDR(&lwip_ip, ip[0], ip[1], ip[2], ip[3]);
+  struct eth_addr *eth_ret = NULL;
+  const ip4_addr_t *ip_ret = NULL;
+
+  // Check ARP table
+  if (etharp_find_addr(netif_default, &lwip_ip, &eth_ret, &ip_ret) >= 0 && eth_ret != NULL) {
+    String mac = formatMacAddress(eth_ret->addr);
+    Serial.printf("[WoL] Discovered MAC for %s: %s\n", ipStr.c_str(), mac.c_str());
+    return mac;
+  }
+
+  Serial.printf("[WoL] Could not discover MAC for %s\n", ipStr.c_str());
+  return "";
+}
+
+// Send a Wake-on-LAN magic packet to the given MAC address.
+// The magic packet is 6x 0xFF followed by 16x the 6-byte MAC, sent as UDP broadcast on port 9.
+static void sendWolPacket(const String &macStr) {
+  uint8_t mac[6];
+  if (!parseMacAddress(macStr, mac)) {
+    Serial.printf("[WoL] Invalid MAC address: %s\n", macStr.c_str());
+    return;
+  }
+
+  uint8_t magicPacket[102];
+  // 6 bytes of 0xFF
+  memset(magicPacket, 0xFF, 6);
+  // 16 repetitions of the MAC address
+  for (int i = 0; i < 16; i++) {
+    memcpy(magicPacket + 6 + i * 6, mac, 6);
+  }
+
+  WiFiUDP udp;
+  udp.begin(0);
+  udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
+  udp.write(magicPacket, sizeof(magicPacket));
+  udp.endPacket();
+  udp.stop();
+
+  Serial.printf("[WoL] Magic packet sent to %s\n", macStr.c_str());
+}
+
+// Get the best IP string for a service (used for MAC auto-discovery).
+static String getServiceIp(const Service &svc) {
+  // Prefer host field (Ping, SNMP, Port types)
+  if (svc.host.length() > 0) {
+    return extractIpFromUrl(svc.host);
+  }
+  // Fall back to URL field (HTTP GET type)
+  if (svc.url.length() > 0) {
+    return extractIpFromUrl(svc.url);
+  }
+  return "";
+}
+
 static bool loraReady = false;
 static bool pendingLoRaNotify = false;
 static String pendingLoRaNotifyMessage;
@@ -1657,6 +1806,8 @@ void saveServices() {
     svc["alertWebhook"] = services[i].alertWebhook;
     svc["alertEmail"] = services[i].alertEmail;
     svc["alertMqtt"] = services[i].alertMqtt;
+    svc["alertWol"] = services[i].alertWol;
+    svc["wolMacAddress"] = services[i].wolMacAddress;
   }
   
   serializeJson(doc, file);
@@ -1725,6 +1876,8 @@ void loadServices() {
     services[serviceCount].alertWebhook = svc["alertWebhook"].isNull() ? true : svc["alertWebhook"].as<bool>();
     services[serviceCount].alertEmail = svc["alertEmail"].isNull() ? true : svc["alertEmail"].as<bool>();
     services[serviceCount].alertMqtt = svc["alertMqtt"].isNull() ? true : svc["alertMqtt"].as<bool>();
+    services[serviceCount].alertWol = svc["alertWol"].isNull() ? false : svc["alertWol"].as<bool>();
+    services[serviceCount].wolMacAddress = svc["wolMacAddress"].isNull() ? "" : svc["wolMacAddress"].as<String>();
 
     if (services[serviceCount].type == TYPE_PUSH && services[serviceCount].pushToken.length() == 0) {
       services[serviceCount].pushToken = generatePushToken();
@@ -1773,6 +1926,8 @@ void initDemoServices() {
   httpSvc.alertWebhook = true;
   httpSvc.alertEmail = true;
   httpSvc.alertMqtt = true;
+  httpSvc.alertWol = false;
+  httpSvc.wolMacAddress = "";
   services[serviceCount++] = httpSvc;
 
   // Example Ping service
@@ -1797,6 +1952,8 @@ void initDemoServices() {
   pingSvc.alertWebhook = true;
   pingSvc.alertEmail = true;
   pingSvc.alertMqtt = true;
+  pingSvc.alertWol = false;
+  pingSvc.wolMacAddress = "";
   services[serviceCount++] = pingSvc;
 
   // Example SNMP service (stub)
@@ -1825,6 +1982,8 @@ void initDemoServices() {
   snmpSvc.alertWebhook = true;
   snmpSvc.alertEmail = true;
   snmpSvc.alertMqtt = true;
+  snmpSvc.alertWol = false;
+  snmpSvc.wolMacAddress = "";
   services[serviceCount++] = snmpSvc;
 }
 
@@ -1917,6 +2076,8 @@ String getServicesJson() {
     obj["alertWebhook"] = services[i].alertWebhook;
     obj["alertEmail"] = services[i].alertEmail;
     obj["alertMqtt"] = services[i].alertMqtt;
+    obj["alertWol"] = services[i].alertWol;
+    obj["wolMacAddress"] = services[i].wolMacAddress;
   }
   String json;
   serializeJson(doc, json);
@@ -3076,6 +3237,11 @@ void updateServiceStatus(Service& service, bool checkResult) {
     if (service.alertWebhook && settings.webhookEnabled) forwardToWebhook(bodyWithId);
     if (service.alertEmail && settings.emailEnabled) forwardToEmail(bodyWithId);
     if (service.alertMqtt && settings.mqttEnabled) forwardToMqtt(alertMsg);
+
+    // Wake-on-LAN: send magic packet when service goes DOWN
+    if (service.alertWol && !service.isUp && service.wolMacAddress.length() > 0) {
+      sendWolPacket(service.wolMacAddress);
+    }
   } else if (wasPending && !service.isPending) {
     Serial.printf("[Status] %s initial state: %s\n", service.name.c_str(), service.isUp ? "UP" : "DOWN");
   }
@@ -4402,6 +4568,7 @@ void setup() {
       if (settings.webhookEnabled && services[i].alertWebhook) channels += "🌐";
       if (settings.emailEnabled && services[i].alertEmail) channels += "📧";
       if (settings.mqttEnabled && services[i].alertMqtt) channels += "📨";
+      if (services[i].alertWol) channels += "⏰";
       if (channels.length() > 0) {
         html += "<div class='service-info' style='margin-top:4px;font-size:12px;opacity:0.85'>Alerts: " + channels + "</div>";
       }
@@ -4486,6 +4653,9 @@ void setup() {
     html += "<input type='number' id='servicePassThreshold' class='form-input' value='1'></div></div>";
     html += "<div class='form-group'><label class='form-label'>Fail Threshold</label>";
     html += "<input type='number' id='serviceFailThreshold' class='form-input' value='2'></div>";
+    // WoL MAC Address field
+    html += "<div class='form-group'><label class='form-label'>WoL MAC Address</label>";
+    html += "<input type='text' id='serviceWolMac' class='form-input' placeholder='AA:BB:CC:DD:EE:FF (auto-discovered if empty)'></div>";
     // Alert channel toggles (only globally-enabled channels shown via JS)
     html += "<div class='form-group' id='alertChannelsGroup'><label class='form-label'>Alert Channels</label>";
     html += "<div id='alertChannelsContainer' style='display:flex;flex-wrap:wrap;gap:12px;margin-top:4px'></div></div>";
@@ -4508,8 +4678,8 @@ void setup() {
     html += "const isAuthed=" + String(isAuthed ? "true" : "false") + ";";
     html += "let modalOpen=false;";
     // Alert channel rendering helper
-    html += "const channelDefs=[{key:'lora',label:'📡 LoRa',field:'alertLora'},{key:'ntfy',label:'🔔 Ntfy',field:'alertNtfy'},{key:'discord',label:'💬 Discord',field:'alertDiscord'},{key:'webhook',label:'🌐 Webhook',field:'alertWebhook'},{key:'email',label:'📧 Email',field:'alertEmail'},{key:'mqtt',label:'📨 MQTT',field:'alertMqtt'}];";
-    html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]!==false;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';}";
+    html += "const channelDefs=[{key:'lora',label:'📡 LoRa',field:'alertLora'},{key:'ntfy',label:'🔔 Ntfy',field:'alertNtfy'},{key:'discord',label:'💬 Discord',field:'alertDiscord'},{key:'webhook',label:'🌐 Webhook',field:'alertWebhook'},{key:'email',label:'📧 Email',field:'alertEmail'},{key:'mqtt',label:'📨 MQTT',field:'alertMqtt'},{key:'wol',label:'⏰ WoL',field:'alertWol',alwaysShow:true}];";;
+    html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!ch.alwaysShow&&!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]===true;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';}";
     html += "function getAlertChannelValues(){const v={};channelDefs.forEach(ch=>{const el=document.getElementById('alert_'+ch.field);v[ch.field]=el?el.checked:true;});return v;}";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
@@ -4556,6 +4726,7 @@ void setup() {
     html += "document.getElementById('serviceCheckInterval').value=s.checkInterval;";
     html += "document.getElementById('servicePassThreshold').value=s.passThreshold;";
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
+    html += "document.getElementById('serviceWolMac').value=s.wolMacAddress||'';";
     html += "updateFieldVisibility(s.type);";
     html += "renderAlertChannels(s);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
@@ -4578,7 +4749,8 @@ void setup() {
     html += "uptimeCompareOp:parseInt(document.getElementById('serviceUptimeCompareOp').value)||0,";
     html += "checkInterval:parseInt(document.getElementById('serviceCheckInterval').value),";
     html += "passThreshold:parseInt(document.getElementById('servicePassThreshold').value),";
-    html += "failThreshold:parseInt(document.getElementById('serviceFailThreshold').value)};";
+    html += "failThreshold:parseInt(document.getElementById('serviceFailThreshold').value),";
+    html += "wolMacAddress:document.getElementById('serviceWolMac').value};";
     html += "Object.assign(data,getAlertChannelValues());";
     html += "const idx=document.getElementById('serviceIndex').value;";
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
@@ -4803,6 +4975,8 @@ void setup() {
       obj["alertWebhook"] = services[i].alertWebhook;
       obj["alertEmail"] = services[i].alertEmail;
       obj["alertMqtt"] = services[i].alertMqtt;
+      obj["alertWol"] = services[i].alertWol;
+      obj["wolMacAddress"] = services[i].wolMacAddress;
     }
     String json;
     serializeJson(doc, json);
@@ -4855,6 +5029,8 @@ void setup() {
             svc.alertWebhook = obj["alertWebhook"].isNull() ? true : obj["alertWebhook"].as<bool>();
             svc.alertEmail = obj["alertEmail"].isNull() ? true : obj["alertEmail"].as<bool>();
             svc.alertMqtt = obj["alertMqtt"].isNull() ? true : obj["alertMqtt"].as<bool>();
+            svc.alertWol = obj["alertWol"].isNull() ? false : obj["alertWol"].as<bool>();
+            svc.wolMacAddress = obj["wolMacAddress"].isNull() ? "" : obj["wolMacAddress"].as<String>();
             svc.consecutivePasses = 0;
             svc.consecutiveFails = 0;
             svc.isUp = false;
@@ -4910,6 +5086,15 @@ void setup() {
       svc.alertWebhook = doc["alertWebhook"].isNull() ? true : doc["alertWebhook"].as<bool>();
       svc.alertEmail = doc["alertEmail"].isNull() ? true : doc["alertEmail"].as<bool>();
       svc.alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
+      svc.alertWol = doc["alertWol"].isNull() ? false : doc["alertWol"].as<bool>();
+      svc.wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
+      // Auto-discover MAC address if WoL enabled but no MAC specified
+      if (svc.alertWol && svc.wolMacAddress.length() == 0) {
+        String ip = getServiceIp(svc);
+        if (ip.length() > 0) {
+          svc.wolMacAddress = discoverMacFromIp(ip);
+        }
+      }
       if (svc.type == TYPE_PUSH && svc.pushToken.length() == 0) {
         svc.pushToken = generatePushToken();
       }
@@ -4966,6 +5151,15 @@ void setup() {
       services[idx].alertWebhook = doc["alertWebhook"].isNull() ? true : doc["alertWebhook"].as<bool>();
       services[idx].alertEmail = doc["alertEmail"].isNull() ? true : doc["alertEmail"].as<bool>();
       services[idx].alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
+      services[idx].alertWol = doc["alertWol"].isNull() ? false : doc["alertWol"].as<bool>();
+      services[idx].wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
+      // Auto-discover MAC address if WoL enabled but no MAC specified
+      if (services[idx].alertWol && services[idx].wolMacAddress.length() == 0) {
+        String ip = getServiceIp(services[idx]);
+        if (ip.length() > 0) {
+          services[idx].wolMacAddress = discoverMacFromIp(ip);
+        }
+      }
       saveServices();  // Persist to LittleFS
       request->send(200, "text/plain", "Service updated");
   });
