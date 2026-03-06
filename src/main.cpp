@@ -5288,10 +5288,7 @@ void setup() {
   // API endpoint to test notifications
   server.on("/api/test-notification", HTTP_POST, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
-    // Include a timestamp so each test gets a unique message ID
-    char tsBuf[32];
-    snprintf(tsBuf, sizeof(tsBuf), "%lu", (unsigned long)millis());
-    String testMsg = String("This is a test notification from ESP32 Monitor (") + tsBuf + ")";
+    const String testMsg = "This is a test notification from ESP32 Monitor";
     sendLoRaNotification("Test", true, testMsg);
     fanOutInternetNotificationsWithId(testMsg);
 
