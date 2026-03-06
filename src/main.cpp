@@ -1116,6 +1116,33 @@ static const size_t MQTT_DEDUP_SIZE = 32;
 static String mqttRecentMessageIds[MQTT_DEDUP_SIZE];
 static uint8_t mqttRecentMessageIdsHead = 0;
 
+// --- MQTT pending message queue (survives async connect delay) ---
+static const size_t MQTT_QUEUE_SIZE = 16;
+static String mqttPendingQueue[MQTT_QUEUE_SIZE];
+static size_t mqttQueueHead = 0;  // next write slot
+static size_t mqttQueueCount = 0; // number of queued items
+
+static void mqttQueuePush(const String &msg) {
+  if (mqttQueueCount >= MQTT_QUEUE_SIZE) {
+    // Drop oldest to make room
+    mqttQueueHead = (mqttQueueHead + 1) % MQTT_QUEUE_SIZE;
+    mqttQueueCount--;
+    Serial.println("[MQTT] Queue full, dropped oldest message");
+  }
+  size_t writeSlot = (mqttQueueHead + mqttQueueCount) % MQTT_QUEUE_SIZE;
+  mqttPendingQueue[writeSlot] = msg;
+  mqttQueueCount++;
+}
+
+static bool mqttQueuePop(String &out) {
+  if (mqttQueueCount == 0) return false;
+  out = mqttPendingQueue[mqttQueueHead];
+  mqttPendingQueue[mqttQueueHead] = String(); // free memory
+  mqttQueueHead = (mqttQueueHead + 1) % MQTT_QUEUE_SIZE;
+  mqttQueueCount--;
+  return true;
+}
+
 static bool mqttRecentlyPublished(const String &messageId) {
   if (messageId.length() == 0) return false;
   for (size_t i = 0; i < MQTT_DEDUP_SIZE; i++) {
@@ -1167,10 +1194,15 @@ static bool ensureMqttConnected() {
   return false;
 }
 
+// Forward declaration (defined after sha256/messageId helpers below)
+static void mqttFlushQueue();
+
 static void mqttOnConnect(bool sessionPresent) {
   (void)sessionPresent;
   mqttConnecting = false;
   Serial.println("[MQTT] Connected");
+  // Flush any messages that were queued while waiting for the connection
+  mqttFlushQueue();
 }
 
 static void mqttOnDisconnect(AsyncMqttClientDisconnectReason reason) {
@@ -1218,14 +1250,42 @@ static String addMessageIdPrefix(const String &body, const String &messageId) {
 
 void forwardToMqtt(String message);
 
-void forwardToMqtt(String message) {
-  initMqttClientOnce();
-
+// Publish a single message immediately (must already be connected)
+static bool mqttPublishNow(const String &message) {
   String messageId = messageIdForBody(message);
   if (mqttRecentlyPublished(messageId)) {
     Serial.println("[MQTT] Duplicate MessageID; skipping publish");
-    return;
+    return true; // already sent
   }
+  String payload = addMessageIdPrefix(message, messageId);
+  uint16_t pid = mqttClient.publish(settings.mqttTopic.c_str(), (uint8_t)settings.mqttQos, false, payload.c_str(), payload.length());
+  if (pid > 0 || settings.mqttQos == 0) {
+    mqttRememberPublished(messageId);
+    Serial.printf("[MQTT] Published to %s (qos=%d)\n", settings.mqttTopic.c_str(), settings.mqttQos);
+    return true;
+  }
+  Serial.println("[MQTT] Publish failed");
+  return false;
+}
+
+// Flush any queued messages (called when connection is available)
+static void mqttFlushQueue() {
+  if (!mqttClient.connected()) return;
+  if (settings.mqttTopic.length() == 0) return;
+  size_t flushed = 0;
+  String msg;
+  while (mqttQueuePop(msg)) {
+    if (mqttPublishNow(msg)) {
+      flushed++;
+    }
+  }
+  if (flushed > 0) {
+    Serial.printf("[MQTT] Flushed %zu queued message(s)\n", flushed);
+  }
+}
+
+void forwardToMqtt(String message) {
+  initMqttClientOnce();
 
   if (!settings.mqttEnabled) {
     Serial.println("MQTT disabled, skipping");
@@ -1237,18 +1297,23 @@ void forwardToMqtt(String message) {
   }
   if (settings.mqttQos < 0) settings.mqttQos = 0;
   if (settings.mqttQos > 2) settings.mqttQos = 2;
-  if (!ensureMqttConnected()) {
-    Serial.println("MQTT not connected, skipping publish");
+
+  String messageId = messageIdForBody(message);
+  if (mqttRecentlyPublished(messageId)) {
+    Serial.println("[MQTT] Duplicate MessageID; skipping publish");
     return;
   }
 
-  String payload = addMessageIdPrefix(message, messageId);
-  uint16_t pid = mqttClient.publish(settings.mqttTopic.c_str(), (uint8_t)settings.mqttQos, false, payload.c_str(), payload.length());
-  if (pid > 0 || settings.mqttQos == 0) {
-    mqttRememberPublished(messageId);
-    Serial.printf("[MQTT] Published to %s (qos=%d)\n", settings.mqttTopic.c_str(), settings.mqttQos);
+  // Kick off a connection if needed
+  ensureMqttConnected();
+
+  if (mqttClient.connected()) {
+    // Connected right now — publish immediately
+    mqttPublishNow(message);
   } else {
-    Serial.println("[MQTT] Publish failed");
+    // Connection is pending — queue the message for delivery once connected
+    mqttQueuePush(message);
+    Serial.printf("[MQTT] Not connected yet, queued message (%zu pending)\n", mqttQueueCount);
   }
 }
 
@@ -5223,7 +5288,10 @@ void setup() {
   // API endpoint to test notifications
   server.on("/api/test-notification", HTTP_POST, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
-    const String testMsg = "This is a test notification from ESP32 Monitor";
+    // Include a timestamp so each test gets a unique message ID
+    char tsBuf[32];
+    snprintf(tsBuf, sizeof(tsBuf), "%lu", (unsigned long)millis());
+    String testMsg = String("This is a test notification from ESP32 Monitor (") + tsBuf + ")";
     sendLoRaNotification("Test", true, testMsg);
     fanOutInternetNotificationsWithId(testMsg);
 
@@ -5892,7 +5960,12 @@ void loop() {
   }
 
   if (settings.mqttEnabled) {
+    initMqttClientOnce();
     ensureMqttConnected();
+    // Flush any queued messages once connected
+    if (mqttClient.connected() && mqttQueueCount > 0) {
+      mqttFlushQueue();
+    }
   }
 
   if (pendingRestart && millis() >= restartAtMs) {
