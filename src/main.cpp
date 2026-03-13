@@ -3902,7 +3902,12 @@ void setup() {
   // Initialize node identity for filtering own messages
   initNodeIdentity();
 
-  // Load cached adverts as early as possible
+  // Sync time via NTP for proper timestamps
+  if (wifiConnected) {
+    syncNTP();
+  }
+
+  // Load cached adverts after NTP sync so stale entries can be expired
   loadAdvertCache();
 
   // Pre-populate peer cache with configured direct nodes
@@ -3915,11 +3920,6 @@ void setup() {
     if (label.length() == 0) label = String("node-") + String(i + 1);
     upsertPeer(pubkey[0], pubkey, label, 0);
     Serial.printf("[LoRa] Pre-loaded direct node '%s' into peer cache\n", label.c_str());
-  }
-  
-  // Sync time via NTP for proper timestamps
-  if (wifiConnected) {
-    syncNTP();
   }
   
   // Setup LoRa
