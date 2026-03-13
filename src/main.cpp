@@ -4573,7 +4573,9 @@ void setup() {
     html += "<canvas id='meshBg'></canvas>";
     html += "<div class='container'>";
     html += "<div class='header'><h1>🚀 ESP32 Uptime Monitor</h1><div class='subtitle'>Real-time service monitoring dashboard</div><div class='subtitle' style='font-size:13px;opacity:0.9;margin-top:6px'>Firmware v" + String(FIRMWARE_VERSION) + "</div><div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>Build: " + String(__DATE__) + " " + String(__TIME__) + "</div>";
-    html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>MAC: " + macWithColons() + "</div>";
+    if (isAuthed) {
+      html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>MAC: " + macWithColons() + "</div>";
+    }
     html += "<div class='subtitle' style='font-size:12px;opacity:0.85;margin-top:4px'>LoRa Node: " + (ourNodeName.length() > 0 ? ourNodeName : String("(not set)")) + "</div></div>";
     
     // Stats cards
