@@ -6621,7 +6621,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       }
 
       // Send ACK
-      size_t rawTextLen = strlen((const char*)&decrypted[5]);
+      size_t rawTextLen = strnlen((const char*)&decrypted[5], decryptedLen - 5);
       uint8_t txtTypeFlags = (txtType >> 2) & 0x3F;
       if (txtTypeFlags == TXT_TYPE_PLAIN && senderPubKey != nullptr) {
         size_t ackDataLen = 5 + rawTextLen;
@@ -6870,7 +6870,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     
     // Compute ACK hash BEFORE stripping padding, using strlen on raw decrypted data
     // MeshCore ACK: SHA256(data[0..4+strlen(&data[5])] || sender_pubkey)[0..3]
-    size_t rawTextLen = strlen((const char*)&decrypted[5]);
+    size_t rawTextLen = strnlen((const char*)&decrypted[5], decryptedLen - 5);
     
     for (int i = textLen - 1; i >= 0; i--) {
       if (textMessage[i] == '\0') {
