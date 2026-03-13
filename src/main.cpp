@@ -35,6 +35,8 @@
 #include <DNSServer.h>
 #include <esp_system.h>
 #include <AsyncMqttClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
@@ -1121,8 +1123,20 @@ static const size_t MQTT_QUEUE_SIZE = 16;
 static String mqttPendingQueue[MQTT_QUEUE_SIZE];
 static size_t mqttQueueHead = 0;  // next write slot
 static size_t mqttQueueCount = 0; // number of queued items
+static SemaphoreHandle_t mqttStateMutex = nullptr;
 
-static void mqttQueuePush(const String &msg) {
+static void ensureMqttStateMutex() {
+  if (mqttStateMutex != nullptr) return;
+  mqttStateMutex = xSemaphoreCreateMutex();
+}
+
+static size_t mqttQueuePush(const String &msg) {
+  ensureMqttStateMutex();
+  if (mqttStateMutex == nullptr) {
+    Serial.println("[MQTT] Failed to allocate queue mutex");
+    return mqttQueueCount;
+  }
+  xSemaphoreTake(mqttStateMutex, portMAX_DELAY);
   if (mqttQueueCount >= MQTT_QUEUE_SIZE) {
     // Drop oldest to make room
     mqttQueueHead = (mqttQueueHead + 1) % MQTT_QUEUE_SIZE;
@@ -1132,29 +1146,59 @@ static void mqttQueuePush(const String &msg) {
   size_t writeSlot = (mqttQueueHead + mqttQueueCount) % MQTT_QUEUE_SIZE;
   mqttPendingQueue[writeSlot] = msg;
   mqttQueueCount++;
+  size_t pending = mqttQueueCount;
+  xSemaphoreGive(mqttStateMutex);
+  return pending;
 }
 
 static bool mqttQueuePop(String &out) {
-  if (mqttQueueCount == 0) return false;
+  ensureMqttStateMutex();
+  if (mqttStateMutex == nullptr) return false;
+  xSemaphoreTake(mqttStateMutex, portMAX_DELAY);
+  if (mqttQueueCount == 0) {
+    xSemaphoreGive(mqttStateMutex);
+    return false;
+  }
   out = mqttPendingQueue[mqttQueueHead];
   mqttPendingQueue[mqttQueueHead] = String(); // free memory
   mqttQueueHead = (mqttQueueHead + 1) % MQTT_QUEUE_SIZE;
   mqttQueueCount--;
+  xSemaphoreGive(mqttStateMutex);
   return true;
+}
+
+static size_t mqttQueueSize() {
+  ensureMqttStateMutex();
+  if (mqttStateMutex == nullptr) return 0;
+  xSemaphoreTake(mqttStateMutex, portMAX_DELAY);
+  size_t pending = mqttQueueCount;
+  xSemaphoreGive(mqttStateMutex);
+  return pending;
 }
 
 static bool mqttRecentlyPublished(const String &messageId) {
   if (messageId.length() == 0) return false;
+  ensureMqttStateMutex();
+  if (mqttStateMutex == nullptr) return false;
+  xSemaphoreTake(mqttStateMutex, portMAX_DELAY);
   for (size_t i = 0; i < MQTT_DEDUP_SIZE; i++) {
-    if (mqttRecentMessageIds[i] == messageId) return true;
+    if (mqttRecentMessageIds[i] == messageId) {
+      xSemaphoreGive(mqttStateMutex);
+      return true;
+    }
   }
+  xSemaphoreGive(mqttStateMutex);
   return false;
 }
 
 static void mqttRememberPublished(const String &messageId) {
   if (messageId.length() == 0) return;
+  ensureMqttStateMutex();
+  if (mqttStateMutex == nullptr) return;
+  xSemaphoreTake(mqttStateMutex, portMAX_DELAY);
   mqttRecentMessageIds[mqttRecentMessageIdsHead] = messageId;
   mqttRecentMessageIdsHead = (uint8_t)((mqttRecentMessageIdsHead + 1) % MQTT_DEDUP_SIZE);
+  xSemaphoreGive(mqttStateMutex);
 }
 
 static String mqttClientId() {
@@ -1312,8 +1356,8 @@ void forwardToMqtt(String message) {
     mqttPublishNow(message);
   } else {
     // Connection is pending — queue the message for delivery once connected
-    mqttQueuePush(message);
-    Serial.printf("[MQTT] Not connected yet, queued message (%zu pending)\n", mqttQueueCount);
+    size_t pending = mqttQueuePush(message);
+    Serial.printf("[MQTT] Not connected yet, queued message (%zu pending)\n", pending);
   }
 }
 
@@ -5960,7 +6004,7 @@ void loop() {
     initMqttClientOnce();
     ensureMqttConnected();
     // Flush any queued messages once connected
-    if (mqttClient.connected() && mqttQueueCount > 0) {
+    if (mqttClient.connected() && mqttQueueSize() > 0) {
       mqttFlushQueue();
     }
   }
