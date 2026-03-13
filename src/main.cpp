@@ -5657,6 +5657,7 @@ void setup() {
     response->print("const typeBadge={Client:'badge-client',Repeater:'badge-repeater',Router:'badge-router',Unknown:'badge-unknown'};");
     response->print("function ago(ts){if(!ts)return 'Never';const s=Math.floor(Date.now()/1000)-ts;if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}");
     response->print("function fmtTime(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleString();}");
+    response->print("function escHtml(v){const s=String(v??'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\\\"','&quot;').replaceAll(\"'\",'&#39;');}");
 
     // loadStats with error handling and retry
     response->print("let statsRetry=0;");
@@ -5675,8 +5676,8 @@ void setup() {
     response->print("let h='<table><tr><th>Name</th><th>Type</th><th>Hash</th><th>Last Seen</th></tr>';");
     response->print("for(const p of d.peers){");
     response->print("const cls=typeBadge[p.type]||'badge-unknown';");
-    response->print("h+='<tr><td>'+(p.name||'<em>unnamed</em>')+'</td>';");
-    response->print("h+='<td><span class=\"badge '+cls+'\">'+p.type+'</span></td>';");
+    response->print("h+='<tr><td>'+((p.name&&p.name.length)?escHtml(p.name):'<em>unnamed</em>')+'</td>';");
+    response->print("h+='<td><span class=\"badge '+cls+'\">'+escHtml(p.type||'-')+'</span></td>';");
     response->print("h+='<td class=\"mono\">0x'+p.hash.toString(16).toUpperCase().padStart(2,'0')+'</td>';");
     response->print("h+='<td>'+ago(p.lastAdvert)+'</td></tr>';}");
     response->print("h+='</table>';document.getElementById('peersTable').innerHTML=h;");
@@ -5688,7 +5689,7 @@ void setup() {
     response->print("document.getElementById('storageInfo').innerHTML='<div class=\"hint\">Storage: '+(d.usedBytes/1024).toFixed(0)+'KB / '+(d.totalBytes/1024).toFixed(0)+'KB used ('+pct+'%). LoRa log budget: '+(d.logBudget/1024).toFixed(0)+'KB ('+logPct+'%)</div><div class=\"storage-bar\"><div class=\"storage-fill\" style=\"width:'+pct+'%\"></div></div>';}");
 
     response->print("}catch(e){console.error('loadStats error:',e);");
-    response->print("document.getElementById('peersTable').innerHTML='<div class=\"empty\">Error loading peers: '+e.message+'. <a href=\"#\" onclick=\"loadStats();return false\">Retry</a></div>';");
+    response->print("document.getElementById('peersTable').innerHTML='<div class=\"empty\">Error loading peers: '+escHtml(e.message)+'. <a href=\"#\" onclick=\"loadStats();return false\">Retry</a></div>';");
     response->print("if(statsRetry<3){statsRetry++;setTimeout(loadStats,2000);}}}");
 
     // loadLog with error handling and retry
@@ -5707,14 +5708,14 @@ void setup() {
     response->print("const ts=parseInt(p[0]);const dir=p[1];const typ=p[2];const peer=p[3];const msg=p.slice(4,p.length-1).join(',');const st=p[p.length-1];");
     response->print("h+='<tr><td>'+fmtTime(ts)+'</td>';");
     response->print("h+='<td><span class=\"badge '+(dir==='S'?'badge-sent':'badge-recv')+'\">'+(dir==='S'?'Sent':'Recv')+'</span></td>';");
-    response->print("h+='<td>'+(typeLabels[typ]||typ)+'</td>';");
-    response->print("h+='<td>'+(peer||'-')+'</td>';");
-    response->print("h+='<td><span class=\"truncate\">'+(msg||'-')+'</span></td>';");
+    response->print("h+='<td>'+escHtml(typeLabels[typ]||typ||'-')+'</td>';");
+    response->print("h+='<td>'+escHtml(peer||'-')+'</td>';");
+    response->print("h+='<td><span class=\"truncate\">'+escHtml(msg||'-')+'</span></td>';");
     response->print("h+='<td><span class=\"badge '+(st==='ok'?'badge-ok':'badge-fail')+'\">'+(st||'-')+'</span></td></tr>';}");
     response->print("if(lines.length>max)h+='<tr><td colspan=\"6\" class=\"hint\">Showing '+max+' of '+lines.length+' entries</td></tr>';");
     response->print("h+='</table>';document.getElementById('logTable').innerHTML=h;");
     response->print("}catch(e){console.error('loadLog error:',e);");
-    response->print("document.getElementById('logTable').innerHTML='<div class=\"empty\">Error loading log: '+e.message+'. <a href=\"#\" onclick=\"loadLog();return false\">Retry</a></div>';");
+    response->print("document.getElementById('logTable').innerHTML='<div class=\"empty\">Error loading log: '+escHtml(e.message)+'. <a href=\"#\" onclick=\"loadLog();return false\">Retry</a></div>';");
     response->print("if(logRetry<3){logRetry++;setTimeout(loadLog,2000);}}}");
 
     response->print("async function clearLog(){if(!confirm('Clear LoRa message log?'))return;");
