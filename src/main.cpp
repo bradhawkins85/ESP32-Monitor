@@ -2425,9 +2425,16 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   if (!settings.loraEnabled) return false;
 
   uint8_t packet[64];
+  constexpr size_t kAckOverheadBytes = 1 /* header */ + 1 /* path_len */ + 4 /* ack hash */;
+  constexpr size_t kMaxDirectAckPathLen = sizeof(packet) - kAckOverheadBytes;
   size_t pktIdx = 0;
 
   bool useDirect = (replyPath != nullptr && replyPathLen > 0);
+  if (useDirect && replyPathLen > kMaxDirectAckPathLen) {
+    Serial.printf("[LoRa] ACK reply path too long for packet buffer (%u > %u), using flood ACK\n",
+                  (unsigned int)replyPathLen, (unsigned int)kMaxDirectAckPathLen);
+    useDirect = false;
+  }
   uint8_t routeType = useDirect ? ROUTE_TYPE_DIRECT : ROUTE_TYPE_FLOOD;
   uint8_t header = (uint8_t)((routeType & 0x03) | ((PAYLOAD_TYPE_ACK & 0x0F) << 2));
   packet[pktIdx++] = header;
