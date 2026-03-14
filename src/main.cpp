@@ -2605,6 +2605,8 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   packet[pktIdx++] = header;
   
   // Path (use node ID from MAC address for tracking)
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
   uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
   packet[pktIdx++] = 4;  // path_len
   packet[pktIdx++] = (uint8_t)(nodeId & 0xFF);
