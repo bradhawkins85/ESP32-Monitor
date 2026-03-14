@@ -37,7 +37,7 @@ jobs:
         run: |
           cat > .env << EOF
           FIRMWARE_VERSION=${{ steps.version.outputs.version }}
-          AUTO_OTA_ENABLED=true
+          AUTO_OTA_ENABLED=false
           AUTO_OTA_URL=https://github.com/${{ github.repository }}/releases/latest/download
           AUTO_OTA_CHECK_INTERVAL=3600
           EOF
