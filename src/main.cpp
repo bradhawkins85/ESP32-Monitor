@@ -5847,15 +5847,16 @@ static bool checkAutoOtaUpdate(bool applyIfAvailable) {
 
   HTTPClient http;
   WiFiClientSecure secureClient;
-  WiFiClient plainClient;
   bool isSecure = versionUrl.startsWith("https://");
 
   if (isSecure) {
-    secureClient.setInsecure();  // Skip certificate validation
     http.begin(secureClient, versionUrl);
   } else {
-    http.begin(plainClient, versionUrl);
+    Serial.println("[AutoOTA] Insecure OTA URL blocked: only HTTPS is allowed");
+    autoOtaLastCheckStatus = "insecure-url";
+    return false;
   }
+
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setTimeout(15000);
 
@@ -5940,15 +5941,17 @@ static bool checkAutoOtaUpdate(bool applyIfAvailable) {
 
   WiFiClient *updateClient;
   WiFiClientSecure secureUpdateClient;
-  WiFiClient plainUpdateClient;
   bool firmwareIsSecure = firmwareUrl.startsWith("https://");
 
   if (firmwareIsSecure) {
-    secureUpdateClient.setInsecure();
     updateClient = &secureUpdateClient;
   } else {
-    updateClient = &plainUpdateClient;
+    Serial.println("[AutoOTA] Insecure firmware URL blocked: only HTTPS is allowed");
+    autoOtaLastCheckStatus = "insecure-firmware-url";
+    autoOtaUpdateInProgress = false;
+    return true;
   }
+
 
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   httpUpdate.rebootOnUpdate(false);  // We'll reboot ourselves after logging
