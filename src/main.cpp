@@ -4903,8 +4903,13 @@ void setup() {
     request->send(200, "text/html", html);
   });
 
-  // Captive portal save (no auth)
+  // Captive portal save (allowed only while captive portal provisioning is active)
   server.on("/captive/save", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!captivePortalActive || isWifiConfigured()) {
+      request->send(403, "text/html", "<html><body>Captive portal is not active. <a href='/'>Back</a></body></html>");
+      return;
+    }
+
     String ssid = "";
     String password = "";
     if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
