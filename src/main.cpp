@@ -879,6 +879,7 @@ void loadSettingsOverrides() {
 
   // LoRa radio parameters
   if (doc["LORA_ENABLED"].is<bool>()) settings.loraEnabled = doc["LORA_ENABLED"].as<bool>();
+  if (doc["LORA_NODE_NAME"].is<String>()) settings.loraNodeName = doc["LORA_NODE_NAME"].as<String>();
   if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
   if (doc["LORA_IGNORE_PUBLIC"].is<bool>()) settings.loraIgnorePublic = doc["LORA_IGNORE_PUBLIC"].as<bool>();
   if (doc["LORA_COMMAND_PIN"].is<String>()) settings.loraCommandPin = doc["LORA_COMMAND_PIN"].as<String>();
@@ -1034,6 +1035,7 @@ bool saveSettingsOverrides() {
   doc["CHANNEL_SECRET"] = settings.channelSecret;
 
   doc["LORA_ENABLED"] = settings.loraEnabled;
+  doc["LORA_NODE_NAME"] = settings.loraNodeName;
   doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
   doc["LORA_IGNORE_PUBLIC"] = settings.loraIgnorePublic;
   doc["LORA_COMMAND_PIN"] = settings.loraCommandPin;
@@ -4499,7 +4501,7 @@ void setup() {
     page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),SHOW_BOOT_CREDENTIALS:boolVal('SHOW_BOOT_CREDENTIALS'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_IGNORE_PUBLIC:boolVal('LORA_IGNORE_PUBLIC'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_NODE_NAME:val('LORA_NODE_NAME'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_IGNORE_PUBLIC:boolVal('LORA_IGNORE_PUBLIC'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
     page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
