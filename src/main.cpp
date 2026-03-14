@@ -2563,15 +2563,9 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   size_t channelKeyLen = 0;
   deriveChannelKey(settings.channelName.c_str(), settings.channelSecret.c_str(), &channelHash, channelKey, &channelKeyLen);
   
-  // Get MAC address for node name
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  char nodeName[18];
-  snprintf(nodeName, sizeof(nodeName), "%02X:%02X:%02X:%02X:%02X:%02X", 
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  
-  // Format message as "nodeName: text" to match MeshCore group message format
-  String formattedMsg = String(nodeName) + ": " + notification;
+  // Format message as "nodeName: text" to match MeshCore group message format.
+  // Use ourNodeName so self-message suppression remains consistent with initNodeIdentity().
+  String formattedMsg = ourNodeName + ": " + notification;
   size_t textLen = formattedMsg.length();
   if (textLen > 220) textLen = 220;  // Leave room for timestamp + txt_type + padding
   
