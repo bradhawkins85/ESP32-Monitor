@@ -5470,6 +5470,16 @@ void setup() {
     },
     nullptr,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      // Require shared secret to prevent unauthenticated message injection
+      if (settings.channelSecret.length() == 0) {
+        request->send(503, "application/json", "{\"error\":\"inbound webhook secret not configured\"}");
+        return;
+      }
+      if (!request->hasHeader("X-Webhook-Secret") || request->header("X-Webhook-Secret") != settings.channelSecret) {
+        request->send(401, "application/json", "{\"error\":\"unauthorized\"}");
+        return;
+      }
+
       // Accumulate body
       if (index == 0) {
         request->_tempObject = new String();
@@ -5501,7 +5511,7 @@ void setup() {
 
         sendLoRaNotification(source, true, message);
 
-      fanOutInternetNotificationsWithId(combined);
+        fanOutInternetNotificationsWithId(combined);
 
         request->send(200, "application/json", "{\"status\":\"ok\"}");
       }
