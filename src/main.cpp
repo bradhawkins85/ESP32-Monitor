@@ -4658,6 +4658,7 @@ void setup() {
       html += "<div class='service-header'>";
       html += "<div class='service-name'>" + services[i].name + "</div>";
       html += "<div class='service-actions'>";
+      html += "<button class='icon-btn' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
       html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
       if (isAuthed) {
         html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
@@ -4848,6 +4849,17 @@ void setup() {
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
     html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
+    html += "async function checkServiceNow(i){try{";
+    html += "const res=await fetch('/api/service/check/'+i,{credentials:'include',method:'POST'});";
+    html += "const d=await res.json();";
+    html += "let msg='Check Results for \"'+services[i].name+'\"\\n\\n';";
+    html += "msg+='Result: '+(d.checkPassed?'✅ PASS':'❌ FAIL')+'\\n';";
+    html += "msg+='Service: '+d.serviceName+' (Type: '+['HTTP GET','Ping','SNMP GET','Port','Push','Uptime'][d.serviceType||0]+')'+(d.target?' @ '+d.target:'')+'\\n';";
+    html += "msg+='Detail: '+(d.checkError||'(none)')+'\\n';";
+    html += "msg+='Timestamp: '+new Date((d.timestamp||Math.floor(Date.now()/1000))*1000).toLocaleString()+'\\n';";
+    html += "msg+='\\nService will continue its normal check schedule regardless of this result.';";
+    html += "alert(msg);";
+    html += "}catch(e){alert('Check failed: '+e.message);}}";
     html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
     html += "const data={name:document.getElementById('serviceName').value,";
     html += "type:parseInt(document.getElementById('serviceType').value),";
@@ -5339,6 +5351,77 @@ void setup() {
     }
     f.close();
     request->send(response);
+  });
+
+  // API endpoint to immediately run a service check (Check Now)
+  server.onRegex("/api/service/check/([0-9]+)", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    int idx = request->pathArg(0).toInt();
+    if (idx < 0 || idx >= serviceCount) {
+      request->send(404, "application/json", "{\"error\":\"Service not found\"}");
+      return;
+    }
+
+    Service& svc = services[idx];
+    bool result = false;
+
+    // Save state before check
+    int prevPasses = svc.consecutivePasses;
+    int prevFails = svc.consecutiveFails;
+    bool prevIsUp = svc.isUp;
+    bool prevPending = svc.isPending;
+    String prevError = svc.lastError;
+
+    switch (svc.type) {
+      case TYPE_HTTP_GET:   result = checkHttpGet(svc); break;
+      case TYPE_PING:       result = checkPing(svc); break;
+      case TYPE_PORT:       result = checkPort(svc); break;
+      case TYPE_SNMP_GET:   result = checkSnmpGet(svc); break;
+      case TYPE_PUSH:       result = checkPush(svc); break;
+      case TYPE_UPTIME:     result = checkUptime(svc); break;
+      default:
+        svc.lastError = "Unknown service type";
+        result = false;
+    }
+
+    // Restore state (don't affect thresholds/notifications from a manual check)
+    svc.consecutivePasses = prevPasses;
+    svc.consecutiveFails = prevFails;
+    svc.isUp = prevIsUp;
+    svc.isPending = prevPending;
+
+    JsonDocument doc;
+    doc["checkPassed"] = result;
+    doc["error"] = svc.lastError;
+    doc["serviceName"] = svc.name;
+    doc["serviceType"] = (int)svc.type;
+    doc["host"] = svc.host;
+    doc["port"] = svc.port;
+    doc["url"] = svc.url;
+
+    // Capture the check result before restoring the previous error
+    String checkError = svc.lastError;
+    svc.lastError = prevError;
+
+    doc["checkError"] = checkError;
+
+    // Add type-specific details
+    if (svc.type == TYPE_PING || svc.type == TYPE_PORT) {
+      doc["target"] = svc.host;
+      if (svc.port > 0) doc["port"] = svc.port;
+    } else if (svc.type == TYPE_HTTP_GET) {
+      doc["url"] = svc.url;
+      doc["expectedResponse"] = svc.expectedResponse;
+    } else if (svc.type == TYPE_SNMP_GET) {
+      doc["snmpOid"] = svc.snmpOid;
+      doc["snmpExpectedValue"] = svc.snmpExpectedValue;
+    }
+
+    doc["timestamp"] = (unsigned long)time(nullptr);
+
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
   });
 
   // API endpoint to test notifications
