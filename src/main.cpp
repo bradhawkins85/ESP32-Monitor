@@ -5354,7 +5354,7 @@ void setup() {
   });
 
   // API endpoint to immediately run a service check (Check Now)
-  server.onRegex("/api/service/check/([0-9]+)", HTTP_POST, [](AsyncWebServerRequest *request){
+  server.on("^/api/service/check/([0-9]+)$", HTTP_POST, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
     int idx = request->pathArg(0).toInt();
     if (idx < 0 || idx >= serviceCount) {
