@@ -104,7 +104,7 @@ struct Service {
   String path;
   String url;
   String expectedResponse;
-  int checkInterval;
+  String cronExpression;
   int passThreshold;
   int failThreshold;
   int rearmCount;
@@ -115,6 +115,8 @@ struct Service {
   bool hasBeenUp;
   bool isPending;
   unsigned long lastCheck;
+  unsigned long lastAutomaticCheck;
+  uint32_t lastCronMinute;
   String lastError;
   // SNMP fields
   String snmpOid;
@@ -1966,6 +1968,96 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
 bool isAuthenticated(AsyncWebServerRequest *request, bool sendUnauthorized = true);
 String generateSessionToken();
 
+// --- Five-field cron scheduling (minute hour day-of-month month day-of-week) ---
+static bool parseCronNumber(const String& text, int minValue, int maxValue, int& value, bool dayOfWeek = false) {
+  if (text.length() == 0) return false;
+  for (size_t i = 0; i < text.length(); i++) {
+    if (!isDigit(text[i])) return false;
+  }
+  value = text.toInt();
+  if (dayOfWeek && value == 7) value = 0;
+  return value >= minValue && value <= maxValue;
+}
+
+static bool cronFieldMatches(const String& field, int value, int minValue, int maxValue,
+                             bool dayOfWeek = false, bool validateOnly = false) {
+  if (field.length() == 0) return false;
+  int itemStart = 0;
+  bool matched = false;
+  while (itemStart < (int)field.length()) {
+    int comma = field.indexOf(',', itemStart);
+    if (comma < 0) comma = field.length();
+    String item = field.substring(itemStart, comma);
+    if (item.length() == 0) return false;
+
+    int slash = item.indexOf('/');
+    String range = slash < 0 ? item : item.substring(0, slash);
+    int step = 1;
+    if (slash >= 0) {
+      String stepText = item.substring(slash + 1);
+      if (item.indexOf('/', slash + 1) >= 0 || !parseCronNumber(stepText, 1, maxValue - minValue + 1, step)) return false;
+    }
+
+    int first = minValue;
+    int last = maxValue;
+    if (range != "*") {
+      int dash = range.indexOf('-');
+      if (dash < 0) {
+        if (!parseCronNumber(range, minValue, maxValue, first, dayOfWeek)) return false;
+        last = first;
+      } else {
+        if (range.indexOf('-', dash + 1) >= 0) return false;
+        if (!parseCronNumber(range.substring(0, dash), minValue, maxValue, first, dayOfWeek) ||
+            !parseCronNumber(range.substring(dash + 1), minValue, maxValue, last, dayOfWeek) || first > last) return false;
+      }
+    }
+
+    if (value >= first && value <= last && ((value - first) % step) == 0) matched = true;
+    itemStart = comma + 1;
+  }
+  return validateOnly || matched;
+}
+
+static bool splitCronExpression(const String& expression, String fields[5]) {
+  String cron = expression;
+  cron.trim();
+  int pos = 0;
+  for (int field = 0; field < 5; field++) {
+    while (pos < (int)cron.length() && cron[pos] == ' ') pos++;
+    if (pos >= (int)cron.length()) return false;
+    int end = cron.indexOf(' ', pos);
+    if (end < 0) end = cron.length();
+    fields[field] = cron.substring(pos, end);
+    pos = end;
+  }
+  while (pos < (int)cron.length() && cron[pos] == ' ') pos++;
+  return pos == (int)cron.length();
+}
+
+static bool isValidCronExpression(const String& expression) {
+  String fields[5];
+  if (!splitCronExpression(expression, fields)) return false;
+  return cronFieldMatches(fields[0], 0, 0, 59, false, true) &&
+         cronFieldMatches(fields[1], 0, 0, 23, false, true) &&
+         cronFieldMatches(fields[2], 1, 1, 31, false, true) &&
+         cronFieldMatches(fields[3], 1, 1, 12, false, true) &&
+         cronFieldMatches(fields[4], 0, 0, 6, true, true);
+}
+
+static bool cronMatches(const String& expression, const struct tm& utc) {
+  String fields[5];
+  if (!splitCronExpression(expression, fields)) return false;
+  bool minute = cronFieldMatches(fields[0], utc.tm_min, 0, 59);
+  bool hour = cronFieldMatches(fields[1], utc.tm_hour, 0, 23);
+  bool month = cronFieldMatches(fields[3], utc.tm_mon + 1, 1, 12);
+  bool dom = cronFieldMatches(fields[2], utc.tm_mday, 1, 31);
+  bool dow = cronFieldMatches(fields[4], utc.tm_wday, 0, 6, true);
+  bool domWildcard = fields[2] == "*";
+  bool dowWildcard = fields[4] == "*";
+  bool day = domWildcard ? dow : (dowWildcard ? dom : (dom || dow));
+  return minute && hour && month && day;
+}
+
 // --- Service Persistence ---
 void saveServices() {
   File file = LittleFS.open("/services.json", "w");
@@ -1987,7 +2079,7 @@ void saveServices() {
     svc["path"] = services[i].path;
     svc["url"] = services[i].url;
     svc["expectedResponse"] = services[i].expectedResponse;
-    svc["checkInterval"] = services[i].checkInterval;
+    svc["cronExpression"] = services[i].cronExpression;
     svc["passThreshold"] = services[i].passThreshold;
     svc["failThreshold"] = services[i].failThreshold;
     svc["rearmCount"] = services[i].rearmCount;
@@ -2050,6 +2142,7 @@ void loadServices() {
   
   JsonArray array = doc["services"].as<JsonArray>();
   serviceCount = 0;
+  bool migratedSchedule = false;
   
   for (JsonObject svc : array) {
     if (serviceCount >= MAX_SERVICES) break;
@@ -2062,7 +2155,12 @@ void loadServices() {
     services[serviceCount].path = svc["path"].as<String>();
     services[serviceCount].url = svc["url"].as<String>();
     services[serviceCount].expectedResponse = svc["expectedResponse"].as<String>();
-    services[serviceCount].checkInterval = svc["checkInterval"].as<int>();
+    String cronExpression = svc["cronExpression"].as<String>();
+    if (!isValidCronExpression(cronExpression)) {
+      cronExpression = "* * * * *";
+      migratedSchedule = true;
+    }
+    services[serviceCount].cronExpression = cronExpression;
     services[serviceCount].passThreshold = svc["passThreshold"].as<int>();
     services[serviceCount].failThreshold = svc["failThreshold"].as<int>();
     services[serviceCount].rearmCount = svc["rearmCount"].as<int>();
@@ -2105,6 +2203,8 @@ void loadServices() {
     services[serviceCount].hasBeenUp = false;
     services[serviceCount].isPending = true;
     services[serviceCount].lastCheck = 0;
+    services[serviceCount].lastAutomaticCheck = 0;
+    services[serviceCount].lastCronMinute = UINT32_MAX;
     services[serviceCount].lastError = "";
     services[serviceCount].lastPush = 0;
     services[serviceCount].pauseUntil = 0;
@@ -2113,6 +2213,10 @@ void loadServices() {
   }
   
   Serial.printf("Loaded %d services from LittleFS\n", serviceCount);
+  if (migratedSchedule) {
+    saveServices();
+    Serial.println("Migrated service schedules to '* * * * *'");
+  }
 }
 
 // --- Service Initialization ---
@@ -2125,7 +2229,7 @@ void initDemoServices() {
   httpSvc.type = TYPE_HTTP_GET;
   httpSvc.url = "http://example.com";
   httpSvc.expectedResponse = "Example Domain";
-  httpSvc.checkInterval = 10; // seconds
+  httpSvc.cronExpression = "* * * * *";
   httpSvc.passThreshold = 1;
   httpSvc.failThreshold = 2;
   httpSvc.enabled = true;
@@ -2135,6 +2239,8 @@ void initDemoServices() {
   httpSvc.hasBeenUp = false;
   httpSvc.isPending = true;
   httpSvc.lastCheck = 0;
+  httpSvc.lastAutomaticCheck = 0;
+  httpSvc.lastCronMinute = UINT32_MAX;
   httpSvc.alertLora = true;
   httpSvc.alertNtfy = true;
   httpSvc.alertDiscord = true;
@@ -2151,7 +2257,7 @@ void initDemoServices() {
   pingSvc.name = "Ping Google";
   pingSvc.type = TYPE_PING;
   pingSvc.host = "8.8.8.8";
-  pingSvc.checkInterval = 15; // seconds
+  pingSvc.cronExpression = "* * * * *";
   pingSvc.passThreshold = 1;
   pingSvc.failThreshold = 2;
   pingSvc.enabled = true;
@@ -2161,6 +2267,8 @@ void initDemoServices() {
   pingSvc.hasBeenUp = false;
   pingSvc.isPending = true;
   pingSvc.lastCheck = 0;
+  pingSvc.lastAutomaticCheck = 0;
+  pingSvc.lastCronMinute = UINT32_MAX;
   pingSvc.alertLora = true;
   pingSvc.alertNtfy = true;
   pingSvc.alertDiscord = true;
@@ -2181,7 +2289,7 @@ void initDemoServices() {
   snmpSvc.snmpCommunity = "public";
   snmpSvc.snmpCompareOp = OP_EQ;
   snmpSvc.snmpExpectedValue = "Linux";
-  snmpSvc.checkInterval = 20; // seconds
+  snmpSvc.cronExpression = "* * * * *";
   snmpSvc.passThreshold = 1;
   snmpSvc.failThreshold = 2;
   snmpSvc.enabled = true;
@@ -2191,6 +2299,8 @@ void initDemoServices() {
   snmpSvc.hasBeenUp = false;
   snmpSvc.isPending = true;
   snmpSvc.lastCheck = 0;
+  snmpSvc.lastAutomaticCheck = 0;
+  snmpSvc.lastCronMinute = UINT32_MAX;
   snmpSvc.alertLora = true;
   snmpSvc.alertNtfy = true;
   snmpSvc.alertDiscord = true;
@@ -2226,12 +2336,19 @@ bool executeServiceCheck(Service& svc) {
 }
 
 void checkAllServices() {
-  unsigned long now = millis();
+  time_t now = time(nullptr);
+  if (now < 1000000000) return;
+  struct tm utc;
+  gmtime_r(&now, &utc);
+  uint32_t cronMinute = (uint32_t)(now / 60);
   for (int i = 0; i < serviceCount; i++) {
     Service& svc = services[i];
     if (!svc.enabled) continue;
-    if (svc.lastCheck == 0 || now - svc.lastCheck >= (unsigned long)svc.checkInterval * 1000) {
+    if (svc.lastCronMinute == cronMinute) continue;
+    svc.lastCronMinute = cronMinute;
+    if (cronMatches(svc.cronExpression, utc)) {
       executeServiceCheck(svc);
+      svc.lastAutomaticCheck = millis();
     }
   }
 }
@@ -2279,7 +2396,7 @@ String getServicesJson() {
     obj["snmpExpectedValue"] = services[i].snmpExpectedValue;
     obj["uptimeThreshold"] = services[i].uptimeThreshold;
     obj["uptimeCompareOp"] = (int)services[i].uptimeCompareOp;
-    obj["checkInterval"] = services[i].checkInterval;
+    obj["cronExpression"] = services[i].cronExpression;
     obj["passThreshold"] = services[i].passThreshold;
     obj["failThreshold"] = services[i].failThreshold;
     obj["alertLora"] = services[i].alertLora;
@@ -3424,19 +3541,18 @@ bool checkSnmpGet(Service& service) {
 }
 
 bool checkPush(Service& service) {
-  unsigned long now = millis();
   if (service.lastPush == 0) {
     service.lastError = "No push received yet";
     return false;
   }
 
-  unsigned long since = now - service.lastPush;
-  if (since <= (unsigned long)service.checkInterval * 1000) {
-    service.lastError = "Last push " + String(since / 1000) + "s ago";
+  unsigned long age = millis() - service.lastPush;
+  if (service.lastAutomaticCheck == 0 || (long)(service.lastPush - service.lastAutomaticCheck) >= 0) {
+    service.lastError = "Last push " + String(age / 1000) + "s ago";
     return true;
   }
 
-  service.lastError = "Push timeout (" + String(since / 1000) + "s ago)";
+  service.lastError = "No push received since the previous scheduled check";
   return false;
 }
 
@@ -3530,8 +3646,7 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
 
 // Send a native status request. The repeater identifies and authorizes this
 // monitor by its public key in Access Control; no password/PIN login is sent.
-// Returns true if a previous response arrived within the allowable window
-// (checkInterval * 2.5 s), false otherwise.
+// Returns true if a response arrived since the previous scheduled check.
 bool checkMeshNode(Service& svc) {
   if (!settings.loraEnabled) {
     svc.lastError = "LoRa disabled";
@@ -3572,14 +3687,12 @@ bool checkMeshNode(Service& svc) {
     return false;
   }
 
-  unsigned long windowMs = (unsigned long)(svc.checkInterval) * 2500UL;  // 2.5× interval
   unsigned long age = millis() - svc.meshLastResponseMs;
-  if (age <= windowMs) {
-    // Fresh enough response — node is reachable
+  if (svc.lastAutomaticCheck == 0 || (long)(svc.meshLastResponseMs - svc.lastAutomaticCheck) >= 0) {
     return true;
   }
 
-  svc.lastError = "No response for " + String(age / 1000) + "s (timeout " + String(windowMs / 1000) + "s)";
+  svc.lastError = "No response since the previous scheduled check (last response " + String(age / 1000) + "s ago)";
   return false;
 }
 
@@ -5069,8 +5182,9 @@ void setup() {
     html += "<div class='form-group'><label class='form-label'>Compare</label>";
     html += "<select id='serviceUptimeCompareOp' class='form-select'><option value='0'>==</option><option value='1'>!=</option><option value='2'>> </option><option value='3'>< </option><option value='4'>>=</option><option value='5'><=</option></select></div></div>";
     html += "<div class='form-row'>";
-    html += "<div class='form-group'><label class='form-label'>Check Interval (seconds)</label>";
-    html += "<input type='number' id='serviceCheckInterval' class='form-input' value='60'></div>";
+    html += "<div class='form-group'><label class='form-label'>Cron Expression (UTC)</label>";
+    html += "<input type='text' id='serviceCronExpression' class='form-input' value='* * * * *' placeholder='minute hour day month weekday' required>";
+    html += "<div class='hint'>Five fields: minute hour day-of-month month day-of-week. Supports *, lists, ranges, and steps.</div></div>";
     html += "<div class='form-group'><label class='form-label'>Pass Threshold</label>";
     html += "<input type='number' id='servicePassThreshold' class='form-input' value='1'></div></div>";
     html += "<div class='form-group'><label class='form-label'>Fail Threshold</label>";
@@ -5156,7 +5270,7 @@ void setup() {
     html += "document.getElementById('serviceSnmpExpectedValue').value=s.snmpExpectedValue||'';";
     html += "document.getElementById('serviceUptimeThreshold').value=s.uptimeThreshold||0;";
     html += "document.getElementById('serviceUptimeCompareOp').value=s.uptimeCompareOp||0;";
-    html += "document.getElementById('serviceCheckInterval').value=s.checkInterval;";
+    html += "document.getElementById('serviceCronExpression').value=s.cronExpression||'* * * * *';";
     html += "document.getElementById('servicePassThreshold').value=s.passThreshold;";
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
     html += "document.getElementById('serviceWolMac').value=s.wolMacAddress||'';";
@@ -5179,7 +5293,7 @@ void setup() {
     html += "msg+='Detail: '+(d.checkError||'(none)')+'\\n';";
     html += "if(d.serviceType===6){msg+='Battery: '+(d.meshLastBatteryPct||0)+'% ('+(d.meshLastBatteryV||0).toFixed(2)+'V)\\n';msg+='Repeater: '+(d.meshRepeaterKnownState?'on':'off')+'\\n';}";
     html += "msg+='Timestamp: '+new Date((d.timestamp||Math.floor(Date.now()/1000))*1000).toLocaleString()+'\\n';";
-    html += "msg+='\\nThis result has been stored and the normal check interval restarts from now.';";
+    html += "msg+='\\nThis result has been stored; the cron schedule is unchanged.';";
     html += "alert(msg);";
     html += "}catch(e){alert('Check failed: '+e.message);}}";
     html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
@@ -5197,7 +5311,7 @@ void setup() {
     html += "snmpExpectedValue:document.getElementById('serviceSnmpExpectedValue').value,";
     html += "uptimeThreshold:parseInt(document.getElementById('serviceUptimeThreshold').value)||0,";
     html += "uptimeCompareOp:parseInt(document.getElementById('serviceUptimeCompareOp').value)||0,";
-    html += "checkInterval:parseInt(document.getElementById('serviceCheckInterval').value),";
+    html += "cronExpression:document.getElementById('serviceCronExpression').value.trim(),";
     html += "passThreshold:parseInt(document.getElementById('servicePassThreshold').value),";
     html += "failThreshold:parseInt(document.getElementById('serviceFailThreshold').value),";
     html += "wolMacAddress:document.getElementById('serviceWolMac').value,";
@@ -5210,7 +5324,7 @@ void setup() {
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
     html += "const method=idx==='-1'?'POST':'PUT';";
     html += "fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data),credentials:'include'})";
-    html += ".then(r=>{if(r.ok){location.reload();}else{alert('Save failed');modalOpen=false;}})};";
+    html += ".then(async r=>{if(r.ok){location.reload();}else{alert((await r.text())||'Save failed');modalOpen=false;}})};";
     html += "function testNotifications(){if(!isAuthed){alert('Login required');return;}if(confirm('Send test notification on all channels?')){";
     html += "fetch('/api/test-notification',{method:'POST',credentials:'include'})";
     html += ".then(r=>r.ok?alert('Test notification sent!'):alert('Failed to send test notification'))}}";
@@ -5417,7 +5531,7 @@ void setup() {
       obj["port"] = services[i].port;
       obj["url"] = services[i].url;
       obj["expectedResponse"] = services[i].expectedResponse;
-      obj["checkInterval"] = services[i].checkInterval;
+      obj["cronExpression"] = services[i].cronExpression;
       obj["passThreshold"] = services[i].passThreshold;
       obj["failThreshold"] = services[i].failThreshold;
       obj["enabled"] = services[i].enabled;
@@ -5471,7 +5585,8 @@ void setup() {
             svc.port = obj["port"].as<int>();
             svc.url = obj["url"].as<String>();
             svc.expectedResponse = obj["expectedResponse"].as<String>();
-            svc.checkInterval = obj["checkInterval"].as<int>();
+            svc.cronExpression = obj["cronExpression"].as<String>();
+            if (!isValidCronExpression(svc.cronExpression)) svc.cronExpression = "* * * * *";
             svc.passThreshold = obj["passThreshold"].as<int>();
             svc.failThreshold = obj["failThreshold"].as<int>();
             svc.enabled = obj["enabled"].as<bool>();
@@ -5503,6 +5618,8 @@ void setup() {
             svc.isUp = false;
             svc.hasBeenUp = false;
             svc.lastCheck = 0;
+            svc.lastAutomaticCheck = 0;
+            svc.lastCronMinute = UINT32_MAX;
             services[serviceCount++] = svc;
           }
           saveServices();  // Persist to LittleFS
@@ -5528,6 +5645,12 @@ void setup() {
         request->send(400, "text/plain", "Invalid JSON");
         return;
       }
+      String cronExpression = doc["cronExpression"].as<String>();
+      cronExpression.trim();
+      if (!isValidCronExpression(cronExpression)) {
+        request->send(400, "text/plain", "Invalid cron expression. Use five fields: minute hour day month weekday");
+        return;
+      }
       Service svc;
       svc.id = "svc" + String(serviceCount + 1);
       svc.name = doc["name"].as<String>();
@@ -5544,7 +5667,7 @@ void setup() {
       svc.snmpExpectedValue = doc["snmpExpectedValue"].as<String>();
       svc.uptimeThreshold = doc["uptimeThreshold"].as<int>();
       svc.uptimeCompareOp = (CompareOp)doc["uptimeCompareOp"].as<int>();
-      svc.checkInterval = doc["checkInterval"].as<int>();
+      svc.cronExpression = cronExpression;
       svc.passThreshold = doc["passThreshold"].as<int>();
       svc.failThreshold = doc["failThreshold"].as<int>();
       svc.alertLora = doc["alertLora"].isNull() ? true : doc["alertLora"].as<bool>();
@@ -5579,6 +5702,8 @@ void setup() {
       svc.isUp = false;
       svc.hasBeenUp = false;
       svc.lastCheck = 0;
+      svc.lastAutomaticCheck = 0;
+      svc.lastCronMinute = UINT32_MAX;
       svc.lastPush = 0;
       services[serviceCount++] = svc;
       saveServices();  // Persist to LittleFS
@@ -5601,6 +5726,12 @@ void setup() {
         request->send(400, "text/plain", "Invalid JSON");
         return;
       }
+      String cronExpression = doc["cronExpression"].as<String>();
+      cronExpression.trim();
+      if (!isValidCronExpression(cronExpression)) {
+        request->send(400, "text/plain", "Invalid cron expression. Use five fields: minute hour day month weekday");
+        return;
+      }
       services[idx].name = doc["name"].as<String>();
       services[idx].type = (ServiceType)doc["type"].as<int>();
       services[idx].enabled = doc["enabled"].as<bool>();
@@ -5618,7 +5749,8 @@ void setup() {
       services[idx].snmpExpectedValue = doc["snmpExpectedValue"].as<String>();
       services[idx].uptimeThreshold = doc["uptimeThreshold"].as<int>();
       services[idx].uptimeCompareOp = (CompareOp)doc["uptimeCompareOp"].as<int>();
-      services[idx].checkInterval = doc["checkInterval"].as<int>();
+      services[idx].cronExpression = cronExpression;
+      services[idx].lastCronMinute = UINT32_MAX;
       services[idx].passThreshold = doc["passThreshold"].as<int>();
       services[idx].failThreshold = doc["failThreshold"].as<int>();
       services[idx].alertLora = doc["alertLora"].isNull() ? true : doc["alertLora"].as<bool>();
