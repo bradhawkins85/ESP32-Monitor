@@ -77,6 +77,7 @@ bool_vars = {
     "LORA_ENABLED": os.environ.get("LORA_ENABLED", "true"),
     "LORA_IP_ALERTS": os.environ.get("LORA_IP_ALERTS", "true"),
     "LORA_IGNORE_PUBLIC": os.environ.get("LORA_IGNORE_PUBLIC", "true"),
+    "LORA_MULTI_BYTE": os.environ.get("LORA_MULTI_BYTE", "false"),
     "DISCORD_ENABLED": os.environ.get("DISCORD_ENABLED", "false"),
     "DISCORD_IP_ALERTS": os.environ.get("DISCORD_IP_ALERTS", "true"),
     "NTFY_ENABLED": os.environ.get("NTFY_ENABLED", "true"),
@@ -94,6 +95,24 @@ bool_vars = {
     "MQTT_MESH_RELAY": os.environ.get("MQTT_MESH_RELAY", "false"),
     "SHOW_BOOT_CREDENTIALS": os.environ.get("SHOW_BOOT_CREDENTIALS", "true"),
 }
+
+# Mesh path hash size (1..4). If missing, fall back to legacy LORA_MULTI_BYTE.
+_path_hash_size_raw = os.environ.get("LORA_PATH_HASH_SIZE", "").strip()
+if _path_hash_size_raw:
+    try:
+        _path_hash_size_int = int(_path_hash_size_raw)
+    except ValueError:
+        _path_hash_size_int = 1
+else:
+    _legacy_multi = os.environ.get("LORA_MULTI_BYTE", "false").strip().lower() in ["true", "1", "yes", "on"]
+    _path_hash_size_int = 4 if _legacy_multi else 1
+
+if _path_hash_size_int < 1:
+    _path_hash_size_int = 1
+if _path_hash_size_int > 4:
+    _path_hash_size_int = 4
+
+_path_hash_size_val = str(_path_hash_size_int)
 
 # Tri-state OTA setting: "false"/"0" = 0, "true"/"1" = 1, "delayed"/"2" = 2
 _ota_raw = os.environ.get("AUTO_OTA_ENABLED", "false").strip().lower()
@@ -159,6 +178,7 @@ int_vars = {
     "LED_PIN": os.environ.get("LED_PIN", "35"),
     "LORA_SPREADING_FACTOR": os.environ.get("LORA_SPREADING_FACTOR", "7"),
     "LORA_CODING_RATE": os.environ.get("LORA_CODING_RATE", "5"),
+    "LORA_PATH_HASH_SIZE": _path_hash_size_val,
     "MQTT_QOS": os.environ.get("MQTT_QOS", "0"),
     "AUTO_OTA_CHECK_INTERVAL": os.environ.get("AUTO_OTA_CHECK_INTERVAL", "86400"),
 }

@@ -147,6 +147,18 @@
 #define LORA_IGNORE_PUBLIC true  // Ignore messages on the MeshCore public channel
 #endif
 
+#ifndef LORA_MULTI_BYTE
+#define LORA_MULTI_BYTE false  // Use MeshCore multi-byte path hashes (4-byte)
+#endif
+
+#ifndef LORA_PATH_HASH_SIZE
+#if LORA_MULTI_BYTE
+#define LORA_PATH_HASH_SIZE 4
+#else
+#define LORA_PATH_HASH_SIZE 1
+#endif
+#endif
+
 #ifndef LORA_NODE_NAME
 #define LORA_NODE_NAME ""  // Default: first 8 hex chars of public key
 #endif

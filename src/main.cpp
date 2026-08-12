@@ -1115,6 +1115,7 @@ struct Settings {
   bool loraEnabled;
   bool loraIpAlerts;
   bool loraIgnorePublic;
+  uint8_t loraPathHashSize;
   String loraNodeName;
   String loraCommandPin;
   float loraFreq;
@@ -1181,6 +1182,37 @@ struct Settings {
 };
 
 Settings settings;
+
+static uint8_t ourMeshPathHash[4] = {0};
+static uint8_t ourMeshPathHashSize = 1;
+
+static uint8_t normalizeMeshPathHashSize(int value) {
+  if (value < 1) return 1;
+  if (value > 4) return 4;
+  return (uint8_t)value;
+}
+
+static uint8_t encodeMeshPathLen(uint8_t hashSize, uint8_t hashCount = 1) {
+  if (hashSize < 1) hashSize = 1;
+  if (hashSize > 4) hashSize = 4;
+  if (hashCount < 1) hashCount = 1;
+  if (hashCount > 0x3F) hashCount = 0x3F;
+  return (uint8_t)(((hashSize - 1U) << 6) | (hashCount & 0x3FU));
+}
+
+static void refreshOurMeshPathHash() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  ourMeshPathHashSize = normalizeMeshPathHashSize(settings.loraPathHashSize);
+  ourMeshPathHash[0] = mac[5];
+  ourMeshPathHash[1] = (ourMeshPathHashSize >= 2) ? mac[4] : 0;
+  ourMeshPathHash[2] = (ourMeshPathHashSize >= 3) ? mac[3] : 0;
+  ourMeshPathHash[3] = (ourMeshPathHashSize >= 4) ? mac[2] : 0;
+}
+
+static uint8_t currentMeshOriginPathLenByte() {
+  return encodeMeshPathLen(ourMeshPathHashSize, 1);
+}
 
 // ============================================
 // Runtime Credential Generation
@@ -1294,6 +1326,7 @@ Settings defaultSettingsFromBuild() {
   s.loraEnabled = (LORA_ENABLED != 0);
   s.loraIpAlerts = (LORA_IP_ALERTS != 0);
   s.loraIgnorePublic = (LORA_IGNORE_PUBLIC != 0);
+  s.loraPathHashSize = normalizeMeshPathHashSize((int)LORA_PATH_HASH_SIZE);
   s.loraNodeName = String(LORA_NODE_NAME);
   s.loraCommandPin = "";  // Will be set from generated credentials
   s.loraFreq = (float)LORA_FREQ;
@@ -1409,6 +1442,16 @@ void loadSettingsOverrides() {
   if (doc["LORA_NODE_NAME"].is<String>()) settings.loraNodeName = doc["LORA_NODE_NAME"].as<String>();
   if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
   if (doc["LORA_IGNORE_PUBLIC"].is<bool>()) settings.loraIgnorePublic = doc["LORA_IGNORE_PUBLIC"].as<bool>();
+  bool hasPathHashSize = false;
+  if (doc["LORA_PATH_HASH_SIZE"].is<int>()) {
+    settings.loraPathHashSize = normalizeMeshPathHashSize(doc["LORA_PATH_HASH_SIZE"].as<int>());
+    hasPathHashSize = true;
+  }
+  if (doc["LORA_PATH_HASH_SIZE"].is<String>()) {
+    settings.loraPathHashSize = normalizeMeshPathHashSize(doc["LORA_PATH_HASH_SIZE"].as<String>().toInt());
+    hasPathHashSize = true;
+  }
+  if (!hasPathHashSize && doc["LORA_MULTI_BYTE"].is<bool>()) settings.loraPathHashSize = doc["LORA_MULTI_BYTE"].as<bool>() ? 4 : 1;
   if (doc["LORA_COMMAND_PIN"].is<String>()) settings.loraCommandPin = doc["LORA_COMMAND_PIN"].as<String>();
   if (doc["LORA_FREQ"].is<float>()) settings.loraFreq = doc["LORA_FREQ"].as<float>();
   if (doc["LORA_FREQ"].is<double>()) settings.loraFreq = (float)doc["LORA_FREQ"].as<double>();
@@ -1535,6 +1578,7 @@ void loadSettingsOverrides() {
   if (settings.mqttPort <= 0) settings.mqttPort = 1883;
   if (settings.mqttQos < 0) settings.mqttQos = 0;
   if (settings.mqttQos > 2) settings.mqttQos = 2;
+  settings.loraPathHashSize = normalizeMeshPathHashSize(settings.loraPathHashSize);
 }
 
 bool saveSettingsOverrides() {
@@ -1568,6 +1612,8 @@ bool saveSettingsOverrides() {
   doc["LORA_NODE_NAME"] = settings.loraNodeName;
   doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
   doc["LORA_IGNORE_PUBLIC"] = settings.loraIgnorePublic;
+  doc["LORA_PATH_HASH_SIZE"] = settings.loraPathHashSize;
+  doc["LORA_MULTI_BYTE"] = settings.loraPathHashSize > 1;
   doc["LORA_COMMAND_PIN"] = settings.loraCommandPin;
   doc["LORA_FREQ"] = settings.loraFreq;
   doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
@@ -3199,6 +3245,11 @@ void initNodeIdentity() {
   ourNodeHashAlt = computeNodeHashSha256(ed25519_public_key);
   Serial.printf("Node hash (pubkey[0]): 0x%02X, alt (sha256[0]): 0x%02X\n", ourNodeHash, ourNodeHashAlt);
 
+  refreshOurMeshPathHash();
+  Serial.printf("Mesh path hash size: %u byte(s) (path_len=0x%02X)\n",
+                (unsigned int)ourMeshPathHashSize,
+                currentMeshOriginPathLenByte());
+
   clearPeerCache();
   initPendingMeshChecks();
   initPendingMeshAdminCommands();
@@ -3557,15 +3608,10 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   uint8_t header = (uint8_t)((ROUTE_TYPE_FLOOD & 0x03) | ((PAYLOAD_TYPE_GRP_TXT & 0x0F) << 2));
   packet[pktIdx++] = header;
   
-  // Path (use node ID from MAC address for tracking)
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
-  packet[pktIdx++] = 4;  // path_len
-  packet[pktIdx++] = (uint8_t)(nodeId & 0xFF);
-  packet[pktIdx++] = (uint8_t)((nodeId >> 8) & 0xFF);
-  packet[pktIdx++] = (uint8_t)((nodeId >> 16) & 0xFF);
-  packet[pktIdx++] = (uint8_t)((nodeId >> 24) & 0xFF);
+  // Path (single-byte or MeshCore multi-byte, based on settings)
+  packet[pktIdx++] = currentMeshOriginPathLenByte();
+  memcpy(&packet[pktIdx], ourMeshPathHash, ourMeshPathHashSize);
+  pktIdx += ourMeshPathHashSize;
   
   // Channel hash (1 byte)
   packet[pktIdx++] = channelHash;
@@ -3601,11 +3647,6 @@ void sendBootAdvert() {
     }
     return;
   }
-  
-  // Get MAC address for node ID
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
   
   // Use configured node name, or default to first 8 chars of public key
   String nodeNameStr = settings.loraNodeName;
@@ -3688,9 +3729,10 @@ void sendBootAdvert() {
   uint8_t floodHeader = (uint8_t)((ROUTE_TYPE_FLOOD & 0x03) | ((PAYLOAD_TYPE_ADVERT & 0x0F) << 2));
   packet[pktIdx++] = floodHeader;
   
-  // Path (last byte of MAC address only)
-  packet[pktIdx++] = 1;  // path_len (1 byte)
-  packet[pktIdx++] = mac[5];  // Last byte of MAC (e.g., E0)
+  // Path (single-byte or MeshCore multi-byte, based on settings)
+  packet[pktIdx++] = currentMeshOriginPathLenByte();
+  memcpy(&packet[pktIdx], ourMeshPathHash, ourMeshPathHashSize);
+  pktIdx += ourMeshPathHashSize;
   
   // Advert payload
   if (pktIdx + payloadIdx > sizeof(packet)) {
@@ -5224,13 +5266,10 @@ void sendPingPacket() {
   uint8_t header = (uint8_t)((ROUTE_TYPE_FLOOD & 0x03) | ((PAYLOAD_TYPE_GRP_TXT & 0x0F) << 2));
   packet[pktIdx++] = header;         // header: version=0, payload=GRP_TXT, route=FLOOD
   
-  // Add node hash to path (use last 4 bytes of MAC as 32-bit node ID)
-  uint32_t nodeId = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
-  packet[pktIdx++] = 4;              // path length = 4 bytes (node ID)
-  packet[pktIdx++] = (uint8_t)(nodeId & 0xFF);
-  packet[pktIdx++] = (uint8_t)((nodeId >> 8) & 0xFF);
-  packet[pktIdx++] = (uint8_t)((nodeId >> 16) & 0xFF);
-  packet[pktIdx++] = (uint8_t)((nodeId >> 24) & 0xFF);
+  // Add node hash path (single-byte or MeshCore multi-byte, based on settings)
+  packet[pktIdx++] = currentMeshOriginPathLenByte();
+  memcpy(&packet[pktIdx], ourMeshPathHash, ourMeshPathHashSize);
+  pktIdx += ourMeshPathHashSize;
   
   packet[pktIdx++] = channelHash;    // channel hash byte
 
@@ -5445,6 +5484,8 @@ void setup() {
     doc["LORA_NODE_NAME"] = settings.loraNodeName;
     doc["LORA_IP_ALERTS"] = settings.loraIpAlerts;
     doc["LORA_IGNORE_PUBLIC"] = settings.loraIgnorePublic;
+    doc["LORA_PATH_HASH_SIZE"] = settings.loraPathHashSize;
+    doc["LORA_MULTI_BYTE"] = settings.loraPathHashSize > 1;
     doc["LORA_FREQ"] = settings.loraFreq;
     doc["LORA_BANDWIDTH"] = settings.loraBandwidth;
     doc["LORA_SPREADING_FACTOR"] = settings.loraSpreadingFactor;
@@ -5569,6 +5610,16 @@ void setup() {
       if (doc["LORA_NODE_NAME"].is<String>()) settings.loraNodeName = doc["LORA_NODE_NAME"].as<String>();
       if (doc["LORA_IP_ALERTS"].is<bool>()) settings.loraIpAlerts = doc["LORA_IP_ALERTS"].as<bool>();
       if (doc["LORA_IGNORE_PUBLIC"].is<bool>()) settings.loraIgnorePublic = doc["LORA_IGNORE_PUBLIC"].as<bool>();
+      bool hasPathHashSize = false;
+      if (doc["LORA_PATH_HASH_SIZE"].is<int>()) {
+        settings.loraPathHashSize = normalizeMeshPathHashSize(doc["LORA_PATH_HASH_SIZE"].as<int>());
+        hasPathHashSize = true;
+      }
+      if (doc["LORA_PATH_HASH_SIZE"].is<String>()) {
+        settings.loraPathHashSize = normalizeMeshPathHashSize(doc["LORA_PATH_HASH_SIZE"].as<String>().toInt());
+        hasPathHashSize = true;
+      }
+      if (!hasPathHashSize && doc["LORA_MULTI_BYTE"].is<bool>()) settings.loraPathHashSize = doc["LORA_MULTI_BYTE"].as<bool>() ? 4 : 1;
       if (doc["LORA_COMMAND_PIN"].is<String>()) {
         String v = doc["LORA_COMMAND_PIN"].as<String>();
         if (v.length() > 0) settings.loraCommandPin = v;
@@ -5697,6 +5748,7 @@ void setup() {
       if (settings.loraCodingRate <= 0) settings.loraCodingRate = (int)LORA_CODING_RATE;
       if (settings.loraAckCount < 1) settings.loraAckCount = 1;
       if (settings.loraAckCount > 5) settings.loraAckCount = 5;
+      settings.loraPathHashSize = normalizeMeshPathHashSize(settings.loraPathHashSize);
 
       if (!saveSettingsOverrides()) {
         request->send(500, "application/json", "{\"error\":\"failed to save\"}");
@@ -5737,6 +5789,7 @@ void setup() {
       float bwDiff = settings.loraBandwidth - before.loraBandwidth;
       if (bwDiff < 0) bwDiff = -bwDiff;
       bool loraChanged = (before.loraEnabled != settings.loraEnabled) ||
+                        (before.loraPathHashSize != settings.loraPathHashSize) ||
                         (freqDiff > 0.0001f) ||
                         (bwDiff > 0.0001f) ||
                         (before.loraSpreadingFactor != settings.loraSpreadingFactor) ||
@@ -5802,6 +5855,7 @@ void setup() {
     page += "<div class='fg'><label class='lbl'>LoRa Enabled</label><select id='LORA_ENABLED'><option value='true'" + String(settings.loraEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>IP Alerts</label><select id='LORA_IP_ALERTS'><option value='true'" + String(settings.loraIpAlerts ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraIpAlerts ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Ignore Public Channel</label><select id='LORA_IGNORE_PUBLIC'><option value='true'" + String(settings.loraIgnorePublic ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.loraIgnorePublic ? " selected" : "") + ">No</option></select></div>";
+    page += "<div class='fg'><label class='lbl'>Mesh Path Hash Size</label><select id='LORA_PATH_HASH_SIZE'><option value='1'" + String(settings.loraPathHashSize == 1 ? " selected" : "") + ">1 byte</option><option value='2'" + String(settings.loraPathHashSize == 2 ? " selected" : "") + ">2 bytes</option><option value='3'" + String(settings.loraPathHashSize == 3 ? " selected" : "") + ">3 bytes</option><option value='4'" + String(settings.loraPathHashSize == 4 ? " selected" : "") + ">4 bytes</option></select><div class='hint'>Match this with MeshCore path hash mode. Mismatch can break direct path routing.</div></div>";
     page += "<div class='fg'><label class='lbl'>Frequency (MHz)</label><input id='LORA_FREQ' type='number' step='0.001' value='" + String(settings.loraFreq, 3) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Bandwidth (kHz)</label><input id='LORA_BANDWIDTH' type='number' step='0.1' value='" + String(settings.loraBandwidth, 1) + "'></div>";
     page += "<div class='fg'><label class='lbl'>Spreading Factor</label><input id='LORA_SPREADING_FACTOR' type='number' min='6' max='12' step='1' value='" + String(settings.loraSpreadingFactor) + "'></div>";
@@ -5901,7 +5955,7 @@ void setup() {
     page += "DNS_MODE:val('DNS_MODE'),STATIC_DNS1:val('STATIC_DNS1'),STATIC_DNS2:val('STATIC_DNS2'),";
     page += "ADMIN_USERNAME:val('ADMIN_USERNAME'),ADMIN_PASSWORD:val('ADMIN_PASSWORD'),SHOW_BOOT_CREDENTIALS:boolVal('SHOW_BOOT_CREDENTIALS'),";
     page += "CHANNEL_NAME:val('CHANNEL_NAME'),CHANNEL_SECRET:val('CHANNEL_SECRET'),";
-    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_NODE_NAME:val('LORA_NODE_NAME'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_IGNORE_PUBLIC:boolVal('LORA_IGNORE_PUBLIC'),LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
+    page += "LORA_ENABLED:boolVal('LORA_ENABLED'),LORA_NODE_NAME:val('LORA_NODE_NAME'),LORA_IP_ALERTS:boolVal('LORA_IP_ALERTS'),LORA_IGNORE_PUBLIC:boolVal('LORA_IGNORE_PUBLIC'),LORA_PATH_HASH_SIZE:parseInt(val('LORA_PATH_HASH_SIZE'))||1,LORA_COMMAND_PIN:val('LORA_COMMAND_PIN'),LORA_FREQ:val('LORA_FREQ'),LORA_BANDWIDTH:val('LORA_BANDWIDTH'),LORA_SPREADING_FACTOR:val('LORA_SPREADING_FACTOR'),LORA_CODING_RATE:val('LORA_CODING_RATE'),LORA_ACK_COUNT:val('LORA_ACK_COUNT'),LORA_DIRECT_ENABLED:boolVal('LORA_DIRECT_ENABLED'),LORA_DIRECT_NODES:collectDirectNodes(),";
     page += "NTFY_ENABLED:boolVal('NTFY_ENABLED'),NTFY_MESH_RELAY:boolVal('NTFY_MESH_RELAY'),NTFY_IP_ALERTS:boolVal('NTFY_IP_ALERTS'),";
     page += "NTFY_SERVER:val('NTFY_SERVER'),NTFY_TOPIC:val('NTFY_TOPIC'),NTFY_USERNAME:val('NTFY_USERNAME'),NTFY_PASSWORD:val('NTFY_PASSWORD'),NTFY_TOKEN:val('NTFY_TOKEN'),";
     page += "DISCORD_ENABLED:boolVal('DISCORD_ENABLED'),DISCORD_MESH_RELAY:boolVal('DISCORD_MESH_RELAY'),DISCORD_IP_ALERTS:boolVal('DISCORD_IP_ALERTS'),DISCORD_WEBHOOK_URL:val('DISCORD_WEBHOOK_URL'),";
@@ -9195,10 +9249,18 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   if (pathHashCount >= 1) {
     size_t pathIdx = pathStart;
     for (size_t i = 0; i < pathHashCount; i++) {
-      if (pathIdx < pathStart + pathByteLen) {
+      if (pathIdx + pathHashSize <= pathStart + pathByteLen) {
         uint8_t nodeHashInPath = (uint8_t)message[pathIdx];
+        bool matchedOurPathHash =
+            (pathHashSize == ourMeshPathHashSize) &&
+            (memcmp(&message[pathIdx], ourMeshPathHash, pathHashSize) == 0);
         if (nodeHashInPath == ourNodeHash || nodeHashInPath == ourNodeHashAlt) {
           Serial.printf("Found our node hash (0x%02X/0x%02X) in path, not forwarding\n", ourNodeHash, ourNodeHashAlt);
+          Serial.println("=== Packet Processing Complete ===\n");
+          return;
+        }
+        if (matchedOurPathHash) {
+          Serial.println("Found our mesh path hash in path, not forwarding");
           Serial.println("=== Packet Processing Complete ===\n");
           return;
         }
