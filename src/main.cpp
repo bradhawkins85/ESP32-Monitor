@@ -2265,6 +2265,7 @@ static bool deriveSharedSecretWithPeer(const uint8_t peerEd25519Pub[32], uint8_t
 static void deriveDirectKeyFromShared(const uint8_t shared[32], uint8_t outKey[32]);
 static bool normalizeHexKey(const String &input, String &out);
 static bool parseHexKeyToBytes(const String &hex, uint8_t out[32]);
+bool checkMeshNode(Service& svc);
 
 // Helper function to get services as JSON string
 String getServicesJson() {
