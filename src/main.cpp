@@ -6168,6 +6168,7 @@ void setup() {
     html += ".modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center}";
     html += ".modal.show{display:flex}";
     html += ".modal-content{background:#fff;border-radius:16px;padding:32px;max-width:600px;width:90%;max-height:90vh;overflow-y:auto}";
+    html += "#serviceModal .modal-content{max-width:900px}";
     html += ".modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}";
     html += ".modal-title{font-size:24px;font-weight:700;color:#2d3748}";
     html += ".close-btn{background:none;border:none;font-size:28px;cursor:pointer;color:#718096;padding:0;width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:4px}";
