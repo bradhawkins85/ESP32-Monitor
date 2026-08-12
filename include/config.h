@@ -342,6 +342,11 @@
 #define MQTT_PASSWORD ""
 #endif
 
+// Repeater Mode (when true, node advertises as a MeshCore repeater)
+#ifndef REPEATER_ENABLED
+#define REPEATER_ENABLED false
+#endif
+
 // Display Configuration
 #ifndef ENABLE_DISPLAY
 #define ENABLE_DISPLAY true
