@@ -1961,6 +1961,7 @@ bool checkPush(Service& service);
 bool checkUptime(Service& service);
 bool checkMeshNode(Service& service);
 void updateServiceStatus(Service& service, bool checkResult);
+bool executeServiceCheck(Service& service);
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
 bool isAuthenticated(AsyncWebServerRequest *request, bool sendUnauthorized = true);
 String generateSessionToken();
@@ -2203,40 +2204,34 @@ void initDemoServices() {
 
 // --- Periodic Service Checking ---
 unsigned long lastServiceCheck = 0;
+
+// Run one complete service check, including threshold tracking, history,
+// notifications, and scheduling state. Used by both automatic and manual checks.
+bool executeServiceCheck(Service& svc) {
+  bool result = false;
+  switch (svc.type) {
+    case TYPE_HTTP_GET:      result = checkHttpGet(svc); break;
+    case TYPE_PING:          result = checkPing(svc); break;
+    case TYPE_PORT:          result = checkPort(svc); break;
+    case TYPE_SNMP_GET:      result = checkSnmpGet(svc); break;
+    case TYPE_PUSH:          result = checkPush(svc); break;
+    case TYPE_UPTIME:        result = checkUptime(svc); break;
+    case TYPE_MESHCORE_NODE: result = checkMeshNode(svc); break;
+    default:
+      svc.lastError = "Unknown type";
+      result = false;
+  }
+  updateServiceStatus(svc, result);
+  return result;
+}
+
 void checkAllServices() {
   unsigned long now = millis();
   for (int i = 0; i < serviceCount; i++) {
     Service& svc = services[i];
     if (!svc.enabled) continue;
     if (svc.lastCheck == 0 || now - svc.lastCheck >= (unsigned long)svc.checkInterval * 1000) {
-      bool result = false;
-      switch (svc.type) {
-        case TYPE_HTTP_GET:
-          result = checkHttpGet(svc);
-          break;
-        case TYPE_PING:
-          result = checkPing(svc);
-          break;
-        case TYPE_PORT:
-          result = checkPort(svc);
-          break;
-        case TYPE_SNMP_GET:
-          result = checkSnmpGet(svc);
-          break;
-        case TYPE_PUSH:
-          result = checkPush(svc);
-          break;
-        case TYPE_UPTIME:
-          result = checkUptime(svc);
-          break;
-        case TYPE_MESHCORE_NODE:
-          result = checkMeshNode(svc);
-          break;
-        default:
-          svc.lastError = "Unknown type";
-          result = false;
-      }
-      updateServiceStatus(svc, result);
+      executeServiceCheck(svc);
     }
   }
 }
@@ -4950,7 +4945,9 @@ void setup() {
       html += "<div class='service-header'>";
       html += "<div class='service-name'>" + services[i].name + "</div>";
       html += "<div class='service-actions'>";
-      html += "<button class='icon-btn' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
+      if (isAuthed) {
+        html += "<button class='icon-btn' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
+      }
       html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
       if (isAuthed) {
         html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
@@ -5172,16 +5169,17 @@ void setup() {
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
     html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
-    html += "async function checkServiceNow(i){try{";
-    html += "const res=await fetch('/api/service/check/'+i,{credentials:'include',method:'POST'});";
-    html += "const d=await res.json();";
+    html += "async function checkServiceNow(i){if(!isAuthed){alert('Login required');return;}try{";
+    html += "const res=await fetch('/api/check-service/'+i,{credentials:'include',method:'POST'});";
+    html += "const body=await res.text();let d;try{d=JSON.parse(body);}catch(_){throw new Error(body||('HTTP '+res.status));}if(!res.ok){throw new Error(d.error||('HTTP '+res.status));}";
     html += "let msg='Check Results for \"'+services[i].name+'\"\\n\\n';";
     html += "msg+='Result: '+(d.checkPassed?'✅ PASS':'❌ FAIL')+'\\n';";
+    html += "msg+='Stored status: '+(d.isPending?'PENDING':(d.isUp?'UP':'DOWN'))+' (passes: '+d.consecutivePasses+', fails: '+d.consecutiveFails+')\\n';";
     html += "msg+='Service: '+d.serviceName+' (Type: '+['HTTP GET','Ping','SNMP GET','Port','Push','Uptime','MeshCore Node'][d.serviceType||0]+')'+(d.target?' @ '+d.target:'')+'\\n';";
     html += "msg+='Detail: '+(d.checkError||'(none)')+'\\n';";
     html += "if(d.serviceType===6){msg+='Battery: '+(d.meshLastBatteryPct||0)+'% ('+(d.meshLastBatteryV||0).toFixed(2)+'V)\\n';msg+='Repeater: '+(d.meshRepeaterKnownState?'on':'off')+'\\n';}";
     html += "msg+='Timestamp: '+new Date((d.timestamp||Math.floor(Date.now()/1000))*1000).toLocaleString()+'\\n';";
-    html += "msg+='\\nService will continue its normal check schedule regardless of this result.';";
+    html += "msg+='\\nThis result has been stored and the normal check interval restarts from now.';";
     html += "alert(msg);";
     html += "}catch(e){alert('Check failed: '+e.message);}}";
     html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
@@ -5704,42 +5702,28 @@ void setup() {
   });
 
   // API endpoint to immediately run a service check (Check Now)
-  server.on("^/api/service/check/([0-9]+)$", HTTP_POST, [](AsyncWebServerRequest *request){
+  server.on("/api/check-service/*", HTTP_POST, [](AsyncWebServerRequest *request){
     if (!isAuthenticated(request)) return;
-    int idx = request->pathArg(0).toInt();
+    const String prefix = "/api/check-service/";
+    String indexText = request->url().substring(prefix.length());
+    if (indexText.length() == 0) {
+      request->send(400, "application/json", "{\"error\":\"Invalid service index\"}");
+      return;
+    }
+    for (size_t i = 0; i < indexText.length(); i++) {
+      if (!isDigit(indexText[i])) {
+        request->send(400, "application/json", "{\"error\":\"Invalid service index\"}");
+        return;
+      }
+    }
+    int idx = indexText.toInt();
     if (idx < 0 || idx >= serviceCount) {
       request->send(404, "application/json", "{\"error\":\"Service not found\"}");
       return;
     }
 
     Service& svc = services[idx];
-    bool result = false;
-
-    // Save state before check
-    int prevPasses = svc.consecutivePasses;
-    int prevFails = svc.consecutiveFails;
-    bool prevIsUp = svc.isUp;
-    bool prevPending = svc.isPending;
-    String prevError = svc.lastError;
-
-    switch (svc.type) {
-      case TYPE_HTTP_GET:   result = checkHttpGet(svc); break;
-      case TYPE_PING:       result = checkPing(svc); break;
-      case TYPE_PORT:       result = checkPort(svc); break;
-      case TYPE_SNMP_GET:   result = checkSnmpGet(svc); break;
-      case TYPE_PUSH:       result = checkPush(svc); break;
-      case TYPE_UPTIME:     result = checkUptime(svc); break;
-      case TYPE_MESHCORE_NODE: result = checkMeshNode(svc); break;
-      default:
-        svc.lastError = "Unknown service type";
-        result = false;
-    }
-
-    // Restore state (don't affect thresholds/notifications from a manual check)
-    svc.consecutivePasses = prevPasses;
-    svc.consecutiveFails = prevFails;
-    svc.isUp = prevIsUp;
-    svc.isPending = prevPending;
+    bool result = executeServiceCheck(svc);
 
     JsonDocument doc;
     doc["checkPassed"] = result;
@@ -5750,11 +5734,11 @@ void setup() {
     doc["port"] = svc.port;
     doc["url"] = svc.url;
 
-    // Capture the check result before restoring the previous error
-    String checkError = svc.lastError;
-    svc.lastError = prevError;
-
-    doc["checkError"] = checkError;
+    doc["checkError"] = svc.lastError;
+    doc["isUp"] = svc.isUp;
+    doc["isPending"] = svc.isPending;
+    doc["consecutivePasses"] = svc.consecutivePasses;
+    doc["consecutiveFails"] = svc.consecutiveFails;
 
     // Add type-specific details
     if (svc.type == TYPE_PING || svc.type == TYPE_PORT) {
