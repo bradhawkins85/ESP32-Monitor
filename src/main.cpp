@@ -87,6 +87,7 @@ enum ServiceType {
   TYPE_PORT,
   TYPE_PUSH,
   TYPE_UPTIME,
+  TYPE_MESHCORE_NODE,
   TYPE_UNKNOWN
 };
 
@@ -137,6 +138,17 @@ struct Service {
   bool alertMqtt;
   bool alertWol;
   String wolMacAddress;
+  // MeshCore Node monitor fields (TYPE_MESHCORE_NODE)
+  String meshNodePubkey;       // 64-char hex Ed25519 public key of remote node
+  String meshNodePin;          // Remote command PIN for authentication
+  bool meshRepeaterControl;    // Enable automated repeater threshold control
+  int meshBatteryLowPct;       // Disable repeater when battery drops below this %
+  int meshBatteryHighPct;      // Re-enable repeater when battery rises above this %
+  // Runtime-only mesh node state (not persisted)
+  int meshLastBatteryPct;
+  float meshLastBatteryV;
+  unsigned long meshLastResponseMs;
+  bool meshRepeaterKnownState; // Last commanded repeater state
 };
 
 // ============================================
@@ -153,6 +165,72 @@ struct DirectNodeConfig {
 #define MAX_SERVICES 16
 Service services[MAX_SERVICES];
 int serviceCount = 0;
+
+// ============================================
+// Pending MeshCore Node Check Tracking
+// Correlates outgoing status requests with incoming responses by sender hash.
+// ============================================
+#define MAX_PENDING_MESH_CHECKS 8
+
+struct PendingMeshNodeCheck {
+  bool active;
+  uint8_t senderHash;     // First byte of target node's pubkey
+  int serviceIdx;         // Index into services[]
+  unsigned long sentMs;   // millis() when request was sent
+};
+
+static PendingMeshNodeCheck pendingMeshChecks[MAX_PENDING_MESH_CHECKS];
+
+static void initPendingMeshChecks() {
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    pendingMeshChecks[i].active = false;
+  }
+}
+
+static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx) {
+  // Reuse an existing slot for the same hash, or find a free one
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
+      pendingMeshChecks[i].serviceIdx = serviceIdx;
+      pendingMeshChecks[i].sentMs = millis();
+      return;
+    }
+  }
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (!pendingMeshChecks[i].active) {
+      pendingMeshChecks[i].active = true;
+      pendingMeshChecks[i].senderHash = senderHash;
+      pendingMeshChecks[i].serviceIdx = serviceIdx;
+      pendingMeshChecks[i].sentMs = millis();
+      return;
+    }
+  }
+  // All slots full — evict oldest
+  unsigned long oldest = 0xFFFFFFFF;
+  int oldestIdx = 0;
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (pendingMeshChecks[i].sentMs < oldest) {
+      oldest = pendingMeshChecks[i].sentMs;
+      oldestIdx = i;
+    }
+  }
+  pendingMeshChecks[oldestIdx].active = true;
+  pendingMeshChecks[oldestIdx].senderHash = senderHash;
+  pendingMeshChecks[oldestIdx].serviceIdx = serviceIdx;
+  pendingMeshChecks[oldestIdx].sentMs = millis();
+}
+
+// Returns service index if the given hash matches an active pending check, -1 otherwise.
+static int consumePendingMeshCheck(uint8_t senderHash) {
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
+      int idx = pendingMeshChecks[i].serviceIdx;
+      pendingMeshChecks[i].active = false;
+      return idx;
+    }
+  }
+  return -1;
+}
 
 // ============================================
 // Peer Cache for Direct Messages
@@ -653,6 +731,9 @@ struct Settings {
   int autoOtaEnabled;
   String autoOtaUrl;
   int autoOtaCheckInterval;  // seconds
+
+  // Repeater mode
+  bool repeaterEnabled;
 };
 
 Settings settings;
@@ -826,6 +907,8 @@ Settings defaultSettingsFromBuild() {
   s.autoOtaUrl = String(AUTO_OTA_URL);
   s.autoOtaCheckInterval = (int)AUTO_OTA_CHECK_INTERVAL;
   if (s.autoOtaCheckInterval < 60) s.autoOtaCheckInterval = 3600;
+
+  s.repeaterEnabled = (REPEATER_ENABLED != 0);
   return s;
 }
 
@@ -1001,6 +1084,9 @@ void loadSettingsOverrides() {
   if (doc["AUTO_OTA_CHECK_INTERVAL"].is<int>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<int>();
   if (doc["AUTO_OTA_CHECK_INTERVAL"].is<String>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<String>().toInt();
 
+  // Repeater mode
+  if (doc["REPEATER_ENABLED"].is<bool>()) settings.repeaterEnabled = doc["REPEATER_ENABLED"].as<bool>();
+
   // Normalize
   if (settings.mqttPort <= 0) settings.mqttPort = 1883;
   if (settings.mqttQos < 0) settings.mqttQos = 0;
@@ -1096,6 +1182,8 @@ bool saveSettingsOverrides() {
   doc["AUTO_OTA_ENABLED"] = settings.autoOtaEnabled;
   doc["AUTO_OTA_URL"] = settings.autoOtaUrl;
   doc["AUTO_OTA_CHECK_INTERVAL"] = settings.autoOtaCheckInterval;
+
+  doc["REPEATER_ENABLED"] = settings.repeaterEnabled;
 
   if (serializeJson(doc, file) == 0) {
     file.close();
@@ -1919,6 +2007,12 @@ void saveServices() {
     svc["alertMqtt"] = services[i].alertMqtt;
     svc["alertWol"] = services[i].alertWol;
     svc["wolMacAddress"] = services[i].wolMacAddress;
+    // MeshCore Node fields
+    svc["meshNodePubkey"] = services[i].meshNodePubkey;
+    svc["meshNodePin"] = services[i].meshNodePin;
+    svc["meshRepeaterControl"] = services[i].meshRepeaterControl;
+    svc["meshBatteryLowPct"] = services[i].meshBatteryLowPct;
+    svc["meshBatteryHighPct"] = services[i].meshBatteryHighPct;
   }
   
   serializeJson(doc, file);
@@ -1989,6 +2083,17 @@ void loadServices() {
     services[serviceCount].alertMqtt = svc["alertMqtt"].isNull() ? true : svc["alertMqtt"].as<bool>();
     services[serviceCount].alertWol = svc["alertWol"].isNull() ? false : svc["alertWol"].as<bool>();
     services[serviceCount].wolMacAddress = svc["wolMacAddress"].isNull() ? "" : svc["wolMacAddress"].as<String>();
+    // MeshCore Node fields
+    services[serviceCount].meshNodePubkey = svc["meshNodePubkey"].isNull() ? "" : svc["meshNodePubkey"].as<String>();
+    services[serviceCount].meshNodePin = svc["meshNodePin"].isNull() ? "" : svc["meshNodePin"].as<String>();
+    services[serviceCount].meshRepeaterControl = svc["meshRepeaterControl"].isNull() ? false : svc["meshRepeaterControl"].as<bool>();
+    services[serviceCount].meshBatteryLowPct = svc["meshBatteryLowPct"].isNull() ? 20 : svc["meshBatteryLowPct"].as<int>();
+    services[serviceCount].meshBatteryHighPct = svc["meshBatteryHighPct"].isNull() ? 50 : svc["meshBatteryHighPct"].as<int>();
+    // Runtime-only mesh node state
+    services[serviceCount].meshLastBatteryPct = 0;
+    services[serviceCount].meshLastBatteryV = 0.0f;
+    services[serviceCount].meshLastResponseMs = 0;
+    services[serviceCount].meshRepeaterKnownState = true;  // Assume repeater on until told otherwise
 
     if (services[serviceCount].type == TYPE_PUSH && services[serviceCount].pushToken.length() == 0) {
       services[serviceCount].pushToken = generatePushToken();
@@ -2126,6 +2231,9 @@ void checkAllServices() {
         case TYPE_UPTIME:
           result = checkUptime(svc);
           break;
+        case TYPE_MESHCORE_NODE:
+          result = checkMeshNode(svc);
+          break;
         default:
           svc.lastError = "Unknown type";
           result = false;
@@ -2189,6 +2297,14 @@ String getServicesJson() {
     obj["alertMqtt"] = services[i].alertMqtt;
     obj["alertWol"] = services[i].alertWol;
     obj["wolMacAddress"] = services[i].wolMacAddress;
+    obj["meshNodePubkey"] = services[i].meshNodePubkey;
+    obj["meshNodePin"] = services[i].meshNodePin;
+    obj["meshRepeaterControl"] = services[i].meshRepeaterControl;
+    obj["meshBatteryLowPct"] = services[i].meshBatteryLowPct;
+    obj["meshBatteryHighPct"] = services[i].meshBatteryHighPct;
+    obj["meshLastBatteryPct"] = services[i].meshLastBatteryPct;
+    obj["meshLastBatteryV"] = services[i].meshLastBatteryV;
+    obj["meshRepeaterKnownState"] = services[i].meshRepeaterKnownState;
   }
   String json;
   serializeJson(doc, json);
@@ -2342,6 +2458,7 @@ void initNodeIdentity() {
   Serial.printf("Node hash (pubkey[0]): 0x%02X, alt (sha256[0]): 0x%02X\n", ourNodeHash, ourNodeHashAlt);
 
   clearPeerCache();
+  initPendingMeshChecks();
 }
 
 // Send direct LoRa text message (for commands like ping/status)
@@ -2685,8 +2802,10 @@ void sendBootAdvert() {
   uint8_t app_data[64];
   size_t app_data_len = 0;
   
-  // App flags (1 byte) - bit 0-3: role (1=Chat Node), bit 4: location (0=No), bit 7: name (1=Yes)
-  app_data[app_data_len++] = 0x81;  // Binary: 10000001 (Chat Node with name)
+  // App flags (1 byte) - bit 0-3: role (1=Chat Node/Client, 2=Repeater), bit 4: location (0=No), bit 7: name (1=Yes)
+  // 0x81 = binary 10000001 = Chat Node with name
+  // 0x82 = binary 10000010 = Repeater with name
+  app_data[app_data_len++] = settings.repeaterEnabled ? 0x82 : 0x81;
   
   // Node name (variable length UTF-8 string)
   memcpy(&app_data[app_data_len], nodeName, nodeNameLen);
@@ -3304,6 +3423,135 @@ bool checkUptime(Service& service) {
   }
   service.lastError = "Uptime " + String(uptimeSeconds) + "s";
   return result;
+}
+
+// Forward declarations for MeshCore node check functions
+static void sendMeshRepeaterCommand(Service& svc, bool enable);
+static void processMeshNodeResponse(int serviceIdx, const String& text);
+
+// ============================================
+// MeshCore Node Monitor Functions
+// ============================================
+
+// Send "repeater on" or "repeater off" to a remote MeshCore node.
+static void sendMeshRepeaterCommand(Service& svc, bool enable) {
+  if (!settings.loraEnabled) return;
+  uint8_t pubkeyBytes[32];
+  if (!parseHexKeyToBytes(svc.meshNodePubkey, pubkeyBytes)) {
+    Serial.printf("[MeshNode] Invalid pubkey for service '%s'\n", svc.name.c_str());
+    return;
+  }
+  String cmd = svc.meshNodePin + ":repeater " + (enable ? "on" : "off");
+  bool ok = sendLoRaDirectMessage(cmd, pubkeyBytes, pubkeyBytes[0], nullptr, 0);
+  if (ok) {
+    svc.meshRepeaterKnownState = enable;
+    Serial.printf("[MeshNode] Sent 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
+  } else {
+    Serial.printf("[MeshNode] Failed to send 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
+  }
+}
+
+// Parse a status reply from a remote MeshCore node and update service state.
+// Expected format: "Status: IP=x.x.x.x, Battery=X.XXV (YY%), ..."
+static void processMeshNodeResponse(int serviceIdx, const String& text) {
+  if (serviceIdx < 0 || serviceIdx >= serviceCount) return;
+  Service& svc = services[serviceIdx];
+
+  Serial.printf("[MeshNode] Response for '%s': %s\n", svc.name.c_str(), text.c_str());
+
+  // Parse battery voltage and percent from "Battery=X.XXV (YY%)"
+  int battIdx = text.indexOf("Battery=");
+  if (battIdx >= 0) {
+    String battStr = text.substring(battIdx + 8);
+    // Extract voltage
+    int vIdx = battStr.indexOf('V');
+    if (vIdx > 0) {
+      svc.meshLastBatteryV = battStr.substring(0, vIdx).toFloat();
+    }
+    // Extract percent from "(YY%)"
+    int pOpen = battStr.indexOf('(');
+    int pClose = battStr.indexOf('%');
+    if (pOpen >= 0 && pClose > pOpen) {
+      svc.meshLastBatteryPct = battStr.substring(pOpen + 1, pClose).toInt();
+    }
+    svc.meshLastResponseMs = millis();
+    svc.lastError = "Battery: " + String(svc.meshLastBatteryPct) + "% (" + String(svc.meshLastBatteryV, 2) + "V)";
+    Serial.printf("[MeshNode] '%s' battery: %d%% (%.2fV)\n",
+                  svc.name.c_str(), svc.meshLastBatteryPct, svc.meshLastBatteryV);
+
+    // Automated repeater control
+    if (svc.meshRepeaterControl) {
+      if (svc.meshRepeaterKnownState && svc.meshLastBatteryPct < svc.meshBatteryLowPct) {
+        Serial.printf("[MeshNode] Battery %d%% below low threshold %d%% — disabling repeater\n",
+                      svc.meshLastBatteryPct, svc.meshBatteryLowPct);
+        sendMeshRepeaterCommand(svc, false);
+      } else if (!svc.meshRepeaterKnownState && svc.meshLastBatteryPct >= svc.meshBatteryHighPct) {
+        Serial.printf("[MeshNode] Battery %d%% above high threshold %d%% — enabling repeater\n",
+                      svc.meshLastBatteryPct, svc.meshBatteryHighPct);
+        sendMeshRepeaterCommand(svc, true);
+      }
+    }
+  } else {
+    // Response received but no battery info — still counts as reachable
+    svc.meshLastResponseMs = millis();
+    svc.lastError = "Reached (no battery data)";
+  }
+}
+
+// Send a PIN-authenticated status request to a remote MeshCore node.
+// Returns true if a previous response arrived within the allowable window
+// (checkInterval * 2.5 s), false otherwise.
+bool checkMeshNode(Service& svc) {
+  if (!settings.loraEnabled) {
+    svc.lastError = "LoRa disabled";
+    return false;
+  }
+  if (svc.meshNodePubkey.length() != 64) {
+    svc.lastError = "Invalid pubkey (need 64 hex chars)";
+    return false;
+  }
+  if (svc.meshNodePin.length() == 0) {
+    svc.lastError = "No PIN configured";
+    return false;
+  }
+
+  // Determine service index
+  int svcIdx = -1;
+  for (int i = 0; i < serviceCount; i++) {
+    if (&services[i] == &svc) { svcIdx = i; break; }
+  }
+
+  uint8_t pubkeyBytes[32];
+  if (!parseHexKeyToBytes(svc.meshNodePubkey, pubkeyBytes)) {
+    svc.lastError = "Malformed pubkey hex";
+    return false;
+  }
+
+  // Send status request
+  String cmd = svc.meshNodePin + ":status";
+  bool sent = sendLoRaDirectMessage(cmd, pubkeyBytes, pubkeyBytes[0], nullptr, 0);
+  if (sent && svcIdx >= 0) {
+    registerPendingMeshCheck(pubkeyBytes[0], svcIdx);
+    Serial.printf("[MeshNode] Sent status request to '%s' (hash=0x%02X)\n",
+                  svc.name.c_str(), pubkeyBytes[0]);
+  }
+
+  // Determine result based on whether we've received a fresh response recently
+  if (svc.meshLastResponseMs == 0) {
+    // Never received a response yet
+    svc.lastError = sent ? "Waiting for first response" : "LoRa send failed";
+    return false;
+  }
+
+  unsigned long windowMs = (unsigned long)(svc.checkInterval) * 2500UL;  // 2.5× interval
+  unsigned long age = millis() - svc.meshLastResponseMs;
+  if (age <= windowMs) {
+    // Fresh enough response — node is reachable
+    return true;
+  }
+
+  svc.lastError = "No response for " + String(age / 1000) + "s (timeout " + String(windowMs / 1000) + "s)";
+  return false;
 }
 
 // Pass/Fail threshold logic
@@ -4293,6 +4541,9 @@ void setup() {
       if (doc["AUTO_OTA_CHECK_INTERVAL"].is<int>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<int>();
       if (doc["AUTO_OTA_CHECK_INTERVAL"].is<String>()) settings.autoOtaCheckInterval = doc["AUTO_OTA_CHECK_INTERVAL"].as<String>().toInt();
 
+      // Repeater mode
+      if (doc["REPEATER_ENABLED"].is<bool>()) settings.repeaterEnabled = doc["REPEATER_ENABLED"].as<bool>();
+
       // Normalize
       if (settings.webhookMethod.length() == 0) settings.webhookMethod = "POST";
 
@@ -4427,6 +4678,12 @@ void setup() {
     page += "<div class='btns'><button class='btn secondary' type='button' onclick='addDirectNode()'>+ Add Node</button></div>";
     page += "</div>";
 
+    page += "<div class='card'><h2>Repeater Mode</h2><div class='row'>";
+    page += "<div class='fg'><label class='lbl'>Repeater Enabled</label><select id='REPEATER_ENABLED'><option value='true'" + String(settings.repeaterEnabled ? " selected" : "") + ">Yes — Advertise as Repeater</option><option value='false'" + String(!settings.repeaterEnabled ? " selected" : "") + ">No — Advertise as Client</option></select></div>";
+    page += "</div>";
+    page += "<div class='hint'>When enabled, this node advertises itself as a MeshCore repeater (role=2) to the mesh network. Can also be toggled remotely via LoRa command: &lt;pin&gt;:repeater on/off</div>";
+    page += "</div>";
+
     page += "<div class='card'><h2>Ntfy</h2><div class='row'>";
     page += "<div class='fg'><label class='lbl'>Enabled</label><select id='NTFY_ENABLED'><option value='true'" + String(settings.ntfyEnabled ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyEnabled ? " selected" : "") + ">No</option></select></div>";
     page += "<div class='fg'><label class='lbl'>Mesh Relay</label><select id='NTFY_MESH_RELAY'><option value='true'" + String(settings.ntfyMeshRelay ? " selected" : "") + ">Yes</option><option value='false'" + String(!settings.ntfyMeshRelay ? " selected" : "") + ">No</option></select></div>";
@@ -4513,6 +4770,7 @@ void setup() {
     page += ",MQTT_ENABLED:boolVal('MQTT_ENABLED'),MQTT_MESH_RELAY:boolVal('MQTT_MESH_RELAY'),MQTT_IP_ALERTS:boolVal('MQTT_IP_ALERTS'),MQTT_BROKER:val('MQTT_BROKER'),MQTT_PORT:val('MQTT_PORT'),MQTT_TOPIC:val('MQTT_TOPIC'),MQTT_USERNAME:val('MQTT_USERNAME'),MQTT_PASSWORD:val('MQTT_PASSWORD')";
     page += ",MQTT_QOS:val('MQTT_QOS')";
     page += ",AUTO_OTA_ENABLED:parseInt(val('AUTO_OTA_ENABLED'))||0,AUTO_OTA_URL:val('AUTO_OTA_URL'),AUTO_OTA_CHECK_INTERVAL:parseInt(val('AUTO_OTA_CHECK_INTERVAL'))||3600";
+    page += ",REPEATER_ENABLED:boolVal('REPEATER_ENABLED')";
     page += "};";
     page += "const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(payload)});";
     page += "if(res.ok){const j=await res.json().catch(()=>({}));if(j.rebooting){alert('Saved. Rebooting...');}else{alert('Saved');}}else{alert('Save failed');}";
@@ -4667,12 +4925,27 @@ void setup() {
       html += "</div>";
       html += "</div>";
       html += "<span class='service-status " + statusBadgeClass + "'>" + statusText + "</span>";
-      html += "<div class='service-info'>Type: " + String(services[i].type) + " | Host: " + services[i].host + "</div>";
+      const char* svcTypeName[] = {"HTTP GET","Ping","SNMP GET","Port","Push","Uptime","MeshCore Node","Unknown"};
+      int svcTypeId = (int)services[i].type;
+      if (svcTypeId < 0 || svcTypeId > 7) svcTypeId = 7;
+      String typeLabel = svcTypeName[svcTypeId];
+      String infoStr = "Type: " + typeLabel;
+      if (services[i].type != TYPE_MESHCORE_NODE) infoStr += " | Host: " + services[i].host;
+      html += "<div class='service-info'>" + infoStr + "</div>";
       if (services[i].type == TYPE_PUSH) {
         String pushUrl = getPushUrl(services[i]);
         if (pushUrl.length() > 0) {
           html += "<div class='service-info'>Push URL: " + pushUrl + "</div>";
         }
+      }
+      if (services[i].type == TYPE_MESHCORE_NODE && services[i].meshLastResponseMs > 0) {
+        String battColor = services[i].meshLastBatteryPct >= 50 ? "#48bb78" : (services[i].meshLastBatteryPct >= 20 ? "#d69e2e" : "#f56565");
+        html += "<div class='service-info'>Battery: <span style='color:" + battColor + ";font-weight:600'>" +
+                String(services[i].meshLastBatteryPct) + "% (" + String(services[i].meshLastBatteryV, 2) + "V)</span>";
+        if (services[i].meshRepeaterControl) {
+          html += " | Repeater: " + String(services[i].meshRepeaterKnownState ? "on" : "off");
+        }
+        html += "</div>";
       }
       if (services[i].lastError.length() > 0) {
         html += "<div class='service-error'>" + services[i].lastError + "</div>";
@@ -4730,7 +5003,8 @@ void setup() {
     html += "<select id='serviceType' class='form-select'>";
     html += "<option value='0'>HTTP GET</option><option value='1'>Ping</option>";
     html += "<option value='2'>SNMP GET</option><option value='3'>Port</option>";
-    html += "<option value='4'>Push</option><option value='5'>Uptime</option></select></div>";
+    html += "<option value='4'>Push</option><option value='5'>Uptime</option>";
+    html += "<option value='6'>MeshCore Node</option></select></div>";
     html += "<div class='form-group'><label class='form-label'>Enabled</label>";
     html += "<select id='serviceEnabled' class='form-select'><option value='true'>Yes</option><option value='false'>No</option></select></div></div>";
     html += "<div class='form-row' data-types='1,2,3'>";
@@ -4773,6 +5047,18 @@ void setup() {
     // WoL MAC Address field
     html += "<div class='form-group'><label class='form-label'>WoL MAC Address</label>";
     html += "<input type='text' id='serviceWolMac' class='form-input' placeholder='AA:BB:CC:DD:EE:FF (auto-discovered if empty)'></div>";
+    // MeshCore Node fields (shown only for type 6)
+    html += "<div class='form-group' data-types='6'><label class='form-label'>Node Public Key (64 hex chars)</label>";
+    html += "<input type='text' id='serviceMeshPubkey' class='form-input' placeholder='e.g. 01ab23cd...' maxlength='64'></div>";
+    html += "<div class='form-group' data-types='6'><label class='form-label'>Remote Command PIN</label>";
+    html += "<input type='text' id='serviceMeshPin' class='form-input' placeholder='PIN used to authenticate commands'></div>";
+    html += "<div class='form-group' data-types='6'><label class='form-label' style='display:flex;align-items:center;gap:8px'>";
+    html += "<input type='checkbox' id='serviceMeshRepeaterControl'>Enable Automated Repeater Control</label></div>";
+    html += "<div class='form-row' data-types='6'>";
+    html += "<div class='form-group'><label class='form-label'>Disable Repeater Below (%)</label>";
+    html += "<input type='number' id='serviceMeshBattLow' class='form-input' value='20' min='0' max='100'></div>";
+    html += "<div class='form-group'><label class='form-label'>Re-enable Repeater Above (%)</label>";
+    html += "<input type='number' id='serviceMeshBattHigh' class='form-input' value='50' min='0' max='100'></div></div>";
     // Alert channel toggles (only globally-enabled channels shown via JS)
     html += "<div class='form-group' id='alertChannelsGroup'><label class='form-label'>Alert Channels</label>";
     html += "<div id='alertChannelsContainer' style='display:flex;flex-wrap:wrap;gap:12px;margin-top:4px'></div></div>";
@@ -4844,6 +5130,11 @@ void setup() {
     html += "document.getElementById('servicePassThreshold').value=s.passThreshold;";
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
     html += "document.getElementById('serviceWolMac').value=s.wolMacAddress||'';";
+    html += "document.getElementById('serviceMeshPubkey').value=s.meshNodePubkey||'';";
+    html += "document.getElementById('serviceMeshPin').value=s.meshNodePin||'';";
+    html += "document.getElementById('serviceMeshRepeaterControl').checked=s.meshRepeaterControl===true;";
+    html += "document.getElementById('serviceMeshBattLow').value=s.meshBatteryLowPct!=null?s.meshBatteryLowPct:20;";
+    html += "document.getElementById('serviceMeshBattHigh').value=s.meshBatteryHighPct!=null?s.meshBatteryHighPct:50;";
     html += "updateFieldVisibility(s.type);";
     html += "renderAlertChannels(s);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
@@ -4854,8 +5145,9 @@ void setup() {
     html += "const d=await res.json();";
     html += "let msg='Check Results for \"'+services[i].name+'\"\\n\\n';";
     html += "msg+='Result: '+(d.checkPassed?'✅ PASS':'❌ FAIL')+'\\n';";
-    html += "msg+='Service: '+d.serviceName+' (Type: '+['HTTP GET','Ping','SNMP GET','Port','Push','Uptime'][d.serviceType||0]+')'+(d.target?' @ '+d.target:'')+'\\n';";
+    html += "msg+='Service: '+d.serviceName+' (Type: '+['HTTP GET','Ping','SNMP GET','Port','Push','Uptime','MeshCore Node'][d.serviceType||0]+')'+(d.target?' @ '+d.target:'')+'\\n';";
     html += "msg+='Detail: '+(d.checkError||'(none)')+'\\n';";
+    html += "if(d.serviceType===6){msg+='Battery: '+(d.meshLastBatteryPct||0)+'% ('+(d.meshLastBatteryV||0).toFixed(2)+'V)\\n';msg+='Repeater: '+(d.meshRepeaterKnownState?'on':'off')+'\\n';}";
     html += "msg+='Timestamp: '+new Date((d.timestamp||Math.floor(Date.now()/1000))*1000).toLocaleString()+'\\n';";
     html += "msg+='\\nService will continue its normal check schedule regardless of this result.';";
     html += "alert(msg);";
@@ -4878,7 +5170,12 @@ void setup() {
     html += "checkInterval:parseInt(document.getElementById('serviceCheckInterval').value),";
     html += "passThreshold:parseInt(document.getElementById('servicePassThreshold').value),";
     html += "failThreshold:parseInt(document.getElementById('serviceFailThreshold').value),";
-    html += "wolMacAddress:document.getElementById('serviceWolMac').value};";
+    html += "wolMacAddress:document.getElementById('serviceWolMac').value,";
+    html += "meshNodePubkey:document.getElementById('serviceMeshPubkey').value,";
+    html += "meshNodePin:document.getElementById('serviceMeshPin').value,";
+    html += "meshRepeaterControl:document.getElementById('serviceMeshRepeaterControl').checked,";
+    html += "meshBatteryLowPct:parseInt(document.getElementById('serviceMeshBattLow').value)||20,";
+    html += "meshBatteryHighPct:parseInt(document.getElementById('serviceMeshBattHigh').value)||50};";
     html += "Object.assign(data,getAlertChannelValues());";
     html += "const idx=document.getElementById('serviceIndex').value;";
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
@@ -5221,6 +5518,16 @@ void setup() {
       svc.alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
       svc.alertWol = doc["alertWol"].isNull() ? false : doc["alertWol"].as<bool>();
       svc.wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
+      // MeshCore Node fields
+      svc.meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
+      svc.meshNodePin = doc["meshNodePin"].isNull() ? "" : doc["meshNodePin"].as<String>();
+      svc.meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
+      svc.meshBatteryLowPct = doc["meshBatteryLowPct"].isNull() ? 20 : doc["meshBatteryLowPct"].as<int>();
+      svc.meshBatteryHighPct = doc["meshBatteryHighPct"].isNull() ? 50 : doc["meshBatteryHighPct"].as<int>();
+      svc.meshLastBatteryPct = 0;
+      svc.meshLastBatteryV = 0.0f;
+      svc.meshLastResponseMs = 0;
+      svc.meshRepeaterKnownState = true;
       // Auto-discover MAC address if WoL enabled but no MAC specified
       if (svc.alertWol && svc.wolMacAddress.length() == 0) {
         String ip = getServiceIp(svc);
@@ -5286,6 +5593,12 @@ void setup() {
       services[idx].alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
       services[idx].alertWol = doc["alertWol"].isNull() ? false : doc["alertWol"].as<bool>();
       services[idx].wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
+      // MeshCore Node fields
+      services[idx].meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
+      services[idx].meshNodePin = doc["meshNodePin"].isNull() ? "" : doc["meshNodePin"].as<String>();
+      services[idx].meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
+      services[idx].meshBatteryLowPct = doc["meshBatteryLowPct"].isNull() ? 20 : doc["meshBatteryLowPct"].as<int>();
+      services[idx].meshBatteryHighPct = doc["meshBatteryHighPct"].isNull() ? 50 : doc["meshBatteryHighPct"].as<int>();
       // Auto-discover MAC address if WoL enabled but no MAC specified
       if (services[idx].alertWol && services[idx].wolMacAddress.length() == 0) {
         String ip = getServiceIp(services[idx]);
@@ -5379,6 +5692,7 @@ void setup() {
       case TYPE_SNMP_GET:   result = checkSnmpGet(svc); break;
       case TYPE_PUSH:       result = checkPush(svc); break;
       case TYPE_UPTIME:     result = checkUptime(svc); break;
+      case TYPE_MESHCORE_NODE: result = checkMeshNode(svc); break;
       default:
         svc.lastError = "Unknown service type";
         result = false;
@@ -5415,6 +5729,11 @@ void setup() {
     } else if (svc.type == TYPE_SNMP_GET) {
       doc["snmpOid"] = svc.snmpOid;
       doc["snmpExpectedValue"] = svc.snmpExpectedValue;
+    } else if (svc.type == TYPE_MESHCORE_NODE) {
+      doc["meshNodePubkey"] = svc.meshNodePubkey;
+      doc["meshLastBatteryPct"] = svc.meshLastBatteryPct;
+      doc["meshLastBatteryV"] = svc.meshLastBatteryV;
+      doc["meshRepeaterKnownState"] = svc.meshRepeaterKnownState;
     }
 
     doc["timestamp"] = (unsigned long)time(nullptr);
@@ -7069,7 +7388,20 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   
   // ===== Common text handling for both group and direct messages =====
   String msgStr = text;
-  
+
+  // Check if this is a response to a pending MeshCore node status check.
+  // Direct messages from a node we polled should be routed to processMeshNodeResponse
+  // and not forwarded to notification services.
+  if (matchedChannelName == "Direct") {
+    int pendingSvcIdx = consumePendingMeshCheck(senderHash);
+    if (pendingSvcIdx >= 0) {
+      processMeshNodeResponse(pendingSvcIdx, msgStr);
+      Serial.println("[MeshNode] Response consumed, suppressing notification forwarding");
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+  }
+
   // Check if this is our own message by checking if the message starts with our node name
   if (msgStr.startsWith(ourNodeName + ":")) {
     Serial.println("This is our own message, not forwarding to notification services");
@@ -7212,6 +7544,50 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     pendingRestart = true;
     restartAtMs = millis() + 2000;
     Serial.println("[Command] Reboot scheduled after successful ack/reply");
+    Serial.println("=== Packet Processing Complete ===\n");
+    return;
+  }
+
+  // Handle "repeater on" command (PIN required)
+  if (commandLower == "repeater on") {
+    Serial.println("[Command] Received 'repeater on' request");
+    if (!pinOk) {
+      Serial.println("[Command] Repeater on denied: invalid or missing PIN");
+      if (senderPubKey != nullptr) {
+        sendLoRaDirectMessage("unauthorized", senderPubKey, senderHash, replyPath, replyPathLen);
+      }
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+    settings.repeaterEnabled = true;
+    saveSettingsOverrides();
+    sendBootAdvert();  // Re-advertise with new role
+    if (senderPubKey != nullptr) {
+      sendLoRaDirectMessage("repeater enabled", senderPubKey, senderHash, replyPath, replyPathLen);
+    }
+    Serial.println("[Command] Repeater mode enabled via remote command");
+    Serial.println("=== Packet Processing Complete ===\n");
+    return;
+  }
+
+  // Handle "repeater off" command (PIN required)
+  if (commandLower == "repeater off") {
+    Serial.println("[Command] Received 'repeater off' request");
+    if (!pinOk) {
+      Serial.println("[Command] Repeater off denied: invalid or missing PIN");
+      if (senderPubKey != nullptr) {
+        sendLoRaDirectMessage("unauthorized", senderPubKey, senderHash, replyPath, replyPathLen);
+      }
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
+    settings.repeaterEnabled = false;
+    saveSettingsOverrides();
+    sendBootAdvert();  // Re-advertise with new role
+    if (senderPubKey != nullptr) {
+      sendLoRaDirectMessage("repeater disabled", senderPubKey, senderHash, replyPath, replyPathLen);
+    }
+    Serial.println("[Command] Repeater mode disabled via remote command");
     Serial.println("=== Packet Processing Complete ===\n");
     return;
   }
