@@ -8627,6 +8627,49 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
         }
       }
 
+      // Also try each TYPE_MESHCORE_NODE service's pubkey before giving up.
+      // These nodes send responses whose srcHash may not equal pubkey[0] or
+      // sha256(pubkey)[0], so they fall through the hash-match path above.
+      if (!foundViaDirectNode) {
+        const uint8_t* encrypted2 = message + idx;
+        size_t encryptedLen2 = messageLen - idx;
+        for (int i = 0; i < serviceCount && !foundViaDirectNode; i++) {
+          if (services[i].type != TYPE_MESHCORE_NODE) continue;
+          if (services[i].meshNodePubkey.length() != 64) continue;
+          uint8_t candidatePub[32];
+          if (!parseHexKeyToBytes(services[i].meshNodePubkey, candidatePub)) continue;
+          // Skip if we already checked this pubkey via a direct-node entry
+          bool alreadyTried = false;
+          for (int j = 0; j < settings.loraDirectNodeCount && !alreadyTried; j++) {
+            uint8_t dp[32];
+            if (parseHexKeyToBytes(settings.loraDirectNodes[j].pubkeyHex, dp) &&
+                memcmp(dp, candidatePub, 32) == 0) alreadyTried = true;
+          }
+          if (alreadyTried) continue;
+
+          uint8_t tryShared[32];
+          if (!deriveSharedSecretWithPeer(candidatePub, tryShared)) continue;
+
+          uint8_t tryDecrypted[256];
+          size_t tryLen = verifyAndDecrypt(tryShared, 32, tryDecrypted, encrypted2, encryptedLen2);
+          if (tryLen == 0) {
+            uint8_t derivedKey[32];
+            deriveDirectKeyFromShared(tryShared, derivedKey);
+            tryLen = verifyAndDecrypt(derivedKey, 32, tryDecrypted, encrypted2, encryptedLen2);
+          }
+
+          if (tryLen > 0) {
+            Serial.printf("[MeshNode] Decryption succeeded with service node '%s' (srcHash=0x%02X != pubkey[0]=0x%02X)\n",
+                          services[i].name.c_str(), srcHash, candidatePub[0]);
+            memcpy(directNodePubkey, candidatePub, 32);
+            upsertPeer(candidatePub[0], candidatePub, services[i].name, (uint32_t)time(nullptr));
+            updateAdvertCache(candidatePub, services[i].name, (uint32_t)time(nullptr));
+            senderPubKey = directNodePubkey;
+            foundViaDirectNode = true;
+          }
+        }
+      }
+
       if (!foundViaDirectNode) {
         Serial.printf("Unknown sender for direct message (srcHash=0x%02X not resolved)\n", srcHash);
         Serial.println("Sending our advert to establish peer relationship...");
@@ -8743,8 +8786,11 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       // A request sent by flood receives its response inside a PATH packet.
       if (extraType == PAYLOAD_TYPE_RESPONSE) {
         size_t responseOffset = 1 + returnPathBytes + 1;
+        // Prefer pubkey[0] over the raw srcHash — nodes may self-identify with
+        // a hash that differs from the first byte of their public key.
+        uint8_t resolvedHashP = (senderPubKey != nullptr) ? senderPubKey[0] : senderHash;
         int pendingSvcIdx = responseOffset <= decryptedLen
-          ? consumePendingMeshCheck(senderHash, &decrypted[responseOffset], decryptedLen - responseOffset)
+          ? consumePendingMeshCheck(resolvedHashP, &decrypted[responseOffset], decryptedLen - responseOffset)
           : -1;
         if (pendingSvcIdx >= 0) {
           processMeshNodeResponse(pendingSvcIdx, &decrypted[responseOffset], decryptedLen - responseOffset);
@@ -8763,7 +8809,10 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
                     payloadType == PAYLOAD_TYPE_REQ ? "REQUEST" : "RESPONSE",
                     senderHash, decryptedLen);
       if (payloadType == PAYLOAD_TYPE_RESPONSE) {
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash, decrypted, decryptedLen);
+        // Prefer pubkey[0] over the raw srcHash — nodes may self-identify with
+        // a hash that differs from the first byte of their public key.
+        uint8_t resolvedHash = (senderPubKey != nullptr) ? senderPubKey[0] : senderHash;
+        int pendingSvcIdx = consumePendingMeshCheck(resolvedHash, decrypted, decryptedLen);
         if (pendingSvcIdx >= 0) {
           processMeshNodeResponse(pendingSvcIdx, decrypted, decryptedLen);
           updateServiceStatus(services[pendingSvcIdx], true);
