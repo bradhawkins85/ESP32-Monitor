@@ -118,6 +118,7 @@ For a `MeshCore Node` service, enable **Automated Battery Policy** and add as ma
 
 - TX power in dBm (leave blank to keep the current TX power)
 - Repeater forwarding on or off
+- Alert on entry (sends notifications when the node enters that battery range)
 
 The policy is evaluated whenever the monitor receives a status response from the node. If the battery percentage is not covered by a configured range, the remote settings are left unchanged. The monitor must be present in the repeater's Access Control list with Admin permission for remote setting changes.
 

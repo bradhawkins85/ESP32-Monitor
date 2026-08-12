@@ -143,6 +143,7 @@ struct Service {
   bool alertMqtt;
   bool alertWol;
   String wolMacAddress;
+  std::vector<String> loraDirectNodePubkeys;
   // MeshCore Node monitor fields (TYPE_MESHCORE_NODE)
   String meshNodePubkey;       // 64-char hex Ed25519 public key of remote node
   bool meshRepeaterControl;    // Enable automated battery policy control
@@ -151,6 +152,7 @@ struct Service {
     int maxPct;
     int txPower;
     bool repeat;
+    bool alert;
   };
   std::vector<MeshBatteryLevel> meshBatteryLevels;
   // Mesh node state. Last verified command values are persisted as a cache;
@@ -162,6 +164,7 @@ struct Service {
   bool meshRepeaterStateKnown;
   int meshKnownTxPower;
   int meshAppliedBatteryLevel;
+  int meshLastMatchedBatteryLevel;
 };
 
 static constexpr int MESH_TX_POWER_UNCHANGED = -32768;
@@ -2059,7 +2062,8 @@ void forwardToEmail(String message);
 void forwardToDiscord(String message);
 void forwardToWebhook(String message);
 void forwardToMqtt(String message);
-void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
+void sendLoRaNotification(const String& serviceName, bool isUp, const String& message,
+                          const std::vector<String>* directRecipients = nullptr);
 
 static void fanOutInternetNotificationsWithId(const String &message) {
   String messageId = messageIdForBody(message);
@@ -2453,7 +2457,8 @@ bool checkUptime(Service& service);
 bool checkMeshNode(Service& service, bool manualCheck = false, bool* requestSent = nullptr);
 void updateServiceStatus(Service& service, bool checkResult);
 bool executeServiceCheck(Service& service);
-void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
+void sendLoRaNotification(const String& serviceName, bool isUp, const String& message,
+                          const std::vector<String>* directRecipients);
 bool isAuthenticated(AsyncWebServerRequest *request, bool sendUnauthorized = true);
 String generateSessionToken();
 
@@ -2553,10 +2558,10 @@ static void addLegacyMeshBatteryLevels(Service& svc, int lowPct, int highPct) {
   lowPct = constrain(lowPct, 0, 100);
   highPct = constrain(highPct, 0, 100);
   if (lowPct > 0) {
-    svc.meshBatteryLevels.push_back({0, lowPct - 1, MESH_TX_POWER_UNCHANGED, false});
+    svc.meshBatteryLevels.push_back({0, lowPct - 1, MESH_TX_POWER_UNCHANGED, false, false});
   }
   if (highPct <= 100) {
-    svc.meshBatteryLevels.push_back({highPct, 100, MESH_TX_POWER_UNCHANGED, true});
+    svc.meshBatteryLevels.push_back({highPct, 100, MESH_TX_POWER_UNCHANGED, true, false});
   }
 }
 
@@ -2581,6 +2586,7 @@ static bool parseMeshBatteryLevels(JsonVariantConst value,
     level.minPct = item["minPct"].as<int>();
     level.maxPct = item["maxPct"].as<int>();
     level.repeat = item["repeat"].as<bool>();
+    level.alert = item["alert"].isNull() ? false : item["alert"].as<bool>();
     level.txPower = item["txPower"].is<int>() ? item["txPower"].as<int>() : MESH_TX_POWER_UNCHANGED;
     if (level.minPct < 0 || level.maxPct > 100 || level.minPct > level.maxPct) {
       if (validationError) *validationError = "Battery ranges must be within 0-100% and minimum must not exceed maximum";
@@ -2611,6 +2617,50 @@ static bool parseMeshBatteryLevels(JsonVariantConst value,
   return true;
 }
 
+static bool parseServiceLoraDirectNodePubkeys(JsonVariantConst value,
+                                              std::vector<String>& recipients,
+                                              String* validationError = nullptr) {
+  recipients.clear();
+  if (value.isNull()) return true;
+  if (!value.is<JsonArrayConst>()) {
+    if (validationError) *validationError = "loraDirectNodePubkeys must be an array";
+    return false;
+  }
+
+  for (JsonVariantConst item : value.as<JsonArrayConst>()) {
+    if (!item.is<String>()) {
+      if (validationError) *validationError = "Each LoRa direct node recipient must be a 64-char hex public key";
+      recipients.clear();
+      return false;
+    }
+
+    String normalized;
+    if (!normalizeHexKey(item.as<String>(), normalized)) {
+      if (validationError) *validationError = "Each LoRa direct node recipient must be a 64-char hex public key";
+      recipients.clear();
+      return false;
+    }
+
+    bool duplicate = false;
+    for (const String& existing : recipients) {
+      if (existing.equalsIgnoreCase(normalized)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) recipients.push_back(normalized);
+  }
+
+  return true;
+}
+
+static void writeServiceLoraDirectNodePubkeys(JsonObject target, const Service& svc) {
+  JsonArray recipients = target["loraDirectNodePubkeys"].to<JsonArray>();
+  for (const String& pubkey : svc.loraDirectNodePubkeys) {
+    if (pubkey.length() > 0) recipients.add(pubkey);
+  }
+}
+
 static void writeMeshBatteryLevels(JsonObject target, const Service& svc) {
   JsonArray levels = target["meshBatteryLevels"].to<JsonArray>();
   for (const Service::MeshBatteryLevel& configured : svc.meshBatteryLevels) {
@@ -2620,6 +2670,7 @@ static void writeMeshBatteryLevels(JsonObject target, const Service& svc) {
     if (configured.txPower == MESH_TX_POWER_UNCHANGED) level["txPower"] = nullptr;
     else level["txPower"] = configured.txPower;
     level["repeat"] = configured.repeat;
+    level["alert"] = configured.alert;
   }
 }
 
@@ -2633,6 +2684,7 @@ static void resetMeshBatteryRuntime(Service& svc) {
   svc.meshRepeaterStateKnown = true;
   svc.meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
   svc.meshAppliedBatteryLevel = -1;
+  svc.meshLastMatchedBatteryLevel = -1;
 }
 
 static void readMeshCommandCache(JsonVariantConst source, Service& svc) {
@@ -2701,6 +2753,7 @@ void saveServices() {
     svc["alertMqtt"] = services[i].alertMqtt;
     svc["alertWol"] = services[i].alertWol;
     svc["wolMacAddress"] = services[i].wolMacAddress;
+    writeServiceLoraDirectNodePubkeys(svc, services[i]);
     // MeshCore Node fields
     svc["meshNodePubkey"] = services[i].meshNodePubkey;
     svc["meshRepeaterControl"] = services[i].meshRepeaterControl;
@@ -2788,6 +2841,14 @@ void loadServices() {
     services[serviceCount].alertMqtt = svc["alertMqtt"].isNull() ? true : svc["alertMqtt"].as<bool>();
     services[serviceCount].alertWol = svc["alertWol"].isNull() ? false : svc["alertWol"].as<bool>();
     services[serviceCount].wolMacAddress = svc["wolMacAddress"].isNull() ? "" : svc["wolMacAddress"].as<String>();
+    String recipientsError;
+    if (!parseServiceLoraDirectNodePubkeys(svc["loraDirectNodePubkeys"],
+                         services[serviceCount].loraDirectNodePubkeys,
+                         &recipientsError)) {
+      services[serviceCount].loraDirectNodePubkeys.clear();
+      Serial.printf("Invalid LoRa direct recipients for '%s': %s\n",
+            services[serviceCount].name.c_str(), recipientsError.c_str());
+    }
     // MeshCore Node fields
     services[serviceCount].meshNodePubkey = svc["meshNodePubkey"].isNull() ? "" : svc["meshNodePubkey"].as<String>();
     services[serviceCount].meshRepeaterControl = svc["meshRepeaterControl"].isNull() ? false : svc["meshRepeaterControl"].as<bool>();
@@ -3056,6 +3117,7 @@ String getServicesJson() {
     obj["alertMqtt"] = services[i].alertMqtt;
     obj["alertWol"] = services[i].alertWol;
     obj["wolMacAddress"] = services[i].wolMacAddress;
+    writeServiceLoraDirectNodePubkeys(obj, services[i]);
     obj["meshNodePubkey"] = services[i].meshNodePubkey;
     obj["meshRepeaterControl"] = services[i].meshRepeaterControl;
     writeMeshBatteryLevels(obj, services[i]);
@@ -3529,7 +3591,16 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   return anySuccess;
 }
 
-static void sendLoRaDirectNotifications(const String &notification) {
+static bool isRecipientSelected(const std::vector<String>* recipients, const String& normalizedPubkey) {
+  if (recipients == nullptr) return true;
+  for (const String& candidate : *recipients) {
+    if (candidate.equalsIgnoreCase(normalizedPubkey)) return true;
+  }
+  return false;
+}
+
+static void sendLoRaDirectNotifications(const String &notification,
+                                        const std::vector<String>* recipients = nullptr) {
   if (!settings.loraEnabled) return;
   if (!settings.loraDirectEnabled) return;
   if (settings.loraDirectNodeCount <= 0) return;
@@ -3538,8 +3609,15 @@ static void sendLoRaDirectNotifications(const String &notification) {
     const String &pubHex = settings.loraDirectNodes[i].pubkeyHex;
     if (pubHex.length() == 0) continue;
 
+    String normalizedPub;
+    if (!normalizeHexKey(pubHex, normalizedPub)) {
+      Serial.printf("[LoRa] Skipping direct node %d: invalid pubkey\n", i);
+      continue;
+    }
+    if (!isRecipientSelected(recipients, normalizedPub)) continue;
+
     uint8_t pubkey[32];
-    if (!parseHexKeyToBytes(pubHex, pubkey)) {
+    if (!parseHexKeyToBytes(normalizedPub, pubkey)) {
       Serial.printf("[LoRa] Skipping direct node %d: invalid pubkey\n", i);
       continue;
     }
@@ -3558,7 +3636,8 @@ static void sendLoRaDirectNotifications(const String &notification) {
 }
 
 // Send LoRa notification for service status changes
-void sendLoRaNotification(const String& serviceName, bool isUp, const String& message) {
+void sendLoRaNotification(const String& serviceName, bool isUp, const String& message,
+                          const std::vector<String>* directRecipients) {
   if (!settings.loraEnabled) return;
   String notification = "[Monitor] " + serviceName + ": " + (isUp ? "UP" : "DOWN");
   if (message.length() > 0) {
@@ -3635,7 +3714,7 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   appendLoraLog('S', 'G', settings.channelName, notification, state == RADIOLIB_ERR_NONE);
 
   // Optional direct notifications to configured nodes
-  sendLoRaDirectNotifications(notification);
+  sendLoRaDirectNotifications(notification, directRecipients);
   
 }
 
@@ -4541,6 +4620,31 @@ static void applyMeshBatteryPolicy(Service& svc) {
     }
   }
 
+  if (levelIndex != svc.meshLastMatchedBatteryLevel && levelIndex >= 0) {
+    const Service::MeshBatteryLevel& enteredLevel = svc.meshBatteryLevels[levelIndex];
+    if (enteredLevel.alert) {
+      String detail = "Battery entered alert range " + String(enteredLevel.minPct) +
+                      "-" + String(enteredLevel.maxPct) + "% (" +
+                      String(svc.meshLastBatteryPct) + "%, " +
+                      String(svc.meshLastBatteryV, 2) + "V)";
+      String alertMsg = "[Monitor] " + svc.name + ": " + detail;
+
+      if (svc.alertLora) sendLoRaNotification(svc.name, true, detail, &svc.loraDirectNodePubkeys);
+
+      String messageId = messageIdForBody(alertMsg);
+      String bodyWithId = addMessageIdPrefix(alertMsg, messageId);
+      if (svc.alertNtfy && settings.ntfyEnabled) forwardToNtfy(bodyWithId);
+      if (svc.alertDiscord && settings.discordEnabled) forwardToDiscord(bodyWithId);
+      if (svc.alertWebhook && settings.webhookEnabled) forwardToWebhook(bodyWithId);
+      if (svc.alertEmail && settings.emailEnabled) forwardToEmail(bodyWithId);
+      if (svc.alertMqtt && settings.mqttEnabled) forwardToMqtt(alertMsg);
+
+      Serial.printf("[MeshNode] Alerted on battery range %d-%d%% for %s\n",
+                    enteredLevel.minPct, enteredLevel.maxPct, svc.name.c_str());
+    }
+  }
+  svc.meshLastMatchedBatteryLevel = levelIndex;
+
   if (levelIndex < 0) {
     if (svc.meshAppliedBatteryLevel != -1) {
       Serial.printf("[MeshNode] Battery %d%% is outside configured ranges; leaving settings unchanged\n",
@@ -4770,7 +4874,8 @@ void updateServiceStatus(Service& service, bool checkResult) {
 
     // LoRa channel notification
     if (service.alertLora) {
-      sendLoRaNotification(service.name, service.isUp, service.lastError);
+      sendLoRaNotification(service.name, service.isUp, service.lastError,
+                           &service.loraDirectNodePubkeys);
     }
 
     // Internet channel notifications (per-service overrides)
@@ -6305,6 +6410,9 @@ void setup() {
     // Alert channel toggles (only globally-enabled channels shown via JS)
     html += "<div class='form-group' id='alertChannelsGroup'><label class='form-label'>Alert Channels</label>";
     html += "<div id='alertChannelsContainer' style='display:flex;flex-wrap:wrap;gap:12px;margin-top:4px'></div></div>";
+    html += "<div class='form-group' id='loraRecipientsGroup' style='display:none'><label class='form-label'>LoRa Direct Recipients</label>";
+    html += "<div id='loraRecipientsContainer' style='display:flex;flex-direction:column;gap:8px;margin-top:4px'></div>";
+    html += "<div class='hint'>Choose which direct-message nodes should receive this service's LoRa alerts.</div></div>";
     html += "<div class='btn-group'>";
     html += "<button type='submit' class='btn btn-primary' style='flex:1'>Save Service</button>";
     html += "<button type='button' class='btn btn-cancel' onclick='closeModal()'>Cancel</button></div>";
@@ -6329,17 +6437,22 @@ void setup() {
     // JavaScript
     html += "<script>";
     html += "const services=" + getServicesJson() + ";";
+    html += "const directNodes=" + getDirectNodesJson() + ";";
     html += "const globalChannels=" + getGlobalAlertChannelsJson() + ";";
     html += "const isAuthed=" + String(isAuthed ? "true" : "false") + ";";
     html += "let modalOpen=false;";
     // Alert channel rendering helper
     html += "const channelDefs=[{key:'lora',label:'📡 LoRa',field:'alertLora'},{key:'ntfy',label:'🔔 Ntfy',field:'alertNtfy'},{key:'discord',label:'💬 Discord',field:'alertDiscord'},{key:'webhook',label:'🌐 Webhook',field:'alertWebhook'},{key:'email',label:'📧 Email',field:'alertEmail'},{key:'mqtt',label:'📨 MQTT',field:'alertMqtt'},{key:'wol',label:'⏰ WoL',field:'alertWol',alwaysShow:true}];";;
-    html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!ch.alwaysShow&&!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]===true;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';}";
+    html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!ch.alwaysShow&&!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]===true;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';updateLoraRecipientsVisibility();}";
     html += "function getAlertChannelValues(){const v={};channelDefs.forEach(ch=>{const el=document.getElementById('alert_'+ch.field);v[ch.field]=el?el.checked:true;});return v;}";
-    html += "const defaultMeshLevels=[{minPct:0,maxPct:30,txPower:20,repeat:false},{minPct:31,maxPct:50,txPower:15,repeat:true},{minPct:51,maxPct:75,txPower:23,repeat:true},{minPct:76,maxPct:100,txPower:28,repeat:true}];";
-    html += "function addMeshBatteryLevel(level){level=level||{minPct:0,maxPct:100,txPower:20,repeat:true};const row=document.createElement('div');row.className='battery-level';const tx=level.txPower==null?'':level.txPower;row.innerHTML=\"<label>Minimum %<input class='form-input mesh-min' type='number' min='0' max='100' required value='\"+Number(level.minPct)+\"'></label><label>Maximum %<input class='form-input mesh-max' type='number' min='0' max='100' required value='\"+Number(level.maxPct)+\"'></label><label>TX Power (dBm)<input class='form-input mesh-tx' type='number' min='-20' max='30' placeholder='unchanged' value='\"+tx+\"'></label><label>Repeat<select class='form-select mesh-repeat'><option value='true'\"+(level.repeat?' selected':'')+\">On</option><option value='false'\"+(!level.repeat?' selected':'')+\">Off</option></select></label><button type='button' class='remove-level' title='Remove level'>×</button>\";row.querySelector('.remove-level').onclick=()=>row.remove();document.getElementById('meshBatteryLevels').appendChild(row);}";
+    html += "function renderLoraRecipients(selected){const c=document.getElementById('loraRecipientsContainer');const g=document.getElementById('loraRecipientsGroup');const selectedSet=new Set((selected||[]).map(v=>(v||'').toLowerCase()));if(!g||!c)return;c.innerHTML='';if(!directNodes.length){g.style.display='none';return;}directNodes.forEach((n,i)=>{const pub=(n.pubkey||'').toLowerCase();if(!pub)return;const label=document.createElement('label');label.style.cssText='display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.className='lora-recipient';cb.value=pub;cb.checked=selectedSet.has(pub);const name=(n.name&&n.name.trim().length)?n.name.trim():'Node '+(i+1);const mono=document.createElement('span');mono.style.cssText='font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;color:#718096';mono.textContent='('+pub.substring(0,12)+'...)';label.appendChild(cb);label.appendChild(document.createTextNode(name+' '));label.appendChild(mono);c.appendChild(label);});updateLoraRecipientsVisibility();};";
+    html += "function collectLoraRecipients(){const out=[];document.querySelectorAll('#loraRecipientsContainer .lora-recipient:checked').forEach(el=>{if(el.value)out.push(el.value);});return out;}";
+    html += "function updateLoraRecipientsVisibility(){const g=document.getElementById('loraRecipientsGroup');if(!g)return;const loraEnabled=document.getElementById('alert_alertLora')?.checked===true;g.style.display=(loraEnabled&&directNodes.length)?'':'none';}";
+    html += "document.addEventListener('change',e=>{if(e.target&&e.target.id==='alert_alertLora'){updateLoraRecipientsVisibility();}});";
+    html += "const defaultMeshLevels=[{minPct:0,maxPct:30,txPower:20,repeat:false,alert:false},{minPct:31,maxPct:50,txPower:15,repeat:true,alert:false},{minPct:51,maxPct:75,txPower:23,repeat:true,alert:false},{minPct:76,maxPct:100,txPower:28,repeat:true,alert:false}];";
+    html += "function addMeshBatteryLevel(level){level=level||{minPct:0,maxPct:100,txPower:20,repeat:true,alert:false};const row=document.createElement('div');row.className='battery-level';const tx=level.txPower==null?'':level.txPower;row.innerHTML=\"<label>Minimum %<input class='form-input mesh-min' type='number' min='0' max='100' required value='\"+Number(level.minPct)+\"'></label><label>Maximum %<input class='form-input mesh-max' type='number' min='0' max='100' required value='\"+Number(level.maxPct)+\"'></label><label>TX Power (dBm)<input class='form-input mesh-tx' type='number' min='-20' max='30' placeholder='unchanged' value='\"+tx+\"'></label><label>Repeat<select class='form-select mesh-repeat'><option value='true'\"+(level.repeat?' selected':'')+\">On</option><option value='false'\"+(!level.repeat?' selected':'')+\">Off</option></select></label><label>Alert<input class='mesh-alert' type='checkbox'\"+(level.alert===true?' checked':'')+\"></label><button type='button' class='remove-level' title='Remove level'>×</button>\";row.querySelector('.remove-level').onclick=()=>row.remove();document.getElementById('meshBatteryLevels').appendChild(row);}";
     html += "function renderMeshBatteryLevels(levels){const c=document.getElementById('meshBatteryLevels');c.innerHTML='';(levels||[]).forEach(addMeshBatteryLevel);}";
-    html += "function collectMeshBatteryLevels(){const levels=[];for(const row of document.querySelectorAll('.battery-level')){const minPct=Number(row.querySelector('.mesh-min').value),maxPct=Number(row.querySelector('.mesh-max').value),txRaw=row.querySelector('.mesh-tx').value.trim(),txPower=txRaw===''?null:Number(txRaw);if(!Number.isInteger(minPct)||!Number.isInteger(maxPct)||(txPower!==null&&!Number.isInteger(txPower))||minPct<0||maxPct>100||minPct>maxPct||(txPower!==null&&(txPower< -20||txPower>30))){alert('Each battery level needs a valid 0-100% range. TX power, when set, must be from -20 to 30 dBm.');return null;}levels.push({minPct,maxPct,txPower,repeat:row.querySelector('.mesh-repeat').value==='true'});}levels.sort((a,b)=>a.minPct-b.minPct);for(let i=1;i<levels.length;i++){if(levels[i].minPct<=levels[i-1].maxPct){alert('Battery ranges must not overlap.');return null;}}return levels;}";
+    html += "function collectMeshBatteryLevels(){const levels=[];for(const row of document.querySelectorAll('.battery-level')){const minPct=Number(row.querySelector('.mesh-min').value),maxPct=Number(row.querySelector('.mesh-max').value),txRaw=row.querySelector('.mesh-tx').value.trim(),txPower=txRaw===''?null:Number(txRaw);if(!Number.isInteger(minPct)||!Number.isInteger(maxPct)||(txPower!==null&&!Number.isInteger(txPower))||minPct<0||maxPct>100||minPct>maxPct||(txPower!==null&&(txPower< -20||txPower>30))){alert('Each battery level needs a valid 0-100% range. TX power, when set, must be from -20 to 30 dBm.');return null;}levels.push({minPct,maxPct,txPower,repeat:row.querySelector('.mesh-repeat').value==='true',alert:row.querySelector('.mesh-alert').checked});}levels.sort((a,b)=>a.minPct-b.minPct);for(let i=1;i<levels.length;i++){if(levels[i].minPct<=levels[i-1].maxPct){alert('Battery ranges must not overlap.');return null;}}return levels;}";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
     html += "function setPushDetails(token){const hidden=document.getElementById('servicePushToken');const url=document.getElementById('servicePushUrl');hidden.value=token||'';if(token){url.value=location.origin+'/push/'+token;url.placeholder='';}else{url.value='';url.placeholder='Generated after saving';}}";
@@ -6348,6 +6461,7 @@ void setup() {
     html += "renderMeshBatteryLevels(defaultMeshLevels);";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "renderAlertChannels({});";
+    html += "renderLoraRecipients([]);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show');modalOpen=false;}";
 
@@ -6399,6 +6513,7 @@ void setup() {
     html += "renderMeshBatteryLevels(s.meshBatteryLevels||[]);";
     html += "updateFieldVisibility(s.type);";
     html += "renderAlertChannels(s);";
+    html += "renderLoraRecipients(s.loraDirectNodePubkeys||[]);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
     html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
@@ -6416,7 +6531,7 @@ void setup() {
     html += "while(d.waitingForResult){await new Promise(resolve=>setTimeout(resolve,500));res=await fetch('/api/check-service-result/'+i+'?startedMs='+encodeURIComponent(d.startedMs)+'&baseline='+encodeURIComponent(d.baseline),{credentials:'include',cache:'no-store'});d=await parseCheckResponse(res);}";
     html += "applyServiceCheckResult(i,d);";
     html += "}catch(e){setCheckMessage(i,'Check failed: '+e.message,'#e53e3e');}finally{if(btn){btn.disabled=false;btn.textContent='▶️';}}}";
-    html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}const meshBatteryLevels=collectMeshBatteryLevels();if(meshBatteryLevels===null)return;if(document.getElementById('serviceMeshRepeaterControl').checked&&!meshBatteryLevels.length){alert('Add at least one battery level before enabling the policy.');return;}";
+    html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}const meshBatteryLevels=collectMeshBatteryLevels();if(meshBatteryLevels===null)return;if(document.getElementById('serviceMeshRepeaterControl').checked&&!meshBatteryLevels.length){alert('Add at least one battery level before enabling the policy.');return;}const alerts=getAlertChannelValues();const loraRecipients=collectLoraRecipients();if(alerts.alertLora&&directNodes.length&&!loraRecipients.length){alert('Select at least one LoRa direct recipient for LoRa alerts.');return;}";
     html += "const data={name:document.getElementById('serviceName').value,";
     html += "group:document.getElementById('serviceGroup').value.trim(),";
     html += "type:parseInt(document.getElementById('serviceType').value),";
@@ -6438,8 +6553,9 @@ void setup() {
     html += "wolMacAddress:document.getElementById('serviceWolMac').value,";
     html += "meshNodePubkey:document.getElementById('serviceMeshPubkey').value,";
     html += "meshRepeaterControl:document.getElementById('serviceMeshRepeaterControl').checked,";
-    html += "meshBatteryLevels:meshBatteryLevels};";
-    html += "Object.assign(data,getAlertChannelValues());";
+    html += "meshBatteryLevels:meshBatteryLevels,";
+    html += "loraDirectNodePubkeys:loraRecipients};";
+    html += "Object.assign(data,alerts);";
     html += "const idx=document.getElementById('serviceIndex').value;";
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
     html += "const method=idx==='-1'?'POST':'PUT';";
@@ -6704,6 +6820,7 @@ void setup() {
       obj["alertMqtt"] = services[i].alertMqtt;
       obj["alertWol"] = services[i].alertWol;
       obj["wolMacAddress"] = services[i].wolMacAddress;
+      writeServiceLoraDirectNodePubkeys(obj, services[i]);
       obj["meshNodePubkey"] = services[i].meshNodePubkey;
       obj["meshRepeaterControl"] = services[i].meshRepeaterControl;
       writeMeshBatteryLevels(obj, services[i]);
@@ -6764,6 +6881,13 @@ void setup() {
             svc.alertMqtt = obj["alertMqtt"].isNull() ? true : obj["alertMqtt"].as<bool>();
             svc.alertWol = obj["alertWol"].isNull() ? false : obj["alertWol"].as<bool>();
             svc.wolMacAddress = obj["wolMacAddress"].isNull() ? "" : obj["wolMacAddress"].as<String>();
+            String recipientsError;
+            if (!parseServiceLoraDirectNodePubkeys(obj["loraDirectNodePubkeys"], svc.loraDirectNodePubkeys,
+                                                   &recipientsError)) {
+              svc.loraDirectNodePubkeys.clear();
+              Serial.printf("Import: invalid LoRa direct recipients for '%s': %s\n",
+                            svc.name.c_str(), recipientsError.c_str());
+            }
             svc.meshNodePubkey = obj["meshNodePubkey"].isNull() ? "" : obj["meshNodePubkey"].as<String>();
             svc.meshRepeaterControl = obj["meshRepeaterControl"].isNull() ? false : obj["meshRepeaterControl"].as<bool>();
             String policyError;
@@ -6842,6 +6966,16 @@ void setup() {
       svc.alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
       svc.alertWol = doc["alertWol"].isNull() ? false : doc["alertWol"].as<bool>();
       svc.wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
+      String recipientsError;
+      if (!parseServiceLoraDirectNodePubkeys(doc["loraDirectNodePubkeys"], svc.loraDirectNodePubkeys,
+                                             &recipientsError)) {
+        request->send(400, "text/plain", recipientsError);
+        return;
+      }
+      if (svc.alertLora && settings.loraDirectNodeCount > 0 && svc.loraDirectNodePubkeys.empty()) {
+        request->send(400, "text/plain", "Select at least one LoRa direct node recipient when LoRa alerts are enabled");
+        return;
+      }
       // MeshCore Node fields
       svc.meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
       svc.meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
@@ -6949,6 +7083,16 @@ void setup() {
       services[idx].alertMqtt = doc["alertMqtt"].isNull() ? true : doc["alertMqtt"].as<bool>();
       services[idx].alertWol = doc["alertWol"].isNull() ? false : doc["alertWol"].as<bool>();
       services[idx].wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
+      String recipientsError;
+      if (!parseServiceLoraDirectNodePubkeys(doc["loraDirectNodePubkeys"], services[idx].loraDirectNodePubkeys,
+                                             &recipientsError)) {
+        request->send(400, "text/plain", recipientsError);
+        return;
+      }
+      if (services[idx].alertLora && settings.loraDirectNodeCount > 0 && services[idx].loraDirectNodePubkeys.empty()) {
+        request->send(400, "text/plain", "Select at least one LoRa direct node recipient when LoRa alerts are enabled");
+        return;
+      }
       // MeshCore Node fields
       services[idx].meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
       services[idx].meshRepeaterControl = policySvc.meshRepeaterControl;
@@ -6965,6 +7109,7 @@ void setup() {
         services[idx].meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
       }
       services[idx].meshAppliedBatteryLevel = -1;
+      services[idx].meshLastMatchedBatteryLevel = -1;
       // Auto-discover MAC address if WoL enabled but no MAC specified
       if (services[idx].alertWol && services[idx].wolMacAddress.length() == 0) {
         String ip = getServiceIp(services[idx]);
