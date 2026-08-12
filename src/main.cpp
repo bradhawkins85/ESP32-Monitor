@@ -1960,6 +1960,7 @@ bool checkPort(Service& service);
 bool checkSnmpGet(Service& service);
 bool checkPush(Service& service);
 bool checkUptime(Service& service);
+bool checkMeshNode(Service& service);
 void updateServiceStatus(Service& service, bool checkResult);
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
 bool isAuthenticated(AsyncWebServerRequest *request, bool sendUnauthorized = true);
@@ -2265,7 +2266,6 @@ static bool deriveSharedSecretWithPeer(const uint8_t peerEd25519Pub[32], uint8_t
 static void deriveDirectKeyFromShared(const uint8_t shared[32], uint8_t outKey[32]);
 static bool normalizeHexKey(const String &input, String &out);
 static bool parseHexKeyToBytes(const String &hex, uint8_t out[32]);
-bool checkMeshNode(Service& svc);
 
 // Helper function to get services as JSON string
 String getServicesJson() {
