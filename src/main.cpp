@@ -51,9 +51,9 @@
 #define PAYLOAD_TYPE_ANON_REQ 0x07
 #define PAYLOAD_TYPE_PATH 0x08
 #define TXT_TYPE_PLAIN 0x00
-#define TXT_TYPE_CLI_CMD 0x01
+#define TXT_TYPE_CLI_DATA 0x01
 #define TXT_TYPE_SIGNED_PLAIN 0x02
-#define TXT_TYPE_CLI_DATA 0x03
+#define REQ_TYPE_GET_STATUS 0x01
 #define ROUTE_TYPE_TRANSPORT_FLOOD 0x00  // flood mode + transport codes
 #define ROUTE_TYPE_FLOOD 0x01            // flood mode, needs 'path' to be built up
 #define ROUTE_TYPE_DIRECT 0x02           // direct route, 'path' is supplied (zero hop = direct with no path)
@@ -140,7 +140,6 @@ struct Service {
   String wolMacAddress;
   // MeshCore Node monitor fields (TYPE_MESHCORE_NODE)
   String meshNodePubkey;       // 64-char hex Ed25519 public key of remote node
-  String meshNodePin;          // Remote command PIN for authentication
   bool meshRepeaterControl;    // Enable automated repeater threshold control
   int meshBatteryLowPct;       // Disable repeater when battery drops below this %
   int meshBatteryHighPct;      // Re-enable repeater when battery rises above this %
@@ -2010,7 +2009,6 @@ void saveServices() {
     svc["wolMacAddress"] = services[i].wolMacAddress;
     // MeshCore Node fields
     svc["meshNodePubkey"] = services[i].meshNodePubkey;
-    svc["meshNodePin"] = services[i].meshNodePin;
     svc["meshRepeaterControl"] = services[i].meshRepeaterControl;
     svc["meshBatteryLowPct"] = services[i].meshBatteryLowPct;
     svc["meshBatteryHighPct"] = services[i].meshBatteryHighPct;
@@ -2086,7 +2084,6 @@ void loadServices() {
     services[serviceCount].wolMacAddress = svc["wolMacAddress"].isNull() ? "" : svc["wolMacAddress"].as<String>();
     // MeshCore Node fields
     services[serviceCount].meshNodePubkey = svc["meshNodePubkey"].isNull() ? "" : svc["meshNodePubkey"].as<String>();
-    services[serviceCount].meshNodePin = svc["meshNodePin"].isNull() ? "" : svc["meshNodePin"].as<String>();
     services[serviceCount].meshRepeaterControl = svc["meshRepeaterControl"].isNull() ? false : svc["meshRepeaterControl"].as<bool>();
     services[serviceCount].meshBatteryLowPct = svc["meshBatteryLowPct"].isNull() ? 20 : svc["meshBatteryLowPct"].as<int>();
     services[serviceCount].meshBatteryHighPct = svc["meshBatteryHighPct"].isNull() ? 50 : svc["meshBatteryHighPct"].as<int>();
@@ -2299,7 +2296,6 @@ String getServicesJson() {
     obj["alertWol"] = services[i].alertWol;
     obj["wolMacAddress"] = services[i].wolMacAddress;
     obj["meshNodePubkey"] = services[i].meshNodePubkey;
-    obj["meshNodePin"] = services[i].meshNodePin;
     obj["meshRepeaterControl"] = services[i].meshRepeaterControl;
     obj["meshBatteryLowPct"] = services[i].meshBatteryLowPct;
     obj["meshBatteryHighPct"] = services[i].meshBatteryHighPct;
@@ -2462,29 +2458,29 @@ void initNodeIdentity() {
   initPendingMeshChecks();
 }
 
-// Send direct LoRa text message (for commands like ping/status)
-// Returns true if the radio transmission succeeded.
-bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uint8_t destHash, const uint8_t* replyPath, size_t replyPathLen) {
+static String getOurMeshPublicKeyHex() {
+  char hexPub[65];
+  for (int i = 0; i < 32; i++) snprintf(hexPub + i * 2, 3, "%02x", ed25519_public_key[i]);
+  hexPub[64] = '\0';
+  return String(hexPub);
+}
+
+static uint32_t nextMeshCommandTimestamp() {
+  static uint32_t lastTimestamp = 0;
+  uint32_t timestamp = (uint32_t)time(nullptr);
+  if (timestamp <= lastTimestamp) timestamp = lastTimestamp + 1;
+  lastTimestamp = timestamp;
+  return timestamp;
+}
+
+// Encrypt and send a MeshCore peer payload using this monitor's node identity.
+static bool sendLoRaPeerPayload(uint8_t payloadType, const uint8_t* plaintext, size_t plaintextLen,
+                               const String& logText, const uint8_t* destPubKey, uint8_t destHash,
+                               const uint8_t* replyPath, size_t replyPathLen) {
   if (!settings.loraEnabled) return false;
 
-  // Send message without node name prefix (direct response style)
-  size_t textLen = message.length();
-  if (textLen > 220) textLen = 220;  // Leave room for timestamp + txt_type + padding
-  
-  // Build plaintext: [timestamp(4)][txt_type(1)][message]
-  uint8_t plaintext[256];
-  size_t idx = 0;
-  uint32_t timestamp = (uint32_t)time(nullptr);
-  plaintext[idx++] = (uint8_t)(timestamp & 0xFF);
-  plaintext[idx++] = (uint8_t)((timestamp >> 8) & 0xFF);
-  plaintext[idx++] = (uint8_t)((timestamp >> 16) & 0xFF);
-  plaintext[idx++] = (uint8_t)((timestamp >> 24) & 0xFF);
-  plaintext[idx++] = TXT_TYPE_PLAIN;  // txt_type (upper 6 bits), attempt (lower 2 bits) = 0
-  memcpy(&plaintext[idx], message.c_str(), textLen);
-  idx += textLen;
-  
   if (destPubKey == nullptr) {
-    Serial.println("[LoRa] ERROR: Missing destination public key for direct message");
+    Serial.println("[LoRa] ERROR: Missing destination public key for peer payload");
     return false;
   }
 
@@ -2499,7 +2495,7 @@ bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   
   // Encrypt and compute MAC using raw shared secret
   uint8_t macAndCipher[256];
-  size_t macCipherLen = encryptAndSign(channelKey, channelKeyLen, macAndCipher, sizeof(macAndCipher), plaintext, idx);
+  size_t macCipherLen = encryptAndSign(channelKey, channelKeyLen, macAndCipher, sizeof(macAndCipher), plaintext, plaintextLen);
   if (macCipherLen == 0) {
     Serial.println("[LoRa] ERROR: Failed to encrypt message");
     return false;
@@ -2509,24 +2505,21 @@ bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   uint8_t packet[260];
   size_t pktIdx = 0;
   
-  // Get MAC address for our node ID
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  
   // Determine routing: DIRECT if we have sender path, otherwise FLOOD
-  bool useDirect = (replyPath != nullptr && replyPathLen > 0);
+  size_t replyPathBytes = (replyPathLen & 0x3F) * ((replyPathLen >> 6) + 1);
+  bool useDirect = (replyPath != nullptr && replyPathBytes > 0);
   uint8_t routeType = useDirect ? ROUTE_TYPE_DIRECT : ROUTE_TYPE_FLOOD;
   
-  // Header: version(0) + payload_type(TXT=2) + route_type
-  uint8_t header = (uint8_t)((routeType & 0x03) | ((PAYLOAD_TYPE_TXT & 0x0F) << 2));
+  // Header: version(0) + payload type + route type
+  uint8_t header = (uint8_t)((routeType & 0x03) | ((payloadType & 0x0F) << 2));
   packet[pktIdx++] = header;
   
   // Path: use sender's path for direct routing, or our node ID for flood
   if (useDirect) {
     // Direct routing: use sender's path as destination
     packet[pktIdx++] = replyPathLen;
-    memcpy(&packet[pktIdx], replyPath, replyPathLen);
-    pktIdx += replyPathLen;
+    memcpy(&packet[pktIdx], replyPath, replyPathBytes);
+    pktIdx += replyPathBytes;
     Serial.printf("[LoRa] Using DIRECT routing with path_len=%d\n", replyPathLen);
   } else {
     // Flood routing: start with empty path
@@ -2552,10 +2545,10 @@ bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
   int state = radio.transmit(packet, pktIdx);
   bool success = (state == RADIOLIB_ERR_NONE);
   if (success) {
-    Serial.printf("[LoRa] Sent direct message: %s (len=%u)\n", 
-                  message.c_str(), (unsigned int)pktIdx);
+    Serial.printf("[LoRa] Sent peer payload type %u: %s (len=%u)\n",
+                  payloadType, logText.c_str(), (unsigned int)pktIdx);
   } else {
-    Serial.printf("[LoRa] Failed to send message, code: %d\n", state);
+    Serial.printf("[LoRa] Failed to send peer payload, code: %d\n", state);
   }
   
   // Log to LoRa message history
@@ -2564,12 +2557,54 @@ bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
     int pi = findPeerIndexByHash(destHash);
     if (pi >= 0) peerName = peers[pi].name;
     if (peerName.length() == 0) { char hx[8]; snprintf(hx, sizeof(hx), "0x%02X", destHash); peerName = hx; }
-    appendLoraLog('S', 'D', peerName, message, success);
+    appendLoraLog('S', 'D', peerName, logText, success);
   }
   
   // Return to RX mode
   radio.startReceive();
   return success;
+}
+
+// Send a direct plain text message. This is used for ordinary messages and replies.
+bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uint8_t destHash,
+                           const uint8_t* replyPath, size_t replyPathLen) {
+  size_t textLen = message.length();
+  if (textLen > 220) textLen = 220;
+
+  uint8_t plaintext[256];
+  uint32_t timestamp = nextMeshCommandTimestamp();
+  memcpy(plaintext, &timestamp, sizeof(timestamp));
+  plaintext[4] = TXT_TYPE_PLAIN << 2;
+  memcpy(&plaintext[5], message.c_str(), textLen);
+  return sendLoRaPeerPayload(PAYLOAD_TYPE_TXT, plaintext, 5 + textLen, message,
+                             destPubKey, destHash, replyPath, replyPathLen);
+}
+
+// Send a remote CLI command. The repeater authorizes it from the sender's ACL role.
+static bool sendLoRaAdminCommand(const String& command, const uint8_t* destPubKey, uint8_t destHash) {
+  size_t textLen = command.length();
+  if (textLen > 220) textLen = 220;
+
+  uint8_t plaintext[256];
+  uint32_t timestamp = nextMeshCommandTimestamp();
+  memcpy(plaintext, &timestamp, sizeof(timestamp));
+  plaintext[4] = TXT_TYPE_CLI_DATA << 2;
+  memcpy(&plaintext[5], command.c_str(), textLen);
+  return sendLoRaPeerPayload(PAYLOAD_TYPE_TXT, plaintext, 5 + textLen, "admin: " + command,
+                             destPubKey, destHash, nullptr, 0);
+}
+
+// Send MeshCore's native repeater status request. ACL membership replaces PIN login.
+static bool sendLoRaStatusRequest(const uint8_t* destPubKey, uint8_t destHash) {
+  uint8_t plaintext[13];
+  uint32_t timestamp = nextMeshCommandTimestamp();
+  memcpy(plaintext, &timestamp, sizeof(timestamp));
+  plaintext[4] = REQ_TYPE_GET_STATUS;
+  memset(&plaintext[5], 0, 4);  // reserved by the MeshCore request format
+  uint32_t nonce = esp_random();
+  memcpy(&plaintext[9], &nonce, sizeof(nonce));
+  return sendLoRaPeerPayload(PAYLOAD_TYPE_REQ, plaintext, sizeof(plaintext), "status request",
+                             destPubKey, destHash, nullptr, 0);
 }
 
 static uint32_t computeAckHash(const uint8_t* data, size_t dataLen, const uint8_t senderPubKey[32]) {
@@ -2593,10 +2628,11 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   constexpr size_t kMaxDirectAckPathLen = sizeof(packet) - kAckOverheadBytes;
   size_t pktIdx = 0;
 
-  bool useDirect = (replyPath != nullptr && replyPathLen > 0);
-  if (useDirect && replyPathLen > kMaxDirectAckPathLen) {
+  size_t replyPathBytes = (replyPathLen & 0x3F) * ((replyPathLen >> 6) + 1);
+  bool useDirect = (replyPath != nullptr && replyPathBytes > 0);
+  if (useDirect && replyPathBytes > kMaxDirectAckPathLen) {
     Serial.printf("[LoRa] ACK reply path too long for packet buffer (%u > %u), using flood ACK\n",
-                  (unsigned int)replyPathLen, (unsigned int)kMaxDirectAckPathLen);
+                  (unsigned int)replyPathBytes, (unsigned int)kMaxDirectAckPathLen);
     useDirect = false;
   }
   uint8_t routeType = useDirect ? ROUTE_TYPE_DIRECT : ROUTE_TYPE_FLOOD;
@@ -2605,8 +2641,8 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
 
   if (useDirect) {
     packet[pktIdx++] = replyPathLen;
-    memcpy(&packet[pktIdx], replyPath, replyPathLen);
-    pktIdx += replyPathLen;
+    memcpy(&packet[pktIdx], replyPath, replyPathBytes);
+    pktIdx += replyPathBytes;
   } else {
     packet[pktIdx++] = 0; // no path for flood
   }
@@ -3428,13 +3464,14 @@ bool checkUptime(Service& service) {
 
 // Forward declarations for MeshCore node check functions
 static void sendMeshRepeaterCommand(Service& svc, bool enable);
-static void processMeshNodeResponse(int serviceIdx, const String& text);
+static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t len);
 
 // ============================================
 // MeshCore Node Monitor Functions
 // ============================================
 
-// Send "repeater on" or "repeater off" to a remote MeshCore node.
+// Send the native remote CLI command to enable or disable repeater forwarding.
+// MeshCore authorizes CLI data from the sender's Access Control role (Admin required).
 static void sendMeshRepeaterCommand(Service& svc, bool enable) {
   if (!settings.loraEnabled) return;
   uint8_t pubkeyBytes[32];
@@ -3442,8 +3479,8 @@ static void sendMeshRepeaterCommand(Service& svc, bool enable) {
     Serial.printf("[MeshNode] Invalid pubkey for service '%s'\n", svc.name.c_str());
     return;
   }
-  String cmd = svc.meshNodePin + ":repeater " + (enable ? "on" : "off");
-  bool ok = sendLoRaDirectMessage(cmd, pubkeyBytes, pubkeyBytes[0], nullptr, 0);
+  String cmd = String("set repeat ") + (enable ? "on" : "off");
+  bool ok = sendLoRaAdminCommand(cmd, pubkeyBytes, pubkeyBytes[0]);
   if (ok) {
     svc.meshRepeaterKnownState = enable;
     Serial.printf("[MeshNode] Sent 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
@@ -3452,30 +3489,29 @@ static void sendMeshRepeaterCommand(Service& svc, bool enable) {
   }
 }
 
-// Parse a status reply from a remote MeshCore node and update service state.
-// Expected format: "Status: IP=x.x.x.x, Battery=X.XXV (YY%), ..."
-static void processMeshNodeResponse(int serviceIdx, const String& text) {
+// Parse MeshCore's binary repeater status response. The response begins with the
+// reflected four-byte request timestamp, followed by RepeaterStats; battery mV
+// is the first field in RepeaterStats.
+static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t len) {
   if (serviceIdx < 0 || serviceIdx >= serviceCount) return;
   Service& svc = services[serviceIdx];
 
-  Serial.printf("[MeshNode] Response for '%s': %s\n", svc.name.c_str(), text.c_str());
+  svc.meshLastResponseMs = millis();
+  Serial.printf("[MeshNode] Binary status response for '%s' (%u bytes)\n",
+                svc.name.c_str(), (unsigned int)len);
 
-  // Parse battery voltage and percent from "Battery=X.XXV (YY%)"
-  int battIdx = text.indexOf("Battery=");
-  if (battIdx >= 0) {
-    String battStr = text.substring(battIdx + 8);
-    // Extract voltage
-    int vIdx = battStr.indexOf('V');
-    if (vIdx > 0) {
-      svc.meshLastBatteryV = battStr.substring(0, vIdx).toFloat();
+  if (data != nullptr && len >= 6) {
+    uint16_t batteryMv = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
+    svc.meshLastBatteryV = batteryMv / 1000.0f;
+    if (batteryMv > 0) {
+      float bounded = constrain(svc.meshLastBatteryV, BATTERY_EMPTY_V, BATTERY_FULL_V);
+      svc.meshLastBatteryPct = constrain(
+        (int)(((bounded - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V)) * 100.0f + 0.5f),
+        0, 100);
+    } else {
+      svc.meshLastBatteryPct = 0;
     }
-    // Extract percent from "(YY%)"
-    int pOpen = battStr.indexOf('(');
-    int pClose = battStr.indexOf('%');
-    if (pOpen >= 0 && pClose > pOpen) {
-      svc.meshLastBatteryPct = battStr.substring(pOpen + 1, pClose).toInt();
-    }
-    svc.meshLastResponseMs = millis();
+
     svc.lastError = "Battery: " + String(svc.meshLastBatteryPct) + "% (" + String(svc.meshLastBatteryV, 2) + "V)";
     Serial.printf("[MeshNode] '%s' battery: %d%% (%.2fV)\n",
                   svc.name.c_str(), svc.meshLastBatteryPct, svc.meshLastBatteryV);
@@ -3493,13 +3529,12 @@ static void processMeshNodeResponse(int serviceIdx, const String& text) {
       }
     }
   } else {
-    // Response received but no battery info — still counts as reachable
-    svc.meshLastResponseMs = millis();
     svc.lastError = "Reached (no battery data)";
   }
 }
 
-// Send a PIN-authenticated status request to a remote MeshCore node.
+// Send a native status request. The repeater identifies and authorizes this
+// monitor by its public key in Access Control; no password/PIN login is sent.
 // Returns true if a previous response arrived within the allowable window
 // (checkInterval * 2.5 s), false otherwise.
 bool checkMeshNode(Service& svc) {
@@ -3511,11 +3546,6 @@ bool checkMeshNode(Service& svc) {
     svc.lastError = "Invalid pubkey (need 64 hex chars)";
     return false;
   }
-  if (svc.meshNodePin.length() == 0) {
-    svc.lastError = "No PIN configured";
-    return false;
-  }
-
   // Determine service index
   int svcIdx = -1;
   for (int i = 0; i < serviceCount; i++) {
@@ -3528,9 +3558,12 @@ bool checkMeshNode(Service& svc) {
     return false;
   }
 
-  // Send status request
-  String cmd = svc.meshNodePin + ":status";
-  bool sent = sendLoRaDirectMessage(cmd, pubkeyBytes, pubkeyBytes[0], nullptr, 0);
+  // Ensure replies can be resolved even if the repeater's advert has not yet
+  // been heard and it is not also configured as a direct-alert recipient.
+  upsertPeer(pubkeyBytes[0], pubkeyBytes, svc.name, 0);
+  updateAdvertCache(pubkeyBytes, svc.name, 0);
+
+  bool sent = sendLoRaStatusRequest(pubkeyBytes, pubkeyBytes[0]);
   if (sent && svcIdx >= 0) {
     registerPendingMeshCheck(pubkeyBytes[0], svcIdx);
     Serial.printf("[MeshNode] Sent status request to '%s' (hash=0x%02X)\n",
@@ -3540,7 +3573,7 @@ bool checkMeshNode(Service& svc) {
   // Determine result based on whether we've received a fresh response recently
   if (svc.meshLastResponseMs == 0) {
     // Never received a response yet
-    svc.lastError = sent ? "Waiting for first response" : "LoRa send failed";
+    svc.lastError = sent ? "Waiting for ACL-authorized response" : "LoRa send failed";
     return false;
   }
 
@@ -5051,8 +5084,7 @@ void setup() {
     // MeshCore Node fields (shown only for type 6)
     html += "<div class='form-group' data-types='6'><label class='form-label'>Node Public Key (64 hex chars)</label>";
     html += "<input type='text' id='serviceMeshPubkey' class='form-input' placeholder='e.g. 01ab23cd...' maxlength='64'></div>";
-    html += "<div class='form-group' data-types='6'><label class='form-label'>Remote Command PIN</label>";
-    html += "<input type='text' id='serviceMeshPin' class='form-input' placeholder='PIN used to authenticate commands'></div>";
+    html += "<div class='form-group' data-types='6'><div class='hint'>Add this ESP Monitor public key to the repeater's Access Control list with Admin permission:<br><code>" + getOurMeshPublicKeyHex() + "</code><br>Status checks and setting changes use this identity; no PIN is required.</div></div>";
     html += "<div class='form-group' data-types='6'><label class='form-label' style='display:flex;align-items:center;gap:8px'>";
     html += "<input type='checkbox' id='serviceMeshRepeaterControl'>Enable Automated Repeater Control</label></div>";
     html += "<div class='form-row' data-types='6'>";
@@ -5132,7 +5164,6 @@ void setup() {
     html += "document.getElementById('serviceFailThreshold').value=s.failThreshold;";
     html += "document.getElementById('serviceWolMac').value=s.wolMacAddress||'';";
     html += "document.getElementById('serviceMeshPubkey').value=s.meshNodePubkey||'';";
-    html += "document.getElementById('serviceMeshPin').value=s.meshNodePin||'';";
     html += "document.getElementById('serviceMeshRepeaterControl').checked=s.meshRepeaterControl===true;";
     html += "document.getElementById('serviceMeshBattLow').value=s.meshBatteryLowPct!=null?s.meshBatteryLowPct:20;";
     html += "document.getElementById('serviceMeshBattHigh').value=s.meshBatteryHighPct!=null?s.meshBatteryHighPct:50;";
@@ -5173,7 +5204,6 @@ void setup() {
     html += "failThreshold:parseInt(document.getElementById('serviceFailThreshold').value),";
     html += "wolMacAddress:document.getElementById('serviceWolMac').value,";
     html += "meshNodePubkey:document.getElementById('serviceMeshPubkey').value,";
-    html += "meshNodePin:document.getElementById('serviceMeshPin').value,";
     html += "meshRepeaterControl:document.getElementById('serviceMeshRepeaterControl').checked,";
     html += "meshBatteryLowPct:parseInt(document.getElementById('serviceMeshBattLow').value)||20,";
     html += "meshBatteryHighPct:parseInt(document.getElementById('serviceMeshBattHigh').value)||50};";
@@ -5462,6 +5492,14 @@ void setup() {
             svc.alertMqtt = obj["alertMqtt"].isNull() ? true : obj["alertMqtt"].as<bool>();
             svc.alertWol = obj["alertWol"].isNull() ? false : obj["alertWol"].as<bool>();
             svc.wolMacAddress = obj["wolMacAddress"].isNull() ? "" : obj["wolMacAddress"].as<String>();
+            svc.meshNodePubkey = obj["meshNodePubkey"].isNull() ? "" : obj["meshNodePubkey"].as<String>();
+            svc.meshRepeaterControl = obj["meshRepeaterControl"].isNull() ? false : obj["meshRepeaterControl"].as<bool>();
+            svc.meshBatteryLowPct = obj["meshBatteryLowPct"].isNull() ? 20 : obj["meshBatteryLowPct"].as<int>();
+            svc.meshBatteryHighPct = obj["meshBatteryHighPct"].isNull() ? 50 : obj["meshBatteryHighPct"].as<int>();
+            svc.meshLastBatteryPct = 0;
+            svc.meshLastBatteryV = 0.0f;
+            svc.meshLastResponseMs = 0;
+            svc.meshRepeaterKnownState = true;
             svc.consecutivePasses = 0;
             svc.consecutiveFails = 0;
             svc.isUp = false;
@@ -5521,7 +5559,6 @@ void setup() {
       svc.wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
       // MeshCore Node fields
       svc.meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
-      svc.meshNodePin = doc["meshNodePin"].isNull() ? "" : doc["meshNodePin"].as<String>();
       svc.meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
       svc.meshBatteryLowPct = doc["meshBatteryLowPct"].isNull() ? 20 : doc["meshBatteryLowPct"].as<int>();
       svc.meshBatteryHighPct = doc["meshBatteryHighPct"].isNull() ? 50 : doc["meshBatteryHighPct"].as<int>();
@@ -5596,7 +5633,6 @@ void setup() {
       services[idx].wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
       // MeshCore Node fields
       services[idx].meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
-      services[idx].meshNodePin = doc["meshNodePin"].isNull() ? "" : doc["meshNodePin"].as<String>();
       services[idx].meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
       services[idx].meshBatteryLowPct = doc["meshBatteryLowPct"].isNull() ? 20 : doc["meshBatteryLowPct"].as<int>();
       services[idx].meshBatteryHighPct = doc["meshBatteryHighPct"].isNull() ? 50 : doc["meshBatteryHighPct"].as<int>();
@@ -5995,6 +6031,7 @@ void setup() {
     doc["lastSnr"] = lastSnr;
     doc["messageCount"] = messageCount;
     doc["lastMessageTime"] = (unsigned long)lastMessageTime;
+    doc["nodePubkey"] = getOurMeshPublicKeyHex();
 
     // Peers
     JsonArray peersArr = doc["peers"].to<JsonArray>();
@@ -6795,33 +6832,39 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     return;
   }
   
-  uint8_t pathLen = message[hdrSize];  // path_len is after header (and optional transport codes)
+  uint8_t pathLen = message[hdrSize];  // encoded: upper 2 bits hash size, lower 6 bits hash count
+  size_t pathHashSize = (pathLen >> 6) + 1;
+  size_t pathHashCount = pathLen & 0x3F;
+  size_t pathByteLen = pathHashCount * pathHashSize;
   
   Serial.printf("Header: 0x%02X -> route=%d, payload=%d, version=%d, pathLen=%d, transport=%s\n", 
                 header, routeType, payloadType, version, pathLen, hasTransportCodes ? "yes" : "no");
   
   // Check minimum packet size based on header + transport codes + path_len byte + path
   size_t pathStart = hdrSize + 1;  // offset where path bytes begin
-  if (messageLen < (pathStart + pathLen)) {
+  if (messageLen < (pathStart + pathByteLen)) {
     Serial.printf("Packet too short: have %d bytes, need at least %d (header + pathLen)\n", 
-                  (int)messageLen, (int)(pathStart + pathLen));
+                  (int)messageLen, (int)(pathStart + pathByteLen));
     return;
   }
   
   // Capture sender path for potential direct reply
   uint8_t senderPath[64];
-  size_t senderPathLen = (pathLen > 64) ? 64 : pathLen;
-  if (pathLen > 0) {
-    memcpy(senderPath, message + pathStart, senderPathLen);
+  size_t senderPathByteLen = (pathByteLen > sizeof(senderPath)) ? sizeof(senderPath) : pathByteLen;
+  if (pathByteLen > sizeof(senderPath)) {
+    Serial.println("Packet path is too large for reply buffer");
+    return;
+  }
+  if (senderPathByteLen > 0) {
+    memcpy(senderPath, message + pathStart, senderPathByteLen);
   }
 
-  // Build reverse path for replies (path uses node hashes)
+  // Build reverse path for replies while preserving each multi-byte hash.
   uint8_t replyPath[64];
-  size_t replyPathLen = senderPathLen;
-  if (senderPathLen > 0) {
-    for (size_t i = 0; i < senderPathLen; i++) {
-      replyPath[i] = senderPath[senderPathLen - 1 - i];
-    }
+  size_t replyPathLen = pathLen;  // retain MeshCore's encoded path length
+  for (size_t i = 0; i < pathHashCount; i++) {
+    memcpy(&replyPath[i * pathHashSize],
+           &senderPath[(pathHashCount - 1 - i) * pathHashSize], pathHashSize);
   }
   
   // We handle PAYLOAD_TYPE_TXT (0x02), PAYLOAD_TYPE_GRP_TXT (0x05), PAYLOAD_TYPE_ADVERT (0x04),
@@ -6836,7 +6879,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   
   // Payload starts after header + optional transport codes + path_len byte + path bytes
-  size_t idx = pathStart + pathLen;
+  size_t idx = pathStart + pathByteLen;
   if (idx >= messageLen) {
     Serial.println("Packet too short for payload");
     return;
@@ -7295,32 +7338,50 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
         return;
       }
       uint8_t returnPathLen = decrypted[0];
-      if (1 + returnPathLen + 1 > decryptedLen) {
+      size_t returnPathBytes = (size_t)(returnPathLen & 0x3F) * ((returnPathLen >> 6) + 1);
+      if (1 + returnPathBytes + 1 > decryptedLen) {
         Serial.println("[PATH] PATH data incomplete");
         Serial.println("=== Packet Processing Complete ===\n");
         return;
       }
       const uint8_t* returnPath = &decrypted[1];
-      uint8_t extraType = decrypted[1 + returnPathLen] & 0x0F;
+      uint8_t extraType = decrypted[1 + returnPathBytes] & 0x0F;
       
       Serial.printf("[PATH] Return path from peer (len=%d), extra_type=%d\n", returnPathLen, extraType);
       
       // If there's an embedded ACK in the PATH, process it
-      if (extraType == PAYLOAD_TYPE_ACK && 1 + returnPathLen + 1 + 4 <= decryptedLen) {
+      if (extraType == PAYLOAD_TYPE_ACK && 1 + returnPathBytes + 1 + 4 <= decryptedLen) {
         uint32_t ackHash;
-        memcpy(&ackHash, &decrypted[1 + returnPathLen + 1], 4);
+        memcpy(&ackHash, &decrypted[1 + returnPathBytes + 1], 4);
         Serial.printf("[PATH] Contains embedded ACK hash: 0x%08X\n", ackHash);
+      }
+
+      // A request sent by flood receives its response inside a PATH packet.
+      if (extraType == PAYLOAD_TYPE_RESPONSE) {
+        size_t responseOffset = 1 + returnPathBytes + 1;
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
+        if (pendingSvcIdx >= 0 && responseOffset <= decryptedLen) {
+          processMeshNodeResponse(pendingSvcIdx, &decrypted[responseOffset], decryptedLen - responseOffset);
+          Serial.println("[MeshNode] Embedded status response consumed");
+        }
       }
       
       Serial.println("=== Packet Processing Complete ===\n");
       return;
     }
     
-    // Handle REQ/RESPONSE payload types (log and ignore for now)
+    // Handle native peer requests/responses.
     if (payloadType == PAYLOAD_TYPE_REQ || payloadType == PAYLOAD_TYPE_RESPONSE) {
       Serial.printf("[LoRa] Received %s from peer (srcHash=0x%02X), %d decrypted bytes\n",
                     payloadType == PAYLOAD_TYPE_REQ ? "REQUEST" : "RESPONSE",
                     senderHash, decryptedLen);
+      if (payloadType == PAYLOAD_TYPE_RESPONSE) {
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
+        if (pendingSvcIdx >= 0) {
+          processMeshNodeResponse(pendingSvcIdx, decrypted, decryptedLen);
+          Serial.println("[MeshNode] Status response consumed");
+        }
+      }
       Serial.println("=== Packet Processing Complete ===\n");
       return;
     }
@@ -7341,6 +7402,8 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
     memcpy(textMessage, &decrypted[5], textLen);
     textMessage[textLen] = '\0';
     
+    uint8_t txtTypeKind = (txtType >> 2) & 0x3F;
+
     // Compute ACK hash BEFORE stripping padding, using strlen on raw decrypted data
     // MeshCore ACK: SHA256(data[0..4+strlen(&data[5])] || sender_pubkey)[0..3]
     size_t rawTextLen = strnlen((const char*)&decrypted[5], decryptedLen - 5);
@@ -7357,8 +7420,7 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
 
     // Send ACK for direct plain text messages
     if (senderPubKey != nullptr) {
-      uint8_t txtTypeFlags = (txtType >> 2) & 0x3F;  // upper 6 bits = txt_type
-      if (txtTypeFlags == TXT_TYPE_PLAIN) {
+      if (txtTypeKind == TXT_TYPE_PLAIN) {
         size_t ackDataLen = 5 + rawTextLen;
         if (ackDataLen <= decryptedLen) {
           uint32_t ackHash = computeAckHash(decrypted, ackDataLen, senderPubKey);
@@ -7380,6 +7442,13 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       if (peerName.length() == 0) peerName = "Unknown";
       appendLoraLog('R', 'D', peerName, text, true);
     }
+
+    // Remote CLI output is an administration response, not a user message or command.
+    if (txtTypeKind == TXT_TYPE_CLI_DATA) {
+      Serial.println("[MeshNode] Remote CLI response consumed");
+      Serial.println("=== Packet Processing Complete ===\n");
+      return;
+    }
   } else {
     // Unhandled payload type that passed the initial filter
     Serial.printf("Payload type %d not processed for text extraction\n", payloadType);
@@ -7389,19 +7458,6 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   
   // ===== Common text handling for both group and direct messages =====
   String msgStr = text;
-
-  // Check if this is a response to a pending MeshCore node status check.
-  // Direct messages from a node we polled should be routed to processMeshNodeResponse
-  // and not forwarded to notification services.
-  if (matchedChannelName == "Direct") {
-    int pendingSvcIdx = consumePendingMeshCheck(senderHash);
-    if (pendingSvcIdx >= 0) {
-      processMeshNodeResponse(pendingSvcIdx, msgStr);
-      Serial.println("[MeshNode] Response consumed, suppressing notification forwarding");
-      Serial.println("=== Packet Processing Complete ===\n");
-      return;
-    }
-  }
 
   // Check if this is our own message by checking if the message starts with our node name
   if (msgStr.startsWith(ourNodeName + ":")) {
@@ -7594,17 +7650,17 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
   }
   
   // Also check path for our node hash to detect own messages
-  if (pathLen >= 1) {
+  if (pathHashCount >= 1) {
     size_t pathIdx = pathStart;
-    for (size_t i = 0; i < pathLen; i++) {
-      if (pathIdx < pathStart + pathLen) {
+    for (size_t i = 0; i < pathHashCount; i++) {
+      if (pathIdx < pathStart + pathByteLen) {
         uint8_t nodeHashInPath = (uint8_t)message[pathIdx];
         if (nodeHashInPath == ourNodeHash || nodeHashInPath == ourNodeHashAlt) {
           Serial.printf("Found our node hash (0x%02X/0x%02X) in path, not forwarding\n", ourNodeHash, ourNodeHashAlt);
           Serial.println("=== Packet Processing Complete ===\n");
           return;
         }
-        pathIdx += 1;
+        pathIdx += pathHashSize;
       }
     }
   }
