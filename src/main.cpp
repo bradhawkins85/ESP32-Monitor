@@ -766,6 +766,41 @@ static void appendLoraLog(char dir, char type, const String &peer, const String 
 
 // --- Global Variables ---
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
+
+// Keep the SX1262 in continuous receive mode. Calling RadioLib::receive() after
+// startReceive() forces the radio through standby first and can discard a packet
+// that arrived while other work was running (notably delayed MeshCore replies).
+static volatile bool loraPacketReceived = false;
+static SemaphoreHandle_t loraRadioMutex = nullptr;
+
+static void IRAM_ATTR onLoraPacketReceived() {
+  loraPacketReceived = true;
+}
+
+static void ensureLoraRadioMutex() {
+  if (loraRadioMutex == nullptr) loraRadioMutex = xSemaphoreCreateMutex();
+}
+
+// Serializes radio access between the main loop and AsyncWebServer callbacks,
+// then immediately restores continuous RX after a blocking transmission.
+static int16_t transmitLoRaPacket(const uint8_t* packet, size_t packetLen) {
+  ensureLoraRadioMutex();
+  if (loraRadioMutex == nullptr || xSemaphoreTake(loraRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println("[LoRa] Failed to acquire radio for transmit");
+    return RADIOLIB_ERR_UNKNOWN;
+  }
+
+  loraPacketReceived = false;
+  int16_t state = radio.transmit(packet, packetLen);
+  // DIO1 also asserts for TX-done; clear that event before arming RX.
+  loraPacketReceived = false;
+  int16_t rxState = radio.startReceive();
+  if (rxState != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] Failed to resume receive mode, code: %d\n", rxState);
+  }
+  xSemaphoreGive(loraRadioMutex);
+  return state;
+}
 int lastRssi = 0;
 float lastSnr = 0;
 bool wifiConnected = false;
@@ -2600,15 +2635,56 @@ void checkAllServices() {
   struct tm utc;
   gmtime_r(&now, &utc);
   uint32_t cronMinute = (uint32_t)(now / 60);
+
+  // Run blocking IP-based checks before transmitting a MeshCore request. With
+  // continuous RX, a response that arrives during one of these checks remains
+  // in the SX1262 FIFO until the loop can process it.
   for (int i = 0; i < serviceCount; i++) {
     Service& svc = services[i];
-    if (!svc.enabled) continue;
+    if (!svc.enabled || svc.type == TYPE_MESHCORE_NODE) continue;
     if (svc.lastCronMinute == cronMinute) continue;
     svc.lastCronMinute = cronMinute;
     if (cronMatches(svc.cronExpression, utc)) {
       executeServiceCheck(svc);
       svc.lastAutomaticCheck = millis();
     }
+  }
+
+  // Clear unanswered automatic requests so another node can use the radio.
+  // Manual checks own their timeout lifecycle through the result endpoint.
+  unsigned long nowMs = millis();
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    PendingMeshNodeCheck& pending = pendingMeshChecks[i];
+    if (!pending.active || pending.manual || (unsigned long)(nowMs - pending.sentMs) < 15000UL) continue;
+    if (pending.serviceIdx >= 0 && pending.serviceIdx < serviceCount) {
+      services[pending.serviceIdx].lastError = "MeshCore response timeout";
+      Serial.printf("[MeshNode] Automatic status request timed out for '%s'\n",
+                    services[pending.serviceIdx].name.c_str());
+    }
+    pending.active = false;
+  }
+
+  // MeshCore is half-duplex and repeaters deliberately delay flood responses.
+  // Keep only one request outstanding to prevent later transmissions from
+  // masking or colliding with an earlier node's response.
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (pendingMeshChecks[i].active) return;
+  }
+
+  static int meshScheduleCursor = 0;
+  if (serviceCount <= 0) return;
+  if (meshScheduleCursor >= serviceCount) meshScheduleCursor = 0;
+  for (int offset = 0; offset < serviceCount; offset++) {
+    int i = (meshScheduleCursor + offset) % serviceCount;
+    Service& svc = services[i];
+    if (!svc.enabled || svc.type != TYPE_MESHCORE_NODE || svc.lastCronMinute == cronMinute) continue;
+    svc.lastCronMinute = cronMinute;
+    if (!cronMatches(svc.cronExpression, utc)) continue;
+
+    executeServiceCheck(svc);
+    svc.lastAutomaticCheck = millis();
+    meshScheduleCursor = (i + 1) % serviceCount;
+    break;
   }
 }
 
@@ -2943,7 +3019,7 @@ static bool sendLoRaPeerPayload(uint8_t payloadType, const uint8_t* plaintext, s
   pktIdx += macCipherLen;
   
   // Transmit
-  int state = radio.transmit(packet, pktIdx);
+  int state = transmitLoRaPacket(packet, pktIdx);
   bool success = (state == RADIOLIB_ERR_NONE);
   if (success) {
     Serial.printf("[LoRa] Sent peer payload type %u: %s (len=%u)\n",
@@ -2961,8 +3037,6 @@ static bool sendLoRaPeerPayload(uint8_t payloadType, const uint8_t* plaintext, s
     appendLoraLog('S', 'D', peerName, logText, success);
   }
   
-  // Return to RX mode
-  radio.startReceive();
   return success;
 }
 
@@ -3060,7 +3134,7 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
   bool anySuccess = false;
   for (int ackIdx = 0; ackIdx < ackCount; ackIdx++) {
     if (ackIdx > 0) delay(150);
-    int state = radio.transmit(packet, pktIdx);
+    int state = transmitLoRaPacket(packet, pktIdx);
     if (state == RADIOLIB_ERR_NONE) {
       Serial.printf("[LoRa] Sent ACK %d/%d (hash=0x%08X, len=%u)\n", ackIdx + 1, ackCount, ackHash, (unsigned int)pktIdx);
       anySuccess = true;
@@ -3076,7 +3150,6 @@ static bool sendLoRaAck(uint32_t ackHash, const uint8_t* replyPath, size_t reply
     appendLoraLog('S', 'A', String(hashStr), "ACK", anySuccess);
   }
 
-  radio.startReceive();
   return anySuccess;
 }
 
@@ -3181,7 +3254,7 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   pktIdx += macCipherLen;
   
   // Transmit
-  int state = radio.transmit(packet, pktIdx);
+  int state = transmitLoRaPacket(packet, pktIdx);
   if (state == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa] Sent notification: %s (timestamp=%u, len=%u)\n", 
                   notification.c_str(), timestamp, (unsigned int)pktIdx);
@@ -3193,8 +3266,6 @@ void sendLoRaNotification(const String& serviceName, bool isUp, const String& me
   // Optional direct notifications to configured nodes
   sendLoRaDirectNotifications(notification);
   
-  // Return to RX mode
-  radio.startReceive();
 }
 
 // Send boot advert to announce device presence on the mesh
@@ -3305,7 +3376,7 @@ void sendBootAdvert() {
   pktIdx += payloadIdx;
   
   // Transmit flood advert
-  int state = radio.transmit(packet, pktIdx);
+  int state = transmitLoRaPacket(packet, pktIdx);
   if (state == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa] Flood advert sent: Node %s (header=0x%02X, len=%u)\n", 
                   nodeName, floodHeader, (unsigned int)pktIdx);
@@ -3318,8 +3389,6 @@ void sendBootAdvert() {
     Serial.printf("[LoRa] Failed to send flood advert, code: %d\n", state);
   }
   
-  // Return to RX mode
-  radio.startReceive();
 }
 
 // Uptime Monitoring Check Functions
@@ -4603,7 +4672,7 @@ void sendPingPacket() {
   Serial.printf("Sending ping on channel %s from %s: '%s' (timestamp=%u, len=%u)\n", 
                 settings.channelName.c_str(), nodeName, message.c_str(), timestamp, (unsigned int)pktIdx);
 
-  int state = radio.transmit(packet, pktIdx);
+  int state = transmitLoRaPacket(packet, pktIdx);
   if (state == RADIOLIB_ERR_NONE) {
     Serial.println("Ping transmitted successfully");
   } else {
@@ -7126,42 +7195,57 @@ void loop() {
       lastRadioCheck = millis();
     }
     
-    // Check for LoRa packets (all devices listen)
-    uint8_t message[256];
-    int state = radio.receive(message, sizeof(message));
-    
-    if (state == RADIOLIB_ERR_NONE) {
-      // Packet received successfully
-      lastRssi = radio.getRSSI();
-      lastSnr = radio.getSNR();
-      
-      Serial.println("\n=== LoRa Packet Received ===");
-      size_t packetLen = radio.getPacketLength();
-      if (packetLen == 0 || packetLen > sizeof(message)) {
-        packetLen = sizeof(message);
+    // DIO1 signals that continuous RX has completed. Read the existing FIFO
+    // without restarting the receiver first, otherwise the packet is lost.
+    if (loraPacketReceived) {
+      uint8_t message[256];
+      size_t packetLen = 0;
+      int16_t state = RADIOLIB_ERR_UNKNOWN;
+      float packetRssi = 0;
+      float packetSnr = 0;
+
+      ensureLoraRadioMutex();
+      if (loraRadioMutex != nullptr && xSemaphoreTake(loraRadioMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (loraPacketReceived) {
+          loraPacketReceived = false;
+          packetLen = radio.getPacketLength();
+          if (packetLen > 0 && packetLen <= sizeof(message)) {
+            state = radio.readData(message, packetLen);
+            packetRssi = radio.getRSSI();
+            packetSnr = radio.getSNR();
+          } else {
+            Serial.printf("[LoRa] Invalid received packet length: %u\n", (unsigned int)packetLen);
+          }
+          int16_t rxState = radio.startReceive();
+          if (rxState != RADIOLIB_ERR_NONE) {
+            Serial.printf("[LoRa] Failed to resume receive mode, code: %d\n", rxState);
+          }
+        }
+        xSemaphoreGive(loraRadioMutex);
       }
-      Serial.printf("Raw length: %d bytes\n", (int)packetLen);
-      Serial.print("Raw hex: ");
-      for (size_t i = 0; i < packetLen && i < 32; i++) {
-        Serial.printf("%02X ", message[i]);
+
+      if (state == RADIOLIB_ERR_NONE) {
+        lastRssi = packetRssi;
+        lastSnr = packetSnr;
+      
+        Serial.println("\n=== LoRa Packet Received ===");
+        Serial.printf("Raw length: %d bytes\n", (int)packetLen);
+        Serial.print("Raw hex: ");
+        for (size_t i = 0; i < packetLen && i < 32; i++) {
+          Serial.printf("%02X ", message[i]);
+        }
+        if (packetLen > 32) Serial.print("...");
+        Serial.println();
+        Serial.printf("RSSI: %d dBm, SNR: %.2f dB\n", (int)lastRssi, lastSnr);
+        Serial.println("===========================\n");
+
+        handleLoRaMessage(message, packetLen);
+        lastMessageTime = millis();
+        messageCount++;
+      } else if (state != RADIOLIB_ERR_UNKNOWN) {
+        Serial.print("LoRa receive failed, code: ");
+        Serial.println(state);
       }
-      if (packetLen > 32) Serial.print("...");
-      Serial.println();
-      Serial.printf("RSSI: %d dBm, SNR: %.2f dB\n", (int)lastRssi, lastSnr);
-      Serial.println("===========================\n");
-      
-      // Handle the message
-      handleLoRaMessage(message, packetLen);
-      
-      lastMessageTime = millis();
-      messageCount++;
-      
-      // Put radio back in receive mode
-      radio.startReceive();
-    } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
-      // Some other error occurred
-      Serial.print("LoRa receive failed, code: ");
-      Serial.println(state);
     }
   }
   
@@ -7432,6 +7516,9 @@ void setupLoRa() {
   initMeshChannels();
   
   // Start listening for packets (all devices listen and can transmit)
+  ensureLoraRadioMutex();
+  radio.setDio1Action(onLoraPacketReceived);
+  loraPacketReceived = false;
   state = radio.startReceive();
   if (state != RADIOLIB_ERR_NONE) {
     Serial.print("Failed to start receive mode, code ");
@@ -7996,11 +8083,10 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       // A request sent by flood receives its response inside a PATH packet.
       if (extraType == PAYLOAD_TYPE_RESPONSE) {
         size_t responseOffset = 1 + returnPathBytes + 1;
-        bool manualCheck = false;
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash, &manualCheck);
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
         if (pendingSvcIdx >= 0 && responseOffset <= decryptedLen) {
           processMeshNodeResponse(pendingSvcIdx, &decrypted[responseOffset], decryptedLen - responseOffset);
-          if (manualCheck) updateServiceStatus(services[pendingSvcIdx], true);
+          updateServiceStatus(services[pendingSvcIdx], true);
           Serial.println("[MeshNode] Embedded status response consumed");
         }
       }
@@ -8015,11 +8101,10 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
                     payloadType == PAYLOAD_TYPE_REQ ? "REQUEST" : "RESPONSE",
                     senderHash, decryptedLen);
       if (payloadType == PAYLOAD_TYPE_RESPONSE) {
-        bool manualCheck = false;
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash, &manualCheck);
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
         if (pendingSvcIdx >= 0) {
           processMeshNodeResponse(pendingSvcIdx, decrypted, decryptedLen);
-          if (manualCheck) updateServiceStatus(services[pendingSvcIdx], true);
+          updateServiceStatus(services[pendingSvcIdx], true);
           Serial.println("[MeshNode] Status response consumed");
         }
       }
