@@ -175,6 +175,7 @@ int serviceCount = 0;
 
 struct PendingMeshNodeCheck {
   bool active;
+  bool manual;
   uint8_t senderHash;     // First byte of target node's pubkey
   int serviceIdx;         // Index into services[]
   unsigned long sentMs;   // millis() when request was sent
@@ -188,12 +189,13 @@ static void initPendingMeshChecks() {
   }
 }
 
-static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx) {
+static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool manual = false) {
   // Reuse an existing slot for the same hash, or find a free one
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
       pendingMeshChecks[i].serviceIdx = serviceIdx;
       pendingMeshChecks[i].sentMs = millis();
+      pendingMeshChecks[i].manual = pendingMeshChecks[i].manual || manual;
       return;
     }
   }
@@ -203,6 +205,7 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx) {
       pendingMeshChecks[i].senderHash = senderHash;
       pendingMeshChecks[i].serviceIdx = serviceIdx;
       pendingMeshChecks[i].sentMs = millis();
+      pendingMeshChecks[i].manual = manual;
       return;
     }
   }
@@ -219,13 +222,15 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx) {
   pendingMeshChecks[oldestIdx].senderHash = senderHash;
   pendingMeshChecks[oldestIdx].serviceIdx = serviceIdx;
   pendingMeshChecks[oldestIdx].sentMs = millis();
+  pendingMeshChecks[oldestIdx].manual = manual;
 }
 
 // Returns service index if the given hash matches an active pending check, -1 otherwise.
-static int consumePendingMeshCheck(uint8_t senderHash) {
+static int consumePendingMeshCheck(uint8_t senderHash, bool* wasManual = nullptr) {
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
       int idx = pendingMeshChecks[i].serviceIdx;
+      if (wasManual != nullptr) *wasManual = pendingMeshChecks[i].manual;
       pendingMeshChecks[i].active = false;
       return idx;
     }
@@ -1961,7 +1966,7 @@ bool checkPort(Service& service);
 bool checkSnmpGet(Service& service);
 bool checkPush(Service& service);
 bool checkUptime(Service& service);
-bool checkMeshNode(Service& service);
+bool checkMeshNode(Service& service, bool manualCheck = false, bool* requestSent = nullptr);
 void updateServiceStatus(Service& service, bool checkResult);
 bool executeServiceCheck(Service& service);
 void sendLoRaNotification(const String& serviceName, bool isUp, const String& message);
@@ -2415,6 +2420,31 @@ String getServicesJson() {
     obj["meshLastBatteryV"] = services[i].meshLastBatteryV;
     obj["meshRepeaterKnownState"] = services[i].meshRepeaterKnownState;
   }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+static String getServiceCheckResultJson(const Service& svc, bool checkPassed, bool waitingForResult = false) {
+  JsonDocument doc;
+  doc["checkPassed"] = checkPassed;
+  doc["waitingForResult"] = waitingForResult;
+  doc["serviceName"] = svc.name;
+  doc["serviceType"] = (int)svc.type;
+  doc["checkError"] = svc.lastError;
+  doc["isUp"] = svc.isUp;
+  doc["isPending"] = svc.isPending;
+  doc["consecutivePasses"] = svc.consecutivePasses;
+  doc["consecutiveFails"] = svc.consecutiveFails;
+  doc["target"] = svc.host;
+  doc["port"] = svc.port;
+  doc["url"] = svc.url;
+  doc["meshHasResponse"] = svc.meshLastResponseMs > 0;
+  doc["meshLastBatteryPct"] = svc.meshLastBatteryPct;
+  doc["meshLastBatteryV"] = svc.meshLastBatteryV;
+  doc["meshRepeaterKnownState"] = svc.meshRepeaterKnownState;
+  doc["timestamp"] = (unsigned long)time(nullptr);
+
   String json;
   serializeJson(doc, json);
   return json;
@@ -3581,6 +3611,17 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
 // MeshCore Node Monitor Functions
 // ============================================
 
+// MeshCore's status response contains the remote board's current ADC-derived
+// battery voltage, not a percentage. Convert that live millivolt value using
+// the same linear defaults as MeshCore's node-side battery indicator.
+static int meshCoreBatteryPercent(uint16_t batteryMv) {
+  if (batteryMv <= MESHCORE_BATTERY_EMPTY_MV) return 0;
+  if (batteryMv >= MESHCORE_BATTERY_FULL_MV) return 100;
+
+  return ((int32_t)batteryMv - MESHCORE_BATTERY_EMPTY_MV) * 100 /
+         (MESHCORE_BATTERY_FULL_MV - MESHCORE_BATTERY_EMPTY_MV);
+}
+
 // Send the native remote CLI command to enable or disable repeater forwarding.
 // MeshCore authorizes CLI data from the sender's Access Control role (Admin required).
 static void sendMeshRepeaterCommand(Service& svc, bool enable) {
@@ -3614,18 +3655,11 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
   if (data != nullptr && len >= 6) {
     uint16_t batteryMv = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
     svc.meshLastBatteryV = batteryMv / 1000.0f;
-    if (batteryMv > 0) {
-      float bounded = constrain(svc.meshLastBatteryV, BATTERY_EMPTY_V, BATTERY_FULL_V);
-      svc.meshLastBatteryPct = constrain(
-        (int)(((bounded - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V)) * 100.0f + 0.5f),
-        0, 100);
-    } else {
-      svc.meshLastBatteryPct = 0;
-    }
+    svc.meshLastBatteryPct = meshCoreBatteryPercent(batteryMv);
 
-    svc.lastError = "Battery: " + String(svc.meshLastBatteryPct) + "% (" + String(svc.meshLastBatteryV, 2) + "V)";
-    Serial.printf("[MeshNode] '%s' battery: %d%% (%.2fV)\n",
-                  svc.name.c_str(), svc.meshLastBatteryPct, svc.meshLastBatteryV);
+    svc.lastError = "Battery: " + String(svc.meshLastBatteryPct) + "% (" + String(batteryMv) + "mV)";
+    Serial.printf("[MeshNode] '%s' remote battery: %umV -> %d%%\n",
+                  svc.name.c_str(), batteryMv, svc.meshLastBatteryPct);
 
     // Automated repeater control
     if (svc.meshRepeaterControl) {
@@ -3647,7 +3681,8 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
 // Send a native status request. The repeater identifies and authorizes this
 // monitor by its public key in Access Control; no password/PIN login is sent.
 // Returns true if a response arrived since the previous scheduled check.
-bool checkMeshNode(Service& svc) {
+bool checkMeshNode(Service& svc, bool manualCheck, bool* requestSent) {
+  if (requestSent != nullptr) *requestSent = false;
   if (!settings.loraEnabled) {
     svc.lastError = "LoRa disabled";
     return false;
@@ -3674,8 +3709,9 @@ bool checkMeshNode(Service& svc) {
   updateAdvertCache(pubkeyBytes, svc.name, 0);
 
   bool sent = sendLoRaStatusRequest(pubkeyBytes, pubkeyBytes[0]);
+  if (requestSent != nullptr) *requestSent = sent;
   if (sent && svcIdx >= 0) {
-    registerPendingMeshCheck(pubkeyBytes[0], svcIdx);
+    registerPendingMeshCheck(pubkeyBytes[0], svcIdx, manualCheck);
     Serial.printf("[MeshNode] Sent status request to '%s' (hash=0x%02X)\n",
                   svc.name.c_str(), pubkeyBytes[0]);
   }
@@ -4967,6 +5003,7 @@ void setup() {
     html += ".service-actions{display:flex;gap:4px}";
     html += ".icon-btn{background:none;border:none;cursor:pointer;font-size:16px;padding:4px 8px;border-radius:4px;transition:all 0.2s}";
     html += ".icon-btn:hover{background:#f7fafc}";
+    html += ".icon-btn:disabled{cursor:wait;opacity:0.55}";
     html += ".icon-btn.delete:hover{background:#fed7d7}";
     html += ".service-info{color:#718096;font-size:12px;margin-top:8px}";
     html += ".services-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}";
@@ -4978,7 +5015,9 @@ void setup() {
     html += ".service-status{display:inline-block;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}";
     html += ".status-up{background:#c6f6d5;color:#22543d}";
     html += ".status-down{background:#fed7d7;color:#742a2a}";
+    html += ".status-pending{background:#e2e8f0;color:#4a5568}";
     html += ".service-error{color:#718096;font-size:13px;margin-top:8px;font-style:italic}";
+    html += ".service-check-message{font-size:12px;margin-top:8px;color:#718096}";
     html += ".actions{display:flex;gap:12px;flex-wrap:wrap}";
     html += ".btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:8px;font-weight:500;text-decoration:none;transition:all 0.3s ease;border:none;cursor:pointer;font-size:14px}";
     html += ".btn-primary{background:#667eea;color:#fff}";
@@ -5037,8 +5076,8 @@ void setup() {
     String batteryColor = battery.valid ? (battery.percent >= 50 ? "#48bb78" : (battery.percent >= 20 ? "#d69e2e" : "#f56565")) : "#718096";
     html += "<div class='stats'>";
     html += "<div class='stat-card'><div class='stat-value'>" + String(serviceCount) + "</div><div class='stat-label'>Total Services</div></div>";
-    html += "<div class='stat-card'><div class='stat-value' style='color:#48bb78'>" + String(upCount) + "</div><div class='stat-label'>Online</div></div>";
-    html += "<div class='stat-card'><div class='stat-value' style='color:#f56565'>" + String(downCount) + "</div><div class='stat-label'>Offline</div></div>";
+    html += "<div class='stat-card'><div class='stat-value' id='onlineCount' style='color:#48bb78'>" + String(upCount) + "</div><div class='stat-label'>Online</div></div>";
+    html += "<div class='stat-card'><div class='stat-value' id='offlineCount' style='color:#f56565'>" + String(downCount) + "</div><div class='stat-label'>Offline</div></div>";
     html += "<div class='stat-card'><div class='stat-value'>" + String(millis() / 1000 / 60) + "m</div><div class='stat-label'>Uptime</div></div>";
     html += "<div class='stat-card'><div class='stat-value' style='color:" + batteryColor + "'>" + batteryValue + "</div><div class='stat-label'>Battery</div></div>";
     html += "</div>";
@@ -5054,12 +5093,12 @@ void setup() {
       String statusClass = services[i].isUp ? "up" : "down";
       String statusText = services[i].isUp ? "up" : "down";
       String statusBadgeClass = services[i].isUp ? "status-up" : "status-down";
-      html += "<div class='service-card " + statusClass + "'>";
+      html += "<div class='service-card " + statusClass + "' id='serviceCard" + String(i) + "'>";
       html += "<div class='service-header'>";
       html += "<div class='service-name'>" + services[i].name + "</div>";
       html += "<div class='service-actions'>";
       if (isAuthed) {
-        html += "<button class='icon-btn' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
+        html += "<button class='icon-btn' id='checkServiceBtn" + String(i) + "' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
       }
       html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
       if (isAuthed) {
@@ -5068,7 +5107,7 @@ void setup() {
       }
       html += "</div>";
       html += "</div>";
-      html += "<span class='service-status " + statusBadgeClass + "'>" + statusText + "</span>";
+      html += "<span class='service-status " + statusBadgeClass + "' id='serviceStatus" + String(i) + "'>" + statusText + "</span>";
       const char* svcTypeName[] = {"HTTP GET","Ping","SNMP GET","Port","Push","Uptime","MeshCore Node","Unknown"};
       int svcTypeId = (int)services[i].type;
       if (svcTypeId < 0 || svcTypeId > 7) svcTypeId = 7;
@@ -5082,18 +5121,17 @@ void setup() {
           html += "<div class='service-info'>Push URL: " + pushUrl + "</div>";
         }
       }
-      if (services[i].type == TYPE_MESHCORE_NODE && services[i].meshLastResponseMs > 0) {
+      if (services[i].type == TYPE_MESHCORE_NODE) {
         String battColor = services[i].meshLastBatteryPct >= 50 ? "#48bb78" : (services[i].meshLastBatteryPct >= 20 ? "#d69e2e" : "#f56565");
-        html += "<div class='service-info'>Battery: <span style='color:" + battColor + ";font-weight:600'>" +
+        html += "<div class='service-info' id='serviceMesh" + String(i) + "'" + (services[i].meshLastResponseMs > 0 ? "" : " style='display:none'") + ">Battery: <span style='color:" + battColor + ";font-weight:600'>" +
                 String(services[i].meshLastBatteryPct) + "% (" + String(services[i].meshLastBatteryV, 2) + "V)</span>";
         if (services[i].meshRepeaterControl) {
           html += " | Repeater: " + String(services[i].meshRepeaterKnownState ? "on" : "off");
         }
         html += "</div>";
       }
-      if (services[i].lastError.length() > 0) {
-        html += "<div class='service-error'>" + services[i].lastError + "</div>";
-      }
+      html += "<div class='service-error' id='serviceError" + String(i) + "'" + (services[i].lastError.length() > 0 ? "" : " style='display:none'") + ">" + services[i].lastError + "</div>";
+      html += "<div class='service-check-message' id='serviceCheckMessage" + String(i) + "' style='display:none'></div>";
       // Show enabled alert channels (only show those that are globally enabled)
       String channels = "";
       if (settings.loraEnabled && services[i].alertLora) channels += "📡";
@@ -5283,19 +5321,20 @@ void setup() {
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
     html += "function deleteService(i){if(!isAuthed){alert('Login required');return;}if(confirm('Delete '+services[i].name+'?')){";
     html += "fetch('/api/service/'+i,{method:'DELETE',credentials:'include'}).then(r=>r.ok?location.reload():alert('Delete failed'))}}";
-    html += "async function checkServiceNow(i){if(!isAuthed){alert('Login required');return;}try{";
-    html += "const res=await fetch('/api/check-service/'+i,{credentials:'include',method:'POST'});";
-    html += "const body=await res.text();let d;try{d=JSON.parse(body);}catch(_){throw new Error(body||('HTTP '+res.status));}if(!res.ok){throw new Error(d.error||('HTTP '+res.status));}";
-    html += "let msg='Check Results for \"'+services[i].name+'\"\\n\\n';";
-    html += "msg+='Result: '+(d.checkPassed?'✅ PASS':'❌ FAIL')+'\\n';";
-    html += "msg+='Stored status: '+(d.isPending?'PENDING':(d.isUp?'UP':'DOWN'))+' (passes: '+d.consecutivePasses+', fails: '+d.consecutiveFails+')\\n';";
-    html += "msg+='Service: '+d.serviceName+' (Type: '+['HTTP GET','Ping','SNMP GET','Port','Push','Uptime','MeshCore Node'][d.serviceType||0]+')'+(d.target?' @ '+d.target:'')+'\\n';";
-    html += "msg+='Detail: '+(d.checkError||'(none)')+'\\n';";
-    html += "if(d.serviceType===6){msg+='Battery: '+(d.meshLastBatteryPct||0)+'% ('+(d.meshLastBatteryV||0).toFixed(2)+'V)\\n';msg+='Repeater: '+(d.meshRepeaterKnownState?'on':'off')+'\\n';}";
-    html += "msg+='Timestamp: '+new Date((d.timestamp||Math.floor(Date.now()/1000))*1000).toLocaleString()+'\\n';";
-    html += "msg+='\\nThis result has been stored; the cron schedule is unchanged.';";
-    html += "alert(msg);";
-    html += "}catch(e){alert('Check failed: '+e.message);}}";
+    html += "function setCheckMessage(i,text,color){const el=document.getElementById('serviceCheckMessage'+i);if(!el)return;el.textContent=text;el.style.color=color||'#718096';el.style.display=text?'':'none';}";
+    html += "function applyServiceCheckResult(i,d){const card=document.getElementById('serviceCard'+i);const status=document.getElementById('serviceStatus'+i);const error=document.getElementById('serviceError'+i);";
+    html += "if(card){card.classList.remove('up','down');card.classList.add(d.isUp?'up':'down');}";
+    html += "if(status){status.classList.remove('status-up','status-down','status-pending');status.classList.add(d.isPending?'status-pending':(d.isUp?'status-up':'status-down'));status.textContent=d.isPending?'pending':(d.isUp?'up':'down');}";
+    html += "if(error){error.textContent=d.checkError||'';error.style.display=d.checkError?'':'none';}";
+    html += "if(d.serviceType===6&&d.meshHasResponse){const mesh=document.getElementById('serviceMesh'+i);if(mesh){const pct=Number(d.meshLastBatteryPct)||0;const volts=Number(d.meshLastBatteryV)||0;const color=pct>=50?'#48bb78':(pct>=20?'#d69e2e':'#f56565');mesh.innerHTML=\"Battery: <span style='color:\"+color+\";font-weight:600'>\"+pct+\"% (\"+volts.toFixed(2)+\"V)</span>\"+(services[i].meshRepeaterControl?' | Repeater: '+(d.meshRepeaterKnownState?'on':'off'):'');mesh.style.display='';}}";
+    html += "const up=document.querySelectorAll('.service-card.up').length;const online=document.getElementById('onlineCount');const offline=document.getElementById('offlineCount');if(online)online.textContent=up;if(offline)offline.textContent=services.length-up;";
+    html += "setCheckMessage(i,d.checkPassed?'Check passed just now':'Check failed just now',d.checkPassed?'#38a169':'#e53e3e');}";
+    html += "async function parseCheckResponse(res){const body=await res.text();let d;try{d=JSON.parse(body);}catch(_){throw new Error(body||('HTTP '+res.status));}if(!res.ok&&res.status!==202)throw new Error(d.error||('HTTP '+res.status));return d;}";
+    html += "async function checkServiceNow(i){const btn=document.getElementById('checkServiceBtn'+i);if(!isAuthed){setCheckMessage(i,'Login required','#e53e3e');return;}if(btn){btn.disabled=true;btn.textContent='⏳';}setCheckMessage(i,'Checking...','#718096');try{";
+    html += "let res=await fetch('/api/check-service/'+i,{credentials:'include',method:'POST',cache:'no-store'});let d=await parseCheckResponse(res);";
+    html += "while(d.waitingForResult){await new Promise(resolve=>setTimeout(resolve,500));res=await fetch('/api/check-service-result/'+i+'?startedMs='+encodeURIComponent(d.startedMs)+'&baseline='+encodeURIComponent(d.baseline),{credentials:'include',cache:'no-store'});d=await parseCheckResponse(res);}";
+    html += "applyServiceCheckResult(i,d);";
+    html += "}catch(e){setCheckMessage(i,'Check failed: '+e.message,'#e53e3e');}finally{if(btn){btn.disabled=false;btn.textContent='▶️';}}}";
     html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
     html += "const data={name:document.getElementById('serviceName').value,";
     html += "type:parseInt(document.getElementById('serviceType').value),";
@@ -5855,45 +5894,85 @@ void setup() {
     }
 
     Service& svc = services[idx];
-    bool result = executeServiceCheck(svc);
+    if (svc.type == TYPE_MESHCORE_NODE) {
+      unsigned long baseline = svc.meshLastResponseMs;
+      unsigned long startedMs = millis();
+      bool requestSent = false;
+      checkMeshNode(svc, true, &requestSent);
+      if (!requestSent) {
+        updateServiceStatus(svc, false);
+        request->send(200, "application/json", getServiceCheckResultJson(svc, false));
+        return;
+      }
 
-    JsonDocument doc;
-    doc["checkPassed"] = result;
-    doc["error"] = svc.lastError;
-    doc["serviceName"] = svc.name;
-    doc["serviceType"] = (int)svc.type;
-    doc["host"] = svc.host;
-    doc["port"] = svc.port;
-    doc["url"] = svc.url;
-
-    doc["checkError"] = svc.lastError;
-    doc["isUp"] = svc.isUp;
-    doc["isPending"] = svc.isPending;
-    doc["consecutivePasses"] = svc.consecutivePasses;
-    doc["consecutiveFails"] = svc.consecutiveFails;
-
-    // Add type-specific details
-    if (svc.type == TYPE_PING || svc.type == TYPE_PORT) {
-      doc["target"] = svc.host;
-      if (svc.port > 0) doc["port"] = svc.port;
-    } else if (svc.type == TYPE_HTTP_GET) {
-      doc["url"] = svc.url;
-      doc["expectedResponse"] = svc.expectedResponse;
-    } else if (svc.type == TYPE_SNMP_GET) {
-      doc["snmpOid"] = svc.snmpOid;
-      doc["snmpExpectedValue"] = svc.snmpExpectedValue;
-    } else if (svc.type == TYPE_MESHCORE_NODE) {
-      doc["meshNodePubkey"] = svc.meshNodePubkey;
-      doc["meshLastBatteryPct"] = svc.meshLastBatteryPct;
-      doc["meshLastBatteryV"] = svc.meshLastBatteryV;
-      doc["meshRepeaterKnownState"] = svc.meshRepeaterKnownState;
+      JsonDocument doc;
+      deserializeJson(doc, getServiceCheckResultJson(svc, false, true));
+      doc["startedMs"] = startedMs;
+      doc["baseline"] = baseline;
+      String json;
+      serializeJson(doc, json);
+      AsyncWebServerResponse *response = request->beginResponse(202, "application/json", json);
+      response->addHeader("Cache-Control", "no-store");
+      request->send(response);
+      return;
     }
 
-    doc["timestamp"] = (unsigned long)time(nullptr);
+    bool result = executeServiceCheck(svc);
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", getServiceCheckResultJson(svc, result));
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
 
+  // MeshCore checks finish asynchronously when the radio response is handled.
+  // The dashboard polls this endpoint until the fresh response arrives or times out.
+  server.on("/api/check-service-result/*", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!isAuthenticated(request)) return;
+    const String prefix = "/api/check-service-result/";
+    int idx = request->url().substring(prefix.length()).toInt();
+    if (idx < 0 || idx >= serviceCount || services[idx].type != TYPE_MESHCORE_NODE ||
+        !request->hasParam("startedMs") || !request->hasParam("baseline")) {
+      request->send(400, "application/json", "{\"error\":\"Invalid check request\"}");
+      return;
+    }
+
+    unsigned long startedMs = strtoul(request->getParam("startedMs")->value().c_str(), nullptr, 10);
+    unsigned long baseline = strtoul(request->getParam("baseline")->value().c_str(), nullptr, 10);
+    Service& svc = services[idx];
+
+    if (svc.meshLastResponseMs != baseline) {
+      AsyncWebServerResponse *response = request->beginResponse(200, "application/json", getServiceCheckResultJson(svc, true));
+      response->addHeader("Cache-Control", "no-store");
+      request->send(response);
+      return;
+    }
+
+    if ((unsigned long)(millis() - startedMs) >= 15000UL) {
+      bool wasPending = false;
+      for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+        if (pendingMeshChecks[i].active && pendingMeshChecks[i].manual && pendingMeshChecks[i].serviceIdx == idx) {
+          pendingMeshChecks[i].active = false;
+          wasPending = true;
+        }
+      }
+      if (wasPending) {
+        svc.lastError = "MeshCore response timeout";
+        updateServiceStatus(svc, false);
+      }
+      AsyncWebServerResponse *response = request->beginResponse(200, "application/json", getServiceCheckResultJson(svc, false));
+      response->addHeader("Cache-Control", "no-store");
+      request->send(response);
+      return;
+    }
+
+    JsonDocument doc;
+    deserializeJson(doc, getServiceCheckResultJson(svc, false, true));
+    doc["startedMs"] = startedMs;
+    doc["baseline"] = baseline;
     String json;
     serializeJson(doc, json);
-    request->send(200, "application/json", json);
+    AsyncWebServerResponse *response = request->beginResponse(202, "application/json", json);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
 
   // API endpoint to test notifications
@@ -7475,9 +7554,11 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       // A request sent by flood receives its response inside a PATH packet.
       if (extraType == PAYLOAD_TYPE_RESPONSE) {
         size_t responseOffset = 1 + returnPathBytes + 1;
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
+        bool manualCheck = false;
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash, &manualCheck);
         if (pendingSvcIdx >= 0 && responseOffset <= decryptedLen) {
           processMeshNodeResponse(pendingSvcIdx, &decrypted[responseOffset], decryptedLen - responseOffset);
+          if (manualCheck) updateServiceStatus(services[pendingSvcIdx], true);
           Serial.println("[MeshNode] Embedded status response consumed");
         }
       }
@@ -7492,9 +7573,11 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
                     payloadType == PAYLOAD_TYPE_REQ ? "REQUEST" : "RESPONSE",
                     senderHash, decryptedLen);
       if (payloadType == PAYLOAD_TYPE_RESPONSE) {
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
+        bool manualCheck = false;
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash, &manualCheck);
         if (pendingSvcIdx >= 0) {
           processMeshNodeResponse(pendingSvcIdx, decrypted, decryptedLen);
+          if (manualCheck) updateServiceStatus(services[pendingSvcIdx], true);
           Serial.println("[MeshNode] Status response consumed");
         }
       }

@@ -91,6 +91,18 @@
 #define BATTERY_EMPTY_V 3.30f
 #endif
 
+// MeshCore reports a remote node's ADC-derived battery voltage in millivolts,
+// but does not include a percentage in its status response. These defaults
+// match MeshCore's node-side battery indicator and are intentionally separate
+// from this monitor board's own battery calibration above.
+#ifndef MESHCORE_BATTERY_EMPTY_MV
+#define MESHCORE_BATTERY_EMPTY_MV 3000
+#endif
+
+#ifndef MESHCORE_BATTERY_FULL_MV
+#define MESHCORE_BATTERY_FULL_MV 4200
+#endif
+
 #ifndef BATTERY_SAMPLES
 #define BATTERY_SAMPLES 8
 #endif
