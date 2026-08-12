@@ -567,6 +567,151 @@ static void deleteServiceHistory(const String &serviceId) {
 }
 
 // ============================================
+// MeshCore Battery History (LittleFS)
+// Stores one sample for every successful status response:
+// <unix_epoch_seconds>,<percentage>,<millivolts>\n
+// Oldest complete records are purged when a node reaches its storage cap.
+// ============================================
+static const char* BATTERY_HISTORY_DIR = "/battery";
+static const size_t BATTERY_HISTORY_TOTAL_BUDGET_BYTES = 262144;
+static const size_t BATTERY_HISTORY_PER_SERVICE_BUDGET_BYTES =
+    (BATTERY_HISTORY_TOTAL_BUDGET_BYTES / MAX_SERVICES);
+static const size_t BATTERY_HISTORY_TRIM_BATCH_BYTES = 4096;
+
+static String batteryHistoryFileForServiceId(const String &serviceId) {
+  return String(BATTERY_HISTORY_DIR) + "/" + sanitizeForPath(serviceId) + ".csv";
+}
+
+static void ensureBatteryHistoryDir() {
+  if (!LittleFS.exists(BATTERY_HISTORY_DIR)) {
+    LittleFS.mkdir(BATTERY_HISTORY_DIR);
+  }
+}
+
+static void appendMeshBatterySample(const Service &service, int percentage, uint16_t millivolts) {
+  time_t now = time(nullptr);
+  if (now < 1000000000) {
+    Serial.println("[BatteryHistory] Time not synced; skipping sample");
+    return;
+  }
+
+  ensureBatteryHistoryDir();
+  String path = batteryHistoryFileForServiceId(service.id);
+  File f = LittleFS.open(path, "a");
+  if (!f) {
+    Serial.println("[BatteryHistory] Failed to open history file for append");
+    return;
+  }
+
+  char line[40];
+  snprintf(line, sizeof(line), "%lu,%d,%u\n", (unsigned long)now, percentage,
+           (unsigned int)millivolts);
+  f.print(line);
+  f.close();
+
+  // Prune in batches instead of rewriting the log after every sample once it
+  // reaches its target size. This bounds space while reducing flash wear.
+  File sizeCheck = LittleFS.open(path, "r");
+  size_t fileSize = sizeCheck ? sizeCheck.size() : 0;
+  if (sizeCheck) sizeCheck.close();
+  if (fileSize > BATTERY_HISTORY_PER_SERVICE_BUDGET_BYTES + BATTERY_HISTORY_TRIM_BATCH_BYTES) {
+    trimFileToSize(path, BATTERY_HISTORY_PER_SERVICE_BUDGET_BYTES);
+  }
+}
+
+static void deleteMeshBatteryHistory(const String &serviceId) {
+  String path = batteryHistoryFileForServiceId(serviceId);
+  if (LittleFS.exists(path)) {
+    LittleFS.remove(path);
+  }
+}
+
+// ============================================
+// SNMP Numeric History (LittleFS)
+// Stores changed numeric values only: <unix_epoch_seconds>,<value>\n
+// Text values are deliberately ignored.
+// ============================================
+static const char* SNMP_HISTORY_DIR = "/snmp";
+static const size_t SNMP_HISTORY_TOTAL_BUDGET_BYTES = 131072;
+static const size_t SNMP_HISTORY_PER_SERVICE_BUDGET_BYTES =
+    (SNMP_HISTORY_TOTAL_BUDGET_BYTES / MAX_SERVICES);
+static const size_t SNMP_HISTORY_TRIM_BATCH_BYTES = 4096;
+
+static String snmpHistoryFileForServiceId(const String &serviceId) {
+  return String(SNMP_HISTORY_DIR) + "/" + sanitizeForPath(serviceId) + ".csv";
+}
+
+static bool parseStrictDouble(const String& text, double& valueOut) {
+  const char* start = text.c_str();
+  char* end = nullptr;
+  valueOut = strtod(start, &end);
+  return end != start && *end == '\0' && isfinite(valueOut);
+}
+
+static bool readLastSnmpNumericValue(const String& path, String& valueOut) {
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  size_t size = f.size();
+  size_t start = size > 256 ? size - 256 : 0;
+  if (start > 0) {
+    f.seek(start);
+    f.readStringUntil('\n'); // discard a potentially partial first record
+  }
+
+  String lastLine;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) lastLine = line;
+  }
+  f.close();
+
+  int comma = lastLine.indexOf(',');
+  if (comma < 0) return false;
+  valueOut = lastLine.substring(comma + 1);
+  double parsed = 0;
+  return parseStrictDouble(valueOut, parsed);
+}
+
+static void appendSnmpNumericSampleIfChanged(const Service& service, const String& returnedValue) {
+  double numericValue = 0;
+  if (!parseStrictDouble(returnedValue, numericValue)) return;
+
+  time_t now = time(nullptr);
+  if (now < 1000000000) {
+    Serial.println("[SNMPHistory] Time not synced; skipping sample");
+    return;
+  }
+
+  if (!LittleFS.exists(SNMP_HISTORY_DIR)) LittleFS.mkdir(SNMP_HISTORY_DIR);
+  String path = snmpHistoryFileForServiceId(service.id);
+  String previousValue;
+  if (readLastSnmpNumericValue(path, previousValue) && previousValue == returnedValue) return;
+
+  File f = LittleFS.open(path, "a");
+  if (!f) {
+    Serial.println("[SNMPHistory] Failed to open history file for append");
+    return;
+  }
+  f.printf("%lu,%s\n", (unsigned long)now, returnedValue.c_str());
+  f.close();
+
+  File sizeCheck = LittleFS.open(path, "r");
+  size_t fileSize = sizeCheck ? sizeCheck.size() : 0;
+  if (sizeCheck) sizeCheck.close();
+  if (fileSize > SNMP_HISTORY_PER_SERVICE_BUDGET_BYTES + SNMP_HISTORY_TRIM_BATCH_BYTES) {
+    trimFileToSize(path, SNMP_HISTORY_PER_SERVICE_BUDGET_BYTES);
+  }
+}
+
+static void deleteSnmpHistory(const String& serviceId) {
+  String path = snmpHistoryFileForServiceId(serviceId);
+  if (LittleFS.exists(path)) LittleFS.remove(path);
+}
+
+// ============================================
 // LoRa Message Log (LittleFS)
 // Stores message events: <unix_epoch>,<dir>,<type>,<peer>,<message_preview>,<status>\n
 //   dir: S=sent, R=received
@@ -3394,16 +3539,36 @@ bool decodeValueString(const uint8_t* data, size_t length, size_t& index, String
 
   switch (type) {
     case 0x02: {  // Integer
-      long intValue = 0;
+      if (len == 0 || len > sizeof(long)) return false;
+      unsigned long rawValue = 0;
+      bool negative = (data[index] & 0x80) != 0;
       for (size_t i = 0; i < len; i++) {
-        intValue = (intValue << 8) | data[index++];
+        rawValue = (rawValue << 8) | data[index++];
       }
+      if (negative && len < sizeof(unsigned long)) {
+        rawValue |= (~0UL) << (len * 8);
+      }
+      long intValue = (long)rawValue;
       valueOut = String(intValue);
       return true;
     }
     case 0x04: {  // Octet String
       valueOut = String();
       for (size_t i = 0; i < len; i++) valueOut += (char)data[index++];
+      return true;
+    }
+    case 0x41: // Counter32
+    case 0x42: // Gauge32 / Unsigned32
+    case 0x43: // TimeTicks
+    case 0x46: { // Counter64
+      if (len == 0 || len > sizeof(unsigned long long)) return false;
+      unsigned long long numericValue = 0;
+      for (size_t i = 0; i < len; i++) {
+        numericValue = (numericValue << 8) | data[index++];
+      }
+      char numericText[24];
+      snprintf(numericText, sizeof(numericText), "%llu", numericValue);
+      valueOut = numericText;
       return true;
     }
     default: {
@@ -3525,16 +3690,9 @@ bool parseSnmpResponse(const uint8_t* data, size_t length, long expectedRequestI
 }
 
 bool compareSnmpValue(const String& actual, const String& expected, CompareOp op) {
-  auto parseDouble = [](const String& str, double& out) {
-    const char* cstr = str.c_str();
-    char* endPtr;
-    out = strtod(cstr, &endPtr);
-    return endPtr != cstr && *endPtr == '\0';
-  };
-
   double actualNum, expectedNum;
-  bool actualIsNum = parseDouble(actual, actualNum);
-  bool expectedIsNum = parseDouble(expected, expectedNum);
+  bool actualIsNum = parseStrictDouble(actual, actualNum);
+  bool expectedIsNum = parseStrictDouble(expected, expectedNum);
 
   if (actualIsNum && expectedIsNum) {
     switch (op) {
@@ -3679,6 +3837,7 @@ bool checkSnmpGet(Service& service) {
     return false;
   }
 
+  appendSnmpNumericSampleIfChanged(service, value);
   bool comparison = compareSnmpValue(value, service.snmpExpectedValue, service.snmpCompareOp);
   service.lastError = "SNMP value: " + value;
   return comparison;
@@ -3827,6 +3986,8 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
     svc.lastError = "Battery: " + String(svc.meshLastBatteryPct) + "% (" + String(batteryMv) + "mV)";
     Serial.printf("[MeshNode] '%s' remote battery: %umV -> %d%%\n",
                   svc.name.c_str(), batteryMv, svc.meshLastBatteryPct);
+
+    appendMeshBatterySample(svc, svc.meshLastBatteryPct, batteryMv);
 
     // Automated battery policy control
     if (svc.meshRepeaterControl) {
@@ -5262,6 +5423,11 @@ void setup() {
       if (isAuthed) {
         html += "<button class='icon-btn' id='checkServiceBtn" + String(i) + "' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
       }
+      if (services[i].type == TYPE_MESHCORE_NODE) {
+        html += "<button class='icon-btn' onclick='viewBatteryGraph(" + String(i) + ")' title='Battery Graph'>📈</button>";
+      } else if (services[i].type == TYPE_SNMP_GET) {
+        html += "<button class='icon-btn' onclick='viewSnmpGraph(" + String(i) + ")' title='SNMP Value Graph'>📈</button>";
+      }
       html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
       if (isAuthed) {
         html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
@@ -5420,6 +5586,14 @@ void setup() {
     html += "<button class='close-btn' onclick='closeHistoryModal()'>×</button></div>";
     html += "<div id='historyBody' style='white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px;line-height:1.4;color:#2d3748'></div>";
     html += "</div></div>";
+
+    // Public MeshCore battery graph modal
+    html += "<div id='batteryGraphModal' class='modal'><div class='modal-content'>";
+    html += "<div class='modal-header'><div class='modal-title' id='batteryGraphTitle'>Battery History</div>";
+    html += "<button class='close-btn' onclick='closeBatteryGraph()'>×</button></div>";
+    html += "<div id='batteryGraphMessage' style='color:#718096;font-size:13px;margin-bottom:10px'></div>";
+    html += "<canvas id='batteryGraphCanvas' style='display:block;width:100%;height:320px;border:1px solid #e2e8f0;border-radius:8px;background:#fff'></canvas>";
+    html += "</div></div>";
     
     // JavaScript
     html += "<script>";
@@ -5447,6 +5621,12 @@ void setup() {
     html += "function closeModal(){document.getElementById('serviceModal').classList.remove('show');modalOpen=false;}";
 
     html += "function closeHistoryModal(){document.getElementById('historyModal').classList.remove('show');modalOpen=false;}";
+
+    html += "function closeBatteryGraph(){document.getElementById('batteryGraphModal').classList.remove('show');modalOpen=false;}";
+    html += "function graphNumber(v){const a=Math.abs(v);return a>=1000000||a>0&&a<0.001?v.toExponential(2):Number(v.toPrecision(6)).toString();}";
+    html += "function drawMetricGraph(samples,percentScale){const canvas=document.getElementById('batteryGraphCanvas'),box=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,box.width),h=320;canvas.width=w*dpr;canvas.height=h*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const pad={l:66,r:18,t:18,b:46},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;let minV=percentScale?0:Math.min(...samples.map(s=>s.p)),maxV=percentScale?100:Math.max(...samples.map(s=>s.p));if(!samples.length){minV=0;maxV=100;}if(maxV===minV){const margin=Math.abs(maxV)*0.05||1;minV-=margin;maxV+=margin;}ctx.font='12px sans-serif';ctx.lineWidth=1;for(let step=0;step<=5;step++){const value=minV+(maxV-minV)*step/5,y=pad.t+ph*(1-step/5);ctx.strokeStyle='#edf2f7';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.fillStyle='#718096';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(percentScale?Math.round(value)+'%':graphNumber(value),pad.l-8,y);}if(!samples.length)return;let minT=samples[0].t,maxT=samples[samples.length-1].t;if(maxT===minT)maxT=minT+1;const x=t=>pad.l+(t-minT)/(maxT-minT)*pw,y=p=>pad.t+ph*(1-(p-minV)/(maxV-minV));ctx.strokeStyle='#667eea';ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();samples.forEach((s,i)=>{if(i)ctx.lineTo(x(s.t),y(s.p));else ctx.moveTo(x(s.t),y(s.p));});ctx.stroke();ctx.fillStyle='#667eea';samples.forEach(s=>{ctx.beginPath();ctx.arc(x(s.t),y(s.p),samples.length<80?2.5:1.5,0,Math.PI*2);ctx.fill();});ctx.fillStyle='#718096';ctx.textBaseline='top';ctx.textAlign='left';ctx.fillText(new Date(minT*1000).toLocaleString(),pad.l,h-pad.b+10);ctx.textAlign='right';ctx.fillText(new Date(samples[samples.length-1].t*1000).toLocaleString(),w-pad.r,h-pad.b+10);}";
+    html += "async function viewBatteryGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage');document.getElementById('batteryGraphTitle').textContent='Battery History - '+(svc?.name||'MeshCore Node');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],true);try{const res=await fetch('/api/mesh-battery-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),pct=Number(p[1]),mv=Number(p[2]);if(Number.isFinite(t)&&Number.isFinite(pct)&&Number.isFinite(mv)&&t>0)samples.push({t:t,p:pct,mv:mv});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No battery samples yet.';drawMetricGraph([],true);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' samples · Latest: '+last.p+'% ('+(last.mv/1000).toFixed(2)+'V) at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,true);}catch(e){msg.textContent='Failed to load battery history';drawMetricGraph([],true);}}";
+    html += "async function viewSnmpGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage');document.getElementById('batteryGraphTitle').textContent='SNMP Value History - '+(svc?.name||'SNMP Check');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],false);try{const res=await fetch('/api/snmp-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),value=Number(p[1]);if(Number.isFinite(t)&&Number.isFinite(value)&&t>0)samples.push({t:t,p:value});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No changed numeric values yet.';drawMetricGraph([],false);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' changed values · Latest: '+graphNumber(last.p)+' at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,false);}catch(e){msg.textContent='Failed to load SNMP history';drawMetricGraph([],false);}}";
 
     html += "async function viewHistory(i){try{";
     html += "const svc=services[i];document.getElementById('historyTitle').textContent='History - '+(svc?.name||'Service');";
@@ -6023,6 +6203,8 @@ void setup() {
     }
     serviceCount--;
     deleteServiceHistory(deletedId);
+    deleteMeshBatteryHistory(deletedId);
+    deleteSnmpHistory(deletedId);
     saveServices();  // Persist to LittleFS
     request->send(200, "text/plain", "Service deleted");
   });
@@ -6051,6 +6233,76 @@ void setup() {
     }
 
     AsyncResponseStream *response = request->beginResponseStream("text/plain");
+    response->addHeader("Cache-Control", "no-store");
+    uint8_t buf[512];
+    while (f.available()) {
+      size_t n = f.read(buf, sizeof(buf));
+      if (n == 0) break;
+      response->write(buf, n);
+    }
+    f.close();
+    request->send(response);
+  });
+
+  // Public endpoint for MeshCore battery graph data. This intentionally does
+  // not require an admin session so the dashboard graph remains read-only and public.
+  server.on("/api/mesh-battery-history/*", HTTP_GET, [](AsyncWebServerRequest *request){
+    String url = request->url();
+    int idx = url.substring(url.lastIndexOf('/') + 1).toInt();
+    if (idx < 0 || idx >= serviceCount || services[idx].type != TYPE_MESHCORE_NODE) {
+      request->send(404, "text/plain", "Not found");
+      return;
+    }
+
+    String path = batteryHistoryFileForServiceId(services[idx].id);
+    if (!LittleFS.exists(path)) {
+      AsyncWebServerResponse *resp = request->beginResponse(200, "text/csv", "");
+      resp->addHeader("Cache-Control", "no-store");
+      request->send(resp);
+      return;
+    }
+
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+      request->send(500, "text/plain", "Failed to open");
+      return;
+    }
+
+    AsyncResponseStream *response = request->beginResponseStream("text/csv");
+    response->addHeader("Cache-Control", "no-store");
+    uint8_t buf[512];
+    while (f.available()) {
+      size_t n = f.read(buf, sizeof(buf));
+      if (n == 0) break;
+      response->write(buf, n);
+    }
+    f.close();
+    request->send(response);
+  });
+
+  // Public, read-only endpoint for changed numeric SNMP values.
+  server.on("/api/snmp-history/*", HTTP_GET, [](AsyncWebServerRequest *request){
+    String url = request->url();
+    int idx = url.substring(url.lastIndexOf('/') + 1).toInt();
+    if (idx < 0 || idx >= serviceCount || services[idx].type != TYPE_SNMP_GET) {
+      request->send(404, "text/plain", "Not found");
+      return;
+    }
+
+    String path = snmpHistoryFileForServiceId(services[idx].id);
+    if (!LittleFS.exists(path)) {
+      AsyncWebServerResponse *resp = request->beginResponse(200, "text/csv", "");
+      resp->addHeader("Cache-Control", "no-store");
+      request->send(resp);
+      return;
+    }
+
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+      request->send(500, "text/plain", "Failed to open");
+      return;
+    }
+    AsyncResponseStream *response = request->beginResponseStream("text/csv");
     response->addHeader("Cache-Control", "no-store");
     uint8_t buf[512];
     while (f.available()) {

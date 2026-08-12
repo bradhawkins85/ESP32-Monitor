@@ -15,6 +15,8 @@ An ESP32-based LoRa message receiver for Heltec Wireless Stick Lite v3 that forw
 - 📶 **WiFi Connectivity**: Automatic connection and reconnection handling
 - ⚙️ **Build-time Configuration**: All settings configurable at compile time
 - 🔋 **MeshCore Battery Policies**: Adjust a monitored repeater's TX power and repeat role across admin-defined battery ranges
+- 📈 **MeshCore Battery Graphs**: Record every successful node battery check in bounded flash history and view the line graph with or without an admin login
+- 📉 **SNMP Value Graphs**: Graph changed numeric SNMP values while ignoring unchanged or text-based responses
 
 ## Hardware Requirements
 
