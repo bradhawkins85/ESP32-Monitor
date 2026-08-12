@@ -37,6 +37,8 @@
 #include <AsyncMqttClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <algorithm>
+#include <vector>
 
 // --- MeshCore protocol constants ---
 #define CIPHER_BLOCK_SIZE 16
@@ -142,15 +144,25 @@ struct Service {
   String wolMacAddress;
   // MeshCore Node monitor fields (TYPE_MESHCORE_NODE)
   String meshNodePubkey;       // 64-char hex Ed25519 public key of remote node
-  bool meshRepeaterControl;    // Enable automated repeater threshold control
-  int meshBatteryLowPct;       // Disable repeater when battery drops below this %
-  int meshBatteryHighPct;      // Re-enable repeater when battery rises above this %
+  bool meshRepeaterControl;    // Enable automated battery policy control
+  struct MeshBatteryLevel {
+    int minPct;
+    int maxPct;
+    int txPower;
+    bool repeat;
+  };
+  std::vector<MeshBatteryLevel> meshBatteryLevels;
   // Runtime-only mesh node state (not persisted)
   int meshLastBatteryPct;
   float meshLastBatteryV;
   unsigned long meshLastResponseMs;
-  bool meshRepeaterKnownState; // Last commanded repeater state
+  bool meshRepeaterKnownState; // Last commanded repeater state value
+  bool meshRepeaterStateKnown;
+  int meshKnownTxPower;
+  int meshAppliedBatteryLevel;
 };
+
+static constexpr int MESH_TX_POWER_UNCHANGED = -32768;
 
 // ============================================
 // Direct LoRa Node Configuration
@@ -2063,6 +2075,103 @@ static bool cronMatches(const String& expression, const struct tm& utc) {
   return minute && hour && month && day;
 }
 
+// --- MeshCore battery policy helpers ---
+static void addLegacyMeshBatteryLevels(Service& svc, int lowPct, int highPct) {
+  svc.meshBatteryLevels.clear();
+  lowPct = constrain(lowPct, 0, 100);
+  highPct = constrain(highPct, 0, 100);
+  if (lowPct > 0) {
+    svc.meshBatteryLevels.push_back({0, lowPct - 1, MESH_TX_POWER_UNCHANGED, false});
+  }
+  if (highPct <= 100) {
+    svc.meshBatteryLevels.push_back({highPct, 100, MESH_TX_POWER_UNCHANGED, true});
+  }
+}
+
+static bool parseMeshBatteryLevels(JsonVariantConst value,
+                                   std::vector<Service::MeshBatteryLevel>& levels,
+                                   String* validationError = nullptr) {
+  levels.clear();
+  if (value.isNull()) return true;
+  if (!value.is<JsonArrayConst>()) {
+    if (validationError) *validationError = "meshBatteryLevels must be an array";
+    return false;
+  }
+
+  for (JsonObjectConst item : value.as<JsonArrayConst>()) {
+    if (!item["minPct"].is<int>() || !item["maxPct"].is<int>() ||
+        !item["repeat"].is<bool>()) {
+      if (validationError) *validationError = "Each battery level requires minPct, maxPct, and repeat";
+      levels.clear();
+      return false;
+    }
+    Service::MeshBatteryLevel level;
+    level.minPct = item["minPct"].as<int>();
+    level.maxPct = item["maxPct"].as<int>();
+    level.repeat = item["repeat"].as<bool>();
+    level.txPower = item["txPower"].is<int>() ? item["txPower"].as<int>() : MESH_TX_POWER_UNCHANGED;
+    if (level.minPct < 0 || level.maxPct > 100 || level.minPct > level.maxPct) {
+      if (validationError) *validationError = "Battery ranges must be within 0-100% and minimum must not exceed maximum";
+      levels.clear();
+      return false;
+    }
+    // MeshCore targets have board-specific limits. This broad range accepts all
+    // common radios while leaving final clamping/validation to the target.
+    if (level.txPower != MESH_TX_POWER_UNCHANGED && (level.txPower < -20 || level.txPower > 30)) {
+      if (validationError) *validationError = "TX power must be between -20 and 30 dBm";
+      levels.clear();
+      return false;
+    }
+    levels.push_back(level);
+  }
+
+  std::sort(levels.begin(), levels.end(), [](const Service::MeshBatteryLevel& a,
+                                              const Service::MeshBatteryLevel& b) {
+    return a.minPct < b.minPct;
+  });
+  for (size_t i = 1; i < levels.size(); i++) {
+    if (levels[i].minPct <= levels[i - 1].maxPct) {
+      if (validationError) *validationError = "Battery ranges must not overlap";
+      levels.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+static void writeMeshBatteryLevels(JsonObject target, const Service& svc) {
+  JsonArray levels = target["meshBatteryLevels"].to<JsonArray>();
+  for (const Service::MeshBatteryLevel& configured : svc.meshBatteryLevels) {
+    JsonObject level = levels.add<JsonObject>();
+    level["minPct"] = configured.minPct;
+    level["maxPct"] = configured.maxPct;
+    if (configured.txPower == MESH_TX_POWER_UNCHANGED) level["txPower"] = nullptr;
+    else level["txPower"] = configured.txPower;
+    level["repeat"] = configured.repeat;
+  }
+}
+
+static void resetMeshBatteryRuntime(Service& svc) {
+  svc.meshLastBatteryPct = 0;
+  svc.meshLastBatteryV = 0.0f;
+  svc.meshLastResponseMs = 0;
+  svc.meshRepeaterKnownState = true;
+  svc.meshRepeaterStateKnown = false;
+  svc.meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
+  svc.meshAppliedBatteryLevel = -1;
+}
+
+// Reads the new array format or migrates the previous low/high repeat thresholds.
+static bool readMeshBatteryPolicy(JsonVariantConst source, Service& svc, String* validationError = nullptr) {
+  if (!source["meshBatteryLevels"].isNull()) {
+    return parseMeshBatteryLevels(source["meshBatteryLevels"], svc.meshBatteryLevels, validationError);
+  }
+  int lowPct = source["meshBatteryLowPct"].isNull() ? 20 : source["meshBatteryLowPct"].as<int>();
+  int highPct = source["meshBatteryHighPct"].isNull() ? 50 : source["meshBatteryHighPct"].as<int>();
+  addLegacyMeshBatteryLevels(svc, lowPct, highPct);
+  return true;
+}
+
 // --- Service Persistence ---
 void saveServices() {
   File file = LittleFS.open("/services.json", "w");
@@ -2108,8 +2217,7 @@ void saveServices() {
     // MeshCore Node fields
     svc["meshNodePubkey"] = services[i].meshNodePubkey;
     svc["meshRepeaterControl"] = services[i].meshRepeaterControl;
-    svc["meshBatteryLowPct"] = services[i].meshBatteryLowPct;
-    svc["meshBatteryHighPct"] = services[i].meshBatteryHighPct;
+    writeMeshBatteryLevels(svc, services[i]);
   }
   
   serializeJson(doc, file);
@@ -2189,13 +2297,14 @@ void loadServices() {
     // MeshCore Node fields
     services[serviceCount].meshNodePubkey = svc["meshNodePubkey"].isNull() ? "" : svc["meshNodePubkey"].as<String>();
     services[serviceCount].meshRepeaterControl = svc["meshRepeaterControl"].isNull() ? false : svc["meshRepeaterControl"].as<bool>();
-    services[serviceCount].meshBatteryLowPct = svc["meshBatteryLowPct"].isNull() ? 20 : svc["meshBatteryLowPct"].as<int>();
-    services[serviceCount].meshBatteryHighPct = svc["meshBatteryHighPct"].isNull() ? 50 : svc["meshBatteryHighPct"].as<int>();
-    // Runtime-only mesh node state
-    services[serviceCount].meshLastBatteryPct = 0;
-    services[serviceCount].meshLastBatteryV = 0.0f;
-    services[serviceCount].meshLastResponseMs = 0;
-    services[serviceCount].meshRepeaterKnownState = true;  // Assume repeater on until told otherwise
+    String policyError;
+    if (!readMeshBatteryPolicy(svc, services[serviceCount], &policyError)) {
+      services[serviceCount].meshBatteryLevels.clear();
+      services[serviceCount].meshRepeaterControl = false;
+      Serial.printf("Invalid battery policy for '%s': %s; automation disabled\n",
+                    services[serviceCount].name.c_str(), policyError.c_str());
+    }
+    resetMeshBatteryRuntime(services[serviceCount]);
 
     if (services[serviceCount].type == TYPE_PUSH && services[serviceCount].pushToken.length() == 0) {
       services[serviceCount].pushToken = generatePushToken();
@@ -2414,11 +2523,14 @@ String getServicesJson() {
     obj["wolMacAddress"] = services[i].wolMacAddress;
     obj["meshNodePubkey"] = services[i].meshNodePubkey;
     obj["meshRepeaterControl"] = services[i].meshRepeaterControl;
-    obj["meshBatteryLowPct"] = services[i].meshBatteryLowPct;
-    obj["meshBatteryHighPct"] = services[i].meshBatteryHighPct;
+    writeMeshBatteryLevels(obj, services[i]);
     obj["meshLastBatteryPct"] = services[i].meshLastBatteryPct;
     obj["meshLastBatteryV"] = services[i].meshLastBatteryV;
     obj["meshRepeaterKnownState"] = services[i].meshRepeaterKnownState;
+    obj["meshRepeaterStateKnown"] = services[i].meshRepeaterStateKnown;
+    if (services[i].meshKnownTxPower != MESH_TX_POWER_UNCHANGED) {
+      obj["meshKnownTxPower"] = services[i].meshKnownTxPower;
+    }
   }
   String json;
   serializeJson(doc, json);
@@ -2443,6 +2555,8 @@ static String getServiceCheckResultJson(const Service& svc, bool checkPassed, bo
   doc["meshLastBatteryPct"] = svc.meshLastBatteryPct;
   doc["meshLastBatteryV"] = svc.meshLastBatteryV;
   doc["meshRepeaterKnownState"] = svc.meshRepeaterKnownState;
+  doc["meshRepeaterStateKnown"] = svc.meshRepeaterStateKnown;
+  if (svc.meshKnownTxPower != MESH_TX_POWER_UNCHANGED) doc["meshKnownTxPower"] = svc.meshKnownTxPower;
   doc["timestamp"] = (unsigned long)time(nullptr);
 
   String json;
@@ -3604,7 +3718,7 @@ bool checkUptime(Service& service) {
 }
 
 // Forward declarations for MeshCore node check functions
-static void sendMeshRepeaterCommand(Service& svc, bool enable);
+static bool sendMeshRepeaterCommand(Service& svc, bool enable);
 static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t len);
 
 // ============================================
@@ -3624,21 +3738,74 @@ static int meshCoreBatteryPercent(uint16_t batteryMv) {
 
 // Send the native remote CLI command to enable or disable repeater forwarding.
 // MeshCore authorizes CLI data from the sender's Access Control role (Admin required).
-static void sendMeshRepeaterCommand(Service& svc, bool enable) {
-  if (!settings.loraEnabled) return;
+static bool sendMeshNodeAdminCommand(Service& svc, const String& command) {
+  if (!settings.loraEnabled) return false;
   uint8_t pubkeyBytes[32];
   if (!parseHexKeyToBytes(svc.meshNodePubkey, pubkeyBytes)) {
     Serial.printf("[MeshNode] Invalid pubkey for service '%s'\n", svc.name.c_str());
-    return;
+    return false;
   }
-  String cmd = String("set repeat ") + (enable ? "on" : "off");
-  bool ok = sendLoRaAdminCommand(cmd, pubkeyBytes, pubkeyBytes[0]);
+  return sendLoRaAdminCommand(command, pubkeyBytes, pubkeyBytes[0]);
+}
+
+static bool sendMeshRepeaterCommand(Service& svc, bool enable) {
+  bool ok = sendMeshNodeAdminCommand(svc, String("set repeat ") + (enable ? "on" : "off"));
   if (ok) {
     svc.meshRepeaterKnownState = enable;
+    svc.meshRepeaterStateKnown = true;
     Serial.printf("[MeshNode] Sent 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
   } else {
     Serial.printf("[MeshNode] Failed to send 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
   }
+  return ok;
+}
+
+static bool sendMeshTxPowerCommand(Service& svc, int txPower) {
+  bool ok = sendMeshNodeAdminCommand(svc, "set tx " + String(txPower));
+  if (ok) {
+    svc.meshKnownTxPower = txPower;
+    Serial.printf("[MeshNode] Sent 'set tx %d' to %s\n", txPower, svc.name.c_str());
+  } else {
+    Serial.printf("[MeshNode] Failed to send 'set tx %d' to %s\n", txPower, svc.name.c_str());
+  }
+  return ok;
+}
+
+static void applyMeshBatteryPolicy(Service& svc) {
+  int levelIndex = -1;
+  for (size_t i = 0; i < svc.meshBatteryLevels.size(); i++) {
+    const Service::MeshBatteryLevel& level = svc.meshBatteryLevels[i];
+    if (svc.meshLastBatteryPct >= level.minPct && svc.meshLastBatteryPct <= level.maxPct) {
+      levelIndex = (int)i;
+      break;
+    }
+  }
+
+  if (levelIndex < 0) {
+    if (svc.meshAppliedBatteryLevel != -1) {
+      Serial.printf("[MeshNode] Battery %d%% is outside configured ranges; leaving settings unchanged\n",
+                    svc.meshLastBatteryPct);
+    }
+    svc.meshAppliedBatteryLevel = -1;
+    return;
+  }
+  if (svc.meshAppliedBatteryLevel == levelIndex) return;
+
+  const Service::MeshBatteryLevel& level = svc.meshBatteryLevels[levelIndex];
+  Serial.printf("[MeshNode] Applying battery level %d-%d%% to %s\n",
+                level.minPct, level.maxPct, svc.name.c_str());
+
+  bool allApplied = true;
+  if (level.txPower != MESH_TX_POWER_UNCHANGED && svc.meshKnownTxPower != level.txPower) {
+    bool txApplied = sendMeshTxPowerCommand(svc, level.txPower);
+    allApplied = txApplied && allApplied;
+    if (txApplied) delay(250);
+  }
+  if (!svc.meshRepeaterStateKnown || svc.meshRepeaterKnownState != level.repeat) {
+    bool repeatChanged = sendMeshRepeaterCommand(svc, level.repeat);
+    allApplied = repeatChanged && allApplied;
+  }
+  if (allApplied) svc.meshAppliedBatteryLevel = levelIndex;
 }
 
 // Parse MeshCore's binary repeater status response. The response begins with the
@@ -3661,17 +3828,9 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
     Serial.printf("[MeshNode] '%s' remote battery: %umV -> %d%%\n",
                   svc.name.c_str(), batteryMv, svc.meshLastBatteryPct);
 
-    // Automated repeater control
+    // Automated battery policy control
     if (svc.meshRepeaterControl) {
-      if (svc.meshRepeaterKnownState && svc.meshLastBatteryPct < svc.meshBatteryLowPct) {
-        Serial.printf("[MeshNode] Battery %d%% below low threshold %d%% — disabling repeater\n",
-                      svc.meshLastBatteryPct, svc.meshBatteryLowPct);
-        sendMeshRepeaterCommand(svc, false);
-      } else if (!svc.meshRepeaterKnownState && svc.meshLastBatteryPct >= svc.meshBatteryHighPct) {
-        Serial.printf("[MeshNode] Battery %d%% above high threshold %d%% — enabling repeater\n",
-                      svc.meshLastBatteryPct, svc.meshBatteryHighPct);
-        sendMeshRepeaterCommand(svc, true);
-      }
+      applyMeshBatteryPolicy(svc);
     }
   } else {
     svc.lastError = "Reached (no battery data)";
@@ -5053,10 +5212,13 @@ void setup() {
     html += ".form-input,.form-select{width:100%;padding:10px 12px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;transition:border-color 0.2s}";
     html += ".form-input:focus,.form-select:focus{outline:none;border-color:#667eea}";
     html += ".form-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}";
+    html += ".battery-level{display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:8px;align-items:end;margin-bottom:10px;padding:10px;background:#f7fafc;border-radius:8px}";
+    html += ".battery-level label{font-size:11px;color:#718096}.battery-level .form-input,.battery-level .form-select{margin-top:4px}";
+    html += ".remove-level{padding:10px 12px;background:#fed7d7;color:#742a2a;border:0;border-radius:8px;cursor:pointer}";
     html += ".btn-group{display:flex;gap:12px;margin-top:24px}";
     html += ".btn-cancel{background:#e2e8f0;color:#4a5568}";
     html += ".btn-cancel:hover{background:#cbd5e0}";
-    html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.modal-content{padding:24px}}";
+    html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.battery-level{grid-template-columns:1fr 1fr}.modal-content{padding:24px}}";
     html += "</style></head><body>";
     html += "<canvas id='meshBg'></canvas>";
     html += "<div class='container'>";
@@ -5126,7 +5288,11 @@ void setup() {
         html += "<div class='service-info' id='serviceMesh" + String(i) + "'" + (services[i].meshLastResponseMs > 0 ? "" : " style='display:none'") + ">Battery: <span style='color:" + battColor + ";font-weight:600'>" +
                 String(services[i].meshLastBatteryPct) + "% (" + String(services[i].meshLastBatteryV, 2) + "V)</span>";
         if (services[i].meshRepeaterControl) {
-          html += " | Repeater: " + String(services[i].meshRepeaterKnownState ? "on" : "off");
+          html += " | Repeater: " + String(services[i].meshRepeaterStateKnown ?
+                                            (services[i].meshRepeaterKnownState ? "on" : "off") : "pending");
+          if (services[i].meshKnownTxPower != MESH_TX_POWER_UNCHANGED) {
+            html += " | TX: " + String(services[i].meshKnownTxPower) + " dBm";
+          }
         }
         html += "</div>";
       }
@@ -5235,12 +5401,11 @@ void setup() {
     html += "<input type='text' id='serviceMeshPubkey' class='form-input' placeholder='e.g. 01ab23cd...' maxlength='64'></div>";
     html += "<div class='form-group' data-types='6'><div class='hint'>Add this ESP Monitor public key to the repeater's Access Control list with Admin permission:<br><code>" + getOurMeshPublicKeyHex() + "</code><br>Status checks and setting changes use this identity; no PIN is required.</div></div>";
     html += "<div class='form-group' data-types='6'><label class='form-label' style='display:flex;align-items:center;gap:8px'>";
-    html += "<input type='checkbox' id='serviceMeshRepeaterControl'>Enable Automated Repeater Control</label></div>";
-    html += "<div class='form-row' data-types='6'>";
-    html += "<div class='form-group'><label class='form-label'>Disable Repeater Below (%)</label>";
-    html += "<input type='number' id='serviceMeshBattLow' class='form-input' value='20' min='0' max='100'></div>";
-    html += "<div class='form-group'><label class='form-label'>Re-enable Repeater Above (%)</label>";
-    html += "<input type='number' id='serviceMeshBattHigh' class='form-input' value='50' min='0' max='100'></div></div>";
+    html += "<input type='checkbox' id='serviceMeshRepeaterControl'>Enable Automated Battery Policy</label>";
+    html += "<div class='hint'>On each status response, the matching range sets TX power and repeater forwarding. Uncovered percentages leave its current settings unchanged.</div></div>";
+    html += "<div class='form-group' data-types='6'><label class='form-label'>Battery Levels</label>";
+    html += "<div id='meshBatteryLevels'></div><button type='button' class='btn btn-secondary' onclick='addMeshBatteryLevel()'>+ Add Level</button>";
+    html += "<div class='hint'>Ranges may not overlap. TX power is limited by the remote radio and local regulations.</div></div>";
     // Alert channel toggles (only globally-enabled channels shown via JS)
     html += "<div class='form-group' id='alertChannelsGroup'><label class='form-label'>Alert Channels</label>";
     html += "<div id='alertChannelsContainer' style='display:flex;flex-wrap:wrap;gap:12px;margin-top:4px'></div></div>";
@@ -5266,11 +5431,16 @@ void setup() {
     html += "const channelDefs=[{key:'lora',label:'📡 LoRa',field:'alertLora'},{key:'ntfy',label:'🔔 Ntfy',field:'alertNtfy'},{key:'discord',label:'💬 Discord',field:'alertDiscord'},{key:'webhook',label:'🌐 Webhook',field:'alertWebhook'},{key:'email',label:'📧 Email',field:'alertEmail'},{key:'mqtt',label:'📨 MQTT',field:'alertMqtt'},{key:'wol',label:'⏰ WoL',field:'alertWol',alwaysShow:true}];";;
     html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!ch.alwaysShow&&!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]===true;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';}";
     html += "function getAlertChannelValues(){const v={};channelDefs.forEach(ch=>{const el=document.getElementById('alert_'+ch.field);v[ch.field]=el?el.checked:true;});return v;}";
+    html += "const defaultMeshLevels=[{minPct:0,maxPct:30,txPower:20,repeat:false},{minPct:31,maxPct:50,txPower:15,repeat:true},{minPct:51,maxPct:75,txPower:23,repeat:true},{minPct:76,maxPct:100,txPower:28,repeat:true}];";
+    html += "function addMeshBatteryLevel(level){level=level||{minPct:0,maxPct:100,txPower:20,repeat:true};const row=document.createElement('div');row.className='battery-level';const tx=level.txPower==null?'':level.txPower;row.innerHTML=\"<label>Minimum %<input class='form-input mesh-min' type='number' min='0' max='100' required value='\"+Number(level.minPct)+\"'></label><label>Maximum %<input class='form-input mesh-max' type='number' min='0' max='100' required value='\"+Number(level.maxPct)+\"'></label><label>TX Power (dBm)<input class='form-input mesh-tx' type='number' min='-20' max='30' placeholder='unchanged' value='\"+tx+\"'></label><label>Repeat<select class='form-select mesh-repeat'><option value='true'\"+(level.repeat?' selected':'')+\">On</option><option value='false'\"+(!level.repeat?' selected':'')+\">Off</option></select></label><button type='button' class='remove-level' title='Remove level'>×</button>\";row.querySelector('.remove-level').onclick=()=>row.remove();document.getElementById('meshBatteryLevels').appendChild(row);}";
+    html += "function renderMeshBatteryLevels(levels){const c=document.getElementById('meshBatteryLevels');c.innerHTML='';(levels||[]).forEach(addMeshBatteryLevel);}";
+    html += "function collectMeshBatteryLevels(){const levels=[];for(const row of document.querySelectorAll('.battery-level')){const minPct=Number(row.querySelector('.mesh-min').value),maxPct=Number(row.querySelector('.mesh-max').value),txRaw=row.querySelector('.mesh-tx').value.trim(),txPower=txRaw===''?null:Number(txRaw);if(!Number.isInteger(minPct)||!Number.isInteger(maxPct)||(txPower!==null&&!Number.isInteger(txPower))||minPct<0||maxPct>100||minPct>maxPct||(txPower!==null&&(txPower< -20||txPower>30))){alert('Each battery level needs a valid 0-100% range. TX power, when set, must be from -20 to 30 dBm.');return null;}levels.push({minPct,maxPct,txPower,repeat:row.querySelector('.mesh-repeat').value==='true'});}levels.sort((a,b)=>a.minPct-b.minPct);for(let i=1;i<levels.length;i++){if(levels[i].minPct<=levels[i-1].maxPct){alert('Battery ranges must not overlap.');return null;}}return levels;}";
     html += "function updateFieldVisibility(type){document.querySelectorAll('[data-types]').forEach(el=>{const types=el.getAttribute('data-types').split(',');el.style.display=types.includes(String(type))?'':'none';});}";
     html += "document.getElementById('serviceType').addEventListener('change',e=>updateFieldVisibility(e.target.value));";
     html += "function setPushDetails(token){const hidden=document.getElementById('servicePushToken');const url=document.getElementById('servicePushUrl');hidden.value=token||'';if(token){url.value=location.origin+'/push/'+token;url.placeholder='';}else{url.value='';url.placeholder='Generated after saving';}}";
     html += "function showAddModal(){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Add Service';";
     html += "document.getElementById('serviceForm').reset();document.getElementById('serviceIndex').value='-1';setPushDetails('');";
+    html += "renderMeshBatteryLevels(defaultMeshLevels);";
     html += "updateFieldVisibility(document.getElementById('serviceType').value);";
     html += "renderAlertChannels({});";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
@@ -5314,8 +5484,7 @@ void setup() {
     html += "document.getElementById('serviceWolMac').value=s.wolMacAddress||'';";
     html += "document.getElementById('serviceMeshPubkey').value=s.meshNodePubkey||'';";
     html += "document.getElementById('serviceMeshRepeaterControl').checked=s.meshRepeaterControl===true;";
-    html += "document.getElementById('serviceMeshBattLow').value=s.meshBatteryLowPct!=null?s.meshBatteryLowPct:20;";
-    html += "document.getElementById('serviceMeshBattHigh').value=s.meshBatteryHighPct!=null?s.meshBatteryHighPct:50;";
+    html += "renderMeshBatteryLevels(s.meshBatteryLevels||[]);";
     html += "updateFieldVisibility(s.type);";
     html += "renderAlertChannels(s);";
     html += "document.getElementById('serviceModal').classList.add('show');modalOpen=true;}";
@@ -5326,7 +5495,7 @@ void setup() {
     html += "if(card){card.classList.remove('up','down');card.classList.add(d.isUp?'up':'down');}";
     html += "if(status){status.classList.remove('status-up','status-down','status-pending');status.classList.add(d.isPending?'status-pending':(d.isUp?'status-up':'status-down'));status.textContent=d.isPending?'pending':(d.isUp?'up':'down');}";
     html += "if(error){error.textContent=d.checkError||'';error.style.display=d.checkError?'':'none';}";
-    html += "if(d.serviceType===6&&d.meshHasResponse){const mesh=document.getElementById('serviceMesh'+i);if(mesh){const pct=Number(d.meshLastBatteryPct)||0;const volts=Number(d.meshLastBatteryV)||0;const color=pct>=50?'#48bb78':(pct>=20?'#d69e2e':'#f56565');mesh.innerHTML=\"Battery: <span style='color:\"+color+\";font-weight:600'>\"+pct+\"% (\"+volts.toFixed(2)+\"V)</span>\"+(services[i].meshRepeaterControl?' | Repeater: '+(d.meshRepeaterKnownState?'on':'off'):'');mesh.style.display='';}}";
+    html += "if(d.serviceType===6&&d.meshHasResponse){const mesh=document.getElementById('serviceMesh'+i);if(mesh){const pct=Number(d.meshLastBatteryPct)||0;const volts=Number(d.meshLastBatteryV)||0;const color=pct>=50?'#48bb78':(pct>=20?'#d69e2e':'#f56565');let policy='';if(services[i].meshRepeaterControl){policy=' | Repeater: '+(d.meshRepeaterStateKnown?(d.meshRepeaterKnownState?'on':'off'):'pending');if(Number.isFinite(d.meshKnownTxPower))policy+=' | TX: '+d.meshKnownTxPower+' dBm';}mesh.innerHTML=\"Battery: <span style='color:\"+color+\";font-weight:600'>\"+pct+\"% (\"+volts.toFixed(2)+\"V)</span>\"+policy;mesh.style.display='';}}";
     html += "const up=document.querySelectorAll('.service-card.up').length;const online=document.getElementById('onlineCount');const offline=document.getElementById('offlineCount');if(online)online.textContent=up;if(offline)offline.textContent=services.length-up;";
     html += "setCheckMessage(i,d.checkPassed?'Check passed just now':'Check failed just now',d.checkPassed?'#38a169':'#e53e3e');}";
     html += "async function parseCheckResponse(res){const body=await res.text();let d;try{d=JSON.parse(body);}catch(_){throw new Error(body||('HTTP '+res.status));}if(!res.ok&&res.status!==202)throw new Error(d.error||('HTTP '+res.status));return d;}";
@@ -5335,7 +5504,7 @@ void setup() {
     html += "while(d.waitingForResult){await new Promise(resolve=>setTimeout(resolve,500));res=await fetch('/api/check-service-result/'+i+'?startedMs='+encodeURIComponent(d.startedMs)+'&baseline='+encodeURIComponent(d.baseline),{credentials:'include',cache:'no-store'});d=await parseCheckResponse(res);}";
     html += "applyServiceCheckResult(i,d);";
     html += "}catch(e){setCheckMessage(i,'Check failed: '+e.message,'#e53e3e');}finally{if(btn){btn.disabled=false;btn.textContent='▶️';}}}";
-    html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}";
+    html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}const meshBatteryLevels=collectMeshBatteryLevels();if(meshBatteryLevels===null)return;if(document.getElementById('serviceMeshRepeaterControl').checked&&!meshBatteryLevels.length){alert('Add at least one battery level before enabling the policy.');return;}";
     html += "const data={name:document.getElementById('serviceName').value,";
     html += "type:parseInt(document.getElementById('serviceType').value),";
     html += "enabled:document.getElementById('serviceEnabled').value==='true',";
@@ -5356,8 +5525,7 @@ void setup() {
     html += "wolMacAddress:document.getElementById('serviceWolMac').value,";
     html += "meshNodePubkey:document.getElementById('serviceMeshPubkey').value,";
     html += "meshRepeaterControl:document.getElementById('serviceMeshRepeaterControl').checked,";
-    html += "meshBatteryLowPct:parseInt(document.getElementById('serviceMeshBattLow').value)||20,";
-    html += "meshBatteryHighPct:parseInt(document.getElementById('serviceMeshBattHigh').value)||50};";
+    html += "meshBatteryLevels:meshBatteryLevels};";
     html += "Object.assign(data,getAlertChannelValues());";
     html += "const idx=document.getElementById('serviceIndex').value;";
     html += "const url=idx==='-1'?'/api/service':'/api/service/'+idx;";
@@ -5589,6 +5757,9 @@ void setup() {
       obj["alertMqtt"] = services[i].alertMqtt;
       obj["alertWol"] = services[i].alertWol;
       obj["wolMacAddress"] = services[i].wolMacAddress;
+      obj["meshNodePubkey"] = services[i].meshNodePubkey;
+      obj["meshRepeaterControl"] = services[i].meshRepeaterControl;
+      writeMeshBatteryLevels(obj, services[i]);
     }
     String json;
     serializeJson(doc, json);
@@ -5646,12 +5817,14 @@ void setup() {
             svc.wolMacAddress = obj["wolMacAddress"].isNull() ? "" : obj["wolMacAddress"].as<String>();
             svc.meshNodePubkey = obj["meshNodePubkey"].isNull() ? "" : obj["meshNodePubkey"].as<String>();
             svc.meshRepeaterControl = obj["meshRepeaterControl"].isNull() ? false : obj["meshRepeaterControl"].as<bool>();
-            svc.meshBatteryLowPct = obj["meshBatteryLowPct"].isNull() ? 20 : obj["meshBatteryLowPct"].as<int>();
-            svc.meshBatteryHighPct = obj["meshBatteryHighPct"].isNull() ? 50 : obj["meshBatteryHighPct"].as<int>();
-            svc.meshLastBatteryPct = 0;
-            svc.meshLastBatteryV = 0.0f;
-            svc.meshLastResponseMs = 0;
-            svc.meshRepeaterKnownState = true;
+            String policyError;
+            if (!readMeshBatteryPolicy(obj, svc, &policyError)) {
+              Serial.printf("Import: invalid battery policy for '%s': %s; automation disabled\n",
+                            svc.name.c_str(), policyError.c_str());
+              svc.meshBatteryLevels.clear();
+              svc.meshRepeaterControl = false;
+            }
+            resetMeshBatteryRuntime(svc);
             svc.consecutivePasses = 0;
             svc.consecutiveFails = 0;
             svc.isUp = false;
@@ -5720,12 +5893,16 @@ void setup() {
       // MeshCore Node fields
       svc.meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
       svc.meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
-      svc.meshBatteryLowPct = doc["meshBatteryLowPct"].isNull() ? 20 : doc["meshBatteryLowPct"].as<int>();
-      svc.meshBatteryHighPct = doc["meshBatteryHighPct"].isNull() ? 50 : doc["meshBatteryHighPct"].as<int>();
-      svc.meshLastBatteryPct = 0;
-      svc.meshLastBatteryV = 0.0f;
-      svc.meshLastResponseMs = 0;
-      svc.meshRepeaterKnownState = true;
+      String policyError;
+      if (!readMeshBatteryPolicy(doc.as<JsonVariantConst>(), svc, &policyError)) {
+        request->send(400, "text/plain", policyError);
+        return;
+      }
+      if (svc.meshRepeaterControl && svc.meshBatteryLevels.empty()) {
+        request->send(400, "text/plain", "Add at least one battery level before enabling the policy");
+        return;
+      }
+      resetMeshBatteryRuntime(svc);
       // Auto-discover MAC address if WoL enabled but no MAC specified
       if (svc.alertWol && svc.wolMacAddress.length() == 0) {
         String ip = getServiceIp(svc);
@@ -5771,6 +5948,17 @@ void setup() {
         request->send(400, "text/plain", "Invalid cron expression. Use five fields: minute hour day month weekday");
         return;
       }
+      Service policySvc;
+      policySvc.meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
+      String policyError;
+      if (!readMeshBatteryPolicy(doc.as<JsonVariantConst>(), policySvc, &policyError)) {
+        request->send(400, "text/plain", policyError);
+        return;
+      }
+      if (policySvc.meshRepeaterControl && policySvc.meshBatteryLevels.empty()) {
+        request->send(400, "text/plain", "Add at least one battery level before enabling the policy");
+        return;
+      }
       services[idx].name = doc["name"].as<String>();
       services[idx].type = (ServiceType)doc["type"].as<int>();
       services[idx].enabled = doc["enabled"].as<bool>();
@@ -5802,9 +5990,11 @@ void setup() {
       services[idx].wolMacAddress = doc["wolMacAddress"].isNull() ? "" : doc["wolMacAddress"].as<String>();
       // MeshCore Node fields
       services[idx].meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
-      services[idx].meshRepeaterControl = doc["meshRepeaterControl"].isNull() ? false : doc["meshRepeaterControl"].as<bool>();
-      services[idx].meshBatteryLowPct = doc["meshBatteryLowPct"].isNull() ? 20 : doc["meshBatteryLowPct"].as<int>();
-      services[idx].meshBatteryHighPct = doc["meshBatteryHighPct"].isNull() ? 50 : doc["meshBatteryHighPct"].as<int>();
+      services[idx].meshRepeaterControl = policySvc.meshRepeaterControl;
+      services[idx].meshBatteryLevels = policySvc.meshBatteryLevels;
+      services[idx].meshRepeaterStateKnown = false;
+      services[idx].meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
+      services[idx].meshAppliedBatteryLevel = -1;
       // Auto-discover MAC address if WoL enabled but no MAC specified
       if (services[idx].alertWol && services[idx].wolMacAddress.length() == 0) {
         String ip = getServiceIp(services[idx]);

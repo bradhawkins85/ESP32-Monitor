@@ -14,6 +14,7 @@ An ESP32-based LoRa message receiver for Heltec Wireless Stick Lite v3 that forw
 - 🖥️ **OLED Display**: Real-time status and message display
 - 📶 **WiFi Connectivity**: Automatic connection and reconnection handling
 - ⚙️ **Build-time Configuration**: All settings configurable at compile time
+- 🔋 **MeshCore Battery Policies**: Adjust a monitored repeater's TX power and repeat role across admin-defined battery ranges
 
 ## Hardware Requirements
 
@@ -108,6 +109,15 @@ LoRa settings can be configured in `include/config.h`:
 #define LORA_CODING_RATE 5  // 5-8 for 4/5 to 4/8
 #define LORA_BANDWIDTH 125.0  // kHz: 125.0, 250.0, or 500.0
 ```
+
+### MeshCore Repeater Battery Policies
+
+For a `MeshCore Node` service, enable **Automated Battery Policy** and add as many non-overlapping battery ranges as needed. Each range can set:
+
+- TX power in dBm (leave blank to keep the current TX power)
+- Repeater forwarding on or off
+
+The policy is evaluated whenever the monitor receives a status response from the node. If the battery percentage is not covered by a configured range, the remote settings are left unchanged. The monitor must be present in the repeater's Access Control list with Admin permission for remote setting changes.
 
 ## Building and Uploading
 
