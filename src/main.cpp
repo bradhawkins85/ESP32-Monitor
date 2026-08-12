@@ -152,7 +152,8 @@ struct Service {
     bool repeat;
   };
   std::vector<MeshBatteryLevel> meshBatteryLevels;
-  // Runtime-only mesh node state (not persisted)
+  // Mesh node state. Last verified command values are persisted as a cache;
+  // live response/battery fields are runtime-only.
   int meshLastBatteryPct;
   float meshLastBatteryV;
   unsigned long meshLastResponseMs;
@@ -184,16 +185,105 @@ int serviceCount = 0;
 // Correlates outgoing status requests with incoming responses by sender hash.
 // ============================================
 #define MAX_PENDING_MESH_CHECKS 8
+#define MESH_STATUS_MIN_ATTEMPT_TIMEOUT_MS 12000UL
+#define MESH_STATUS_MAX_ATTEMPT_TIMEOUT_MS 60000UL
+#define MESH_STATUS_MAX_ATTEMPTS 3
+#define MESH_STATUS_TOTAL_TIMEOUT_MS ((MESH_STATUS_MAX_ATTEMPT_TIMEOUT_MS * MESH_STATUS_MAX_ATTEMPTS) + 3000UL)
 
 struct PendingMeshNodeCheck {
   bool active;
   bool manual;
   uint8_t senderHash;     // First byte of target node's pubkey
   int serviceIdx;         // Index into services[]
+  unsigned long startedMs;
   unsigned long sentMs;   // millis() when request was sent
+  uint32_t timeoutMs;
+  bool usedDirectPath;
+  uint8_t attempts;
+  uint32_t requestTags[MESH_STATUS_MAX_ATTEMPTS];
 };
 
 static PendingMeshNodeCheck pendingMeshChecks[MAX_PENDING_MESH_CHECKS];
+
+struct PendingReciprocalPath {
+  bool active;
+  unsigned long sendAtMs;
+  uint8_t peerPubkey[32];
+  uint8_t directPathLen;
+  uint8_t directPath[64];
+  uint8_t advertisedPathLen;
+  uint8_t advertisedPath[64];
+};
+
+static PendingReciprocalPath pendingReciprocalPath = {};
+static unsigned long meshPeerTrafficNotBeforeMs = 0;
+
+static bool meshPeerTrafficReady() {
+  return !pendingReciprocalPath.active && (long)(millis() - meshPeerTrafficNotBeforeMs) >= 0;
+}
+
+// Remote CLI commands are deliberately serialized. MeshCore replies arrive on
+// the main LoRa receive loop, so blocking here would prevent the reply from
+// being processed. A command is only considered applied after its SET reply is
+// OK and a subsequent GET returns the requested value.
+#define MAX_PENDING_MESH_ADMIN_COMMANDS (MAX_SERVICES * 2)
+#define MESH_ADMIN_RESPONSE_TIMEOUT_MS 15000UL
+#define MESH_ADMIN_RETRY_DELAY_MS 2000UL
+#define MESH_ADMIN_VERIFY_DELAY_MS 1000UL
+#define MESH_ADMIN_MAX_ATTEMPTS 5
+
+enum MeshAdminCommandKind : uint8_t {
+  MESH_ADMIN_TX_POWER,
+  MESH_ADMIN_REPEAT
+};
+
+enum MeshAdminCommandPhase : uint8_t {
+  MESH_ADMIN_QUEUED,
+  MESH_ADMIN_WAIT_SET_REPLY,
+  MESH_ADMIN_WAIT_VERIFY_DELAY,
+  MESH_ADMIN_WAIT_VERIFY_REPLY,
+  MESH_ADMIN_RETRY_DELAY
+};
+
+struct PendingMeshAdminCommand {
+  bool active;
+  int serviceIdx;
+  MeshAdminCommandKind kind;
+  int desiredValue;
+  uint8_t attempts;
+  MeshAdminCommandPhase phase;
+  unsigned long phaseStartedMs;
+};
+
+static PendingMeshAdminCommand pendingMeshAdminCommands[MAX_PENDING_MESH_ADMIN_COMMANDS];
+static int activeMeshAdminCommand = -1;
+
+static void initPendingMeshAdminCommands() {
+  activeMeshAdminCommand = -1;
+  for (int i = 0; i < MAX_PENDING_MESH_ADMIN_COMMANDS; i++) {
+    pendingMeshAdminCommands[i].active = false;
+  }
+}
+
+static bool hasPendingMeshAdminCommands() {
+  for (int i = 0; i < MAX_PENDING_MESH_ADMIN_COMMANDS; i++) {
+    if (pendingMeshAdminCommands[i].active) return true;
+  }
+  return false;
+}
+
+static void cancelPendingMeshAdminCommandsForService(int serviceIdx, bool serviceRemoved = false) {
+  for (int i = 0; i < MAX_PENDING_MESH_ADMIN_COMMANDS; i++) {
+    PendingMeshAdminCommand& pending = pendingMeshAdminCommands[i];
+    if (!pending.active) continue;
+    if (pending.serviceIdx == serviceIdx) {
+      pending.active = false;
+      if (activeMeshAdminCommand == i) activeMeshAdminCommand = -1;
+    } else if (serviceRemoved && pending.serviceIdx > serviceIdx) {
+      pending.serviceIdx--;
+    }
+  }
+}
 
 static void initPendingMeshChecks() {
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
@@ -201,13 +291,20 @@ static void initPendingMeshChecks() {
   }
 }
 
-static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool manual = false) {
+static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool manual, uint32_t requestTag,
+                                     uint32_t timeoutMs, bool usedDirectPath, bool initialSent = true) {
   // Reuse an existing slot for the same hash, or find a free one
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
       pendingMeshChecks[i].serviceIdx = serviceIdx;
+      pendingMeshChecks[i].startedMs = millis();
       pendingMeshChecks[i].sentMs = millis();
+      pendingMeshChecks[i].timeoutMs = timeoutMs;
+      pendingMeshChecks[i].usedDirectPath = usedDirectPath;
       pendingMeshChecks[i].manual = pendingMeshChecks[i].manual || manual;
+      pendingMeshChecks[i].attempts = initialSent ? 1 : 0;
+      memset(pendingMeshChecks[i].requestTags, 0, sizeof(pendingMeshChecks[i].requestTags));
+      if (initialSent) pendingMeshChecks[i].requestTags[0] = requestTag;
       return;
     }
   }
@@ -216,8 +313,14 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool ma
       pendingMeshChecks[i].active = true;
       pendingMeshChecks[i].senderHash = senderHash;
       pendingMeshChecks[i].serviceIdx = serviceIdx;
+      pendingMeshChecks[i].startedMs = millis();
       pendingMeshChecks[i].sentMs = millis();
+      pendingMeshChecks[i].timeoutMs = timeoutMs;
+      pendingMeshChecks[i].usedDirectPath = usedDirectPath;
       pendingMeshChecks[i].manual = manual;
+      pendingMeshChecks[i].attempts = initialSent ? 1 : 0;
+      memset(pendingMeshChecks[i].requestTags, 0, sizeof(pendingMeshChecks[i].requestTags));
+      if (initialSent) pendingMeshChecks[i].requestTags[0] = requestTag;
       return;
     }
   }
@@ -233,14 +336,51 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool ma
   pendingMeshChecks[oldestIdx].active = true;
   pendingMeshChecks[oldestIdx].senderHash = senderHash;
   pendingMeshChecks[oldestIdx].serviceIdx = serviceIdx;
+  pendingMeshChecks[oldestIdx].startedMs = millis();
   pendingMeshChecks[oldestIdx].sentMs = millis();
+  pendingMeshChecks[oldestIdx].timeoutMs = timeoutMs;
+  pendingMeshChecks[oldestIdx].usedDirectPath = usedDirectPath;
   pendingMeshChecks[oldestIdx].manual = manual;
+  pendingMeshChecks[oldestIdx].attempts = initialSent ? 1 : 0;
+  memset(pendingMeshChecks[oldestIdx].requestTags, 0, sizeof(pendingMeshChecks[oldestIdx].requestTags));
+  if (initialSent) pendingMeshChecks[oldestIdx].requestTags[0] = requestTag;
 }
 
-// Returns service index if the given hash matches an active pending check, -1 otherwise.
-static int consumePendingMeshCheck(uint8_t senderHash, bool* wasManual = nullptr) {
+static bool hasPendingMeshCheckForService(int serviceIdx, bool manualOnly = false) {
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (pendingMeshChecks[i].active && pendingMeshChecks[i].serviceIdx == serviceIdx &&
+        (!manualOnly || pendingMeshChecks[i].manual)) return true;
+  }
+  return false;
+}
+
+static void cancelPendingMeshChecksForService(int serviceIdx, bool serviceRemoved = false) {
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    if (!pendingMeshChecks[i].active) continue;
+    if (pendingMeshChecks[i].serviceIdx == serviceIdx) {
+      pendingMeshChecks[i].active = false;
+    } else if (serviceRemoved && pendingMeshChecks[i].serviceIdx > serviceIdx) {
+      pendingMeshChecks[i].serviceIdx--;
+    }
+  }
+}
+
+// Returns the service index only when both the sender and reflected request tag match.
+static int consumePendingMeshCheck(uint8_t senderHash, const uint8_t* response, size_t responseLen,
+                                   bool* wasManual = nullptr) {
+  if (response == nullptr || responseLen < sizeof(uint32_t)) return -1;
+  uint32_t responseTag;
+  memcpy(&responseTag, response, sizeof(responseTag));
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
+      bool tagMatched = false;
+      for (uint8_t attempt = 0; attempt < pendingMeshChecks[i].attempts; attempt++) {
+        if (pendingMeshChecks[i].requestTags[attempt] == responseTag) {
+          tagMatched = true;
+          break;
+        }
+      }
+      if (!tagMatched) continue;
       int idx = pendingMeshChecks[i].serviceIdx;
       if (wasManual != nullptr) *wasManual = pendingMeshChecks[i].manual;
       pendingMeshChecks[i].active = false;
@@ -261,6 +401,8 @@ struct PeerInfo {
   String name;            // Optional human-readable name
   uint32_t lastAdvert;    // Unix timestamp of last advert
   uint8_t nodeType;       // MeshCore appFlags lower nibble: 0=Unknown,1=Client,2=Repeater,3=Router
+  uint8_t outPathLen;     // Encoded MeshCore path length; 0xFF means unknown
+  uint8_t outPath[64];
   bool inUse;
 };
 
@@ -409,7 +551,15 @@ static void clearPeerCache() {
     peers[i].name = "";
     peers[i].lastAdvert = 0;
     peers[i].nodeType = 0;
+    peers[i].outPathLen = 0xFF;
   }
+}
+
+static int findPeerIndexByPubkey(const uint8_t pub[32]) {
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (peers[i].inUse && memcmp(peers[i].ed25519_pub, pub, 32) == 0) return i;
+  }
+  return -1;
 }
 
 static int findPeerIndexByHash(uint8_t hash) {
@@ -431,7 +581,7 @@ static uint8_t computeNodeHashSha256(const uint8_t pub[32]) {
 }
 
 static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint32_t lastAdvert, uint8_t nodeType) {
-  int idx = findPeerIndexByHash(hash);
+  int idx = findPeerIndexByPubkey(pub);
   if (idx < 0) {
     for (int i = 0; i < MAX_PEERS; i++) {
       if (!peers[i].inUse) { idx = i; break; }
@@ -452,8 +602,21 @@ static int upsertPeer(uint8_t hash, const uint8_t *pub, const String &name, uint
   peers[idx].name = clean;
   peers[idx].lastAdvert = lastAdvert;
   peers[idx].nodeType = nodeType;
+  if (!peers[idx].inUse) peers[idx].outPathLen = 0xFF;
   peers[idx].inUse = true;
   return idx;
+}
+
+static void rememberPeerPath(const uint8_t pub[32], const uint8_t* path, uint8_t pathLen) {
+  size_t pathBytes = (size_t)(pathLen & 0x3F) * ((pathLen >> 6) + 1);
+  if (pathBytes > sizeof(peers[0].outPath)) return;
+  int idx = findPeerIndexByPubkey(pub);
+  if (idx < 0) idx = upsertPeer(pub[0], pub, "", 0);
+  if (idx < 0) return;
+  peers[idx].outPathLen = pathLen;
+  if (pathBytes > 0) memcpy(peers[idx].outPath, path, pathBytes);
+  Serial.printf("[LoRa] Learned route to peer 0x%02X (%u hop%s)\n",
+                pub[0], pathLen & 0x3F, (pathLen & 0x3F) == 1 ? "" : "s");
 }
 
 static int ensurePeerFromAdvertCache(uint8_t hash) {
@@ -772,6 +935,10 @@ SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 // that arrived while other work was running (notably delayed MeshCore replies).
 static volatile bool loraPacketReceived = false;
 static SemaphoreHandle_t loraRadioMutex = nullptr;
+static uint32_t loraRxActivityAtMs = 0;
+static bool loraRxHeaderSeen = false;
+static uint32_t loraPreambleDeadlineMs = 66;
+static uint32_t loraPayloadDeadlineMs = 3934;
 
 static void IRAM_ATTR onLoraPacketReceived() {
   loraPacketReceived = true;
@@ -781,20 +948,98 @@ static void ensureLoraRadioMutex() {
   if (loraRadioMutex == nullptr) loraRadioMutex = xSemaphoreCreateMutex();
 }
 
+static int16_t startLoRaReceive() {
+  // Keep preamble/header IRQ state available for receive-before-transmit
+  // arbitration without raising DIO1 until a complete packet is ready.
+  return radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF,
+                            RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED),
+                            RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+}
+
+// Match MeshCore's SX1262 receive arbitration. Preamble/header IRQ bits remain
+// latched until explicitly cleared, so treating either bit as an unconditional
+// "radio busy" indication can permanently prevent subsequent requests. The
+// deadlines are calculated for the active modulation during setup.
+static bool isLoRaReceptionInProgress() {
+  uint32_t irqFlags = radio.getIrqFlags();
+  bool preamble = irqFlags & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED;
+  bool header = irqFlags & RADIOLIB_SX126X_IRQ_HEADER_VALID;
+  bool headerError = irqFlags & RADIOLIB_SX126X_IRQ_HEADER_ERR;
+  uint32_t now = millis();
+  const uint32_t activityFlags = RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED |
+                                 RADIOLIB_SX126X_IRQ_SYNC_WORD_VALID |
+                                 RADIOLIB_SX126X_IRQ_HEADER_VALID |
+                                 RADIOLIB_SX126X_IRQ_HEADER_ERR;
+
+  if (loraPacketReceived || (irqFlags & RADIOLIB_SX126X_IRQ_RX_DONE)) return true;
+
+  if (headerError) {
+    radio.clearIrqFlags(activityFlags);
+    loraRxActivityAtMs = 0;
+    loraRxHeaderSeen = false;
+    return false;
+  }
+
+  if (!header && loraRxHeaderSeen) {
+    loraRxActivityAtMs = 0;
+    loraRxHeaderSeen = false;
+    return false;
+  }
+
+  if (header) {
+    if (!loraRxHeaderSeen) {
+      loraRxHeaderSeen = true;
+      loraRxActivityAtMs = now;
+    }
+    if (now - loraRxActivityAtMs <= loraPayloadDeadlineMs) return true;
+
+    Serial.printf("[LoRa] Clearing stale header IRQ after %lu ms\n",
+                  (unsigned long)loraPayloadDeadlineMs);
+    radio.clearIrqFlags(activityFlags);
+    loraRxActivityAtMs = 0;
+    loraRxHeaderSeen = false;
+    return false;
+  }
+
+  if (preamble) {
+    if (loraRxActivityAtMs == 0) loraRxActivityAtMs = now;
+    if (now - loraRxActivityAtMs <= loraPreambleDeadlineMs) return true;
+
+    Serial.printf("[LoRa] Clearing stale preamble IRQ after %lu ms\n",
+                  (unsigned long)loraPreambleDeadlineMs);
+    radio.clearIrqFlags(RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
+    loraRxActivityAtMs = 0;
+    return false;
+  }
+
+  loraRxActivityAtMs = 0;
+  loraRxHeaderSeen = false;
+  return false;
+}
+
 // Serializes radio access between the main loop and AsyncWebServer callbacks,
 // then immediately restores continuous RX after a blocking transmission.
-static int16_t transmitLoRaPacket(const uint8_t* packet, size_t packetLen) {
+static int16_t transmitLoRaPacket(const uint8_t* packet, size_t packetLen, uint32_t* airtimeMs = nullptr) {
   ensureLoraRadioMutex();
   if (loraRadioMutex == nullptr || xSemaphoreTake(loraRadioMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
     Serial.println("[LoRa] Failed to acquire radio for transmit");
     return RADIOLIB_ERR_UNKNOWN;
   }
 
+  if (isLoRaReceptionInProgress()) {
+    xSemaphoreGive(loraRadioMutex);
+    Serial.println("[LoRa] Deferred transmit: packet reception is in progress");
+    return RADIOLIB_PREAMBLE_DETECTED;
+  }
+
   loraPacketReceived = false;
+  if (airtimeMs != nullptr) {
+    *airtimeMs = (uint32_t)((radio.getTimeOnAir(packetLen) + 999UL) / 1000UL);
+  }
   int16_t state = radio.transmit(packet, packetLen);
   // DIO1 also asserts for TX-done; clear that event before arming RX.
   loraPacketReceived = false;
-  int16_t rxState = radio.startReceive();
+  int16_t rxState = startLoRaReceive();
   if (rxState != RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa] Failed to resume receive mode, code: %d\n", rxState);
   }
@@ -2336,9 +2581,23 @@ static void resetMeshBatteryRuntime(Service& svc) {
   svc.meshLastBatteryV = 0.0f;
   svc.meshLastResponseMs = 0;
   svc.meshRepeaterKnownState = true;
-  svc.meshRepeaterStateKnown = false;
+  // MeshCore repeaters default to forwarding. Treat that as the initial cached
+  // value so an "on" policy does not generate a redundant command.
+  svc.meshRepeaterStateKnown = true;
   svc.meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
   svc.meshAppliedBatteryLevel = -1;
+}
+
+static void readMeshCommandCache(JsonVariantConst source, Service& svc) {
+  if (!source["meshRepeaterKnownState"].isNull()) {
+    svc.meshRepeaterKnownState = source["meshRepeaterKnownState"].as<bool>();
+  }
+  if (!source["meshRepeaterStateKnown"].isNull()) {
+    svc.meshRepeaterStateKnown = source["meshRepeaterStateKnown"].as<bool>();
+  }
+  if (!source["meshKnownTxPower"].isNull()) {
+    svc.meshKnownTxPower = source["meshKnownTxPower"].as<int>();
+  }
 }
 
 // Reads the new array format or migrates the previous low/high repeat thresholds.
@@ -2397,6 +2656,11 @@ void saveServices() {
     // MeshCore Node fields
     svc["meshNodePubkey"] = services[i].meshNodePubkey;
     svc["meshRepeaterControl"] = services[i].meshRepeaterControl;
+    svc["meshRepeaterKnownState"] = services[i].meshRepeaterKnownState;
+    svc["meshRepeaterStateKnown"] = services[i].meshRepeaterStateKnown;
+    if (services[i].meshKnownTxPower != MESH_TX_POWER_UNCHANGED) {
+      svc["meshKnownTxPower"] = services[i].meshKnownTxPower;
+    }
     writeMeshBatteryLevels(svc, services[i]);
   }
   
@@ -2485,6 +2749,7 @@ void loadServices() {
                     services[serviceCount].name.c_str(), policyError.c_str());
     }
     resetMeshBatteryRuntime(services[serviceCount]);
+    readMeshCommandCache(svc, services[serviceCount]);
 
     if (services[serviceCount].type == TYPE_PUSH && services[serviceCount].pushToken.length() == 0) {
       services[serviceCount].pushToken = generatePushToken();
@@ -2650,26 +2915,17 @@ void checkAllServices() {
     }
   }
 
-  // Clear unanswered automatic requests so another node can use the radio.
-  // Manual checks own their timeout lifecycle through the result endpoint.
-  unsigned long nowMs = millis();
-  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
-    PendingMeshNodeCheck& pending = pendingMeshChecks[i];
-    if (!pending.active || pending.manual || (unsigned long)(nowMs - pending.sentMs) < 15000UL) continue;
-    if (pending.serviceIdx >= 0 && pending.serviceIdx < serviceCount) {
-      services[pending.serviceIdx].lastError = "MeshCore response timeout";
-      Serial.printf("[MeshNode] Automatic status request timed out for '%s'\n",
-                    services[pending.serviceIdx].name.c_str());
-    }
-    pending.active = false;
-  }
-
   // MeshCore is half-duplex and repeaters deliberately delay flood responses.
   // Keep only one request outstanding to prevent later transmissions from
   // masking or colliding with an earlier node's response.
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     if (pendingMeshChecks[i].active) return;
   }
+
+  // Do not interleave scheduled status traffic with the serialized remote CLI
+  // workflow. The admin command engine continues from loop().
+  if (hasPendingMeshAdminCommands()) return;
+  if (!meshPeerTrafficReady()) return;
 
   static int meshScheduleCursor = 0;
   if (serviceCount <= 0) return;
@@ -2681,8 +2937,12 @@ void checkAllServices() {
     svc.lastCronMinute = cronMinute;
     if (!cronMatches(svc.cronExpression, utc)) continue;
 
-    executeServiceCheck(svc);
     svc.lastAutomaticCheck = millis();
+    bool requestSent = false;
+    checkMeshNode(svc, false, &requestSent);
+    // MeshCore checks complete asynchronously. Only an immediate send failure
+    // is a result here; successful transmissions are resolved on reply/timeout.
+    if (!requestSent) updateServiceStatus(svc, false);
     meshScheduleCursor = (i + 1) % serviceCount;
     break;
   }
@@ -2933,6 +3193,7 @@ void initNodeIdentity() {
 
   clearPeerCache();
   initPendingMeshChecks();
+  initPendingMeshAdminCommands();
 }
 
 static String getOurMeshPublicKeyHex() {
@@ -2953,7 +3214,8 @@ static uint32_t nextMeshCommandTimestamp() {
 // Encrypt and send a MeshCore peer payload using this monitor's node identity.
 static bool sendLoRaPeerPayload(uint8_t payloadType, const uint8_t* plaintext, size_t plaintextLen,
                                const String& logText, const uint8_t* destPubKey, uint8_t destHash,
-                               const uint8_t* replyPath, size_t replyPathLen) {
+                               const uint8_t* replyPath, size_t replyPathLen,
+                               uint32_t* suggestedTimeoutMs = nullptr) {
   if (!settings.loraEnabled) return false;
 
   if (destPubKey == nullptr) {
@@ -2984,7 +3246,7 @@ static bool sendLoRaPeerPayload(uint8_t payloadType, const uint8_t* plaintext, s
   
   // Determine routing: DIRECT if we have sender path, otherwise FLOOD
   size_t replyPathBytes = (replyPathLen & 0x3F) * ((replyPathLen >> 6) + 1);
-  bool useDirect = (replyPath != nullptr && replyPathBytes > 0);
+  bool useDirect = (replyPath != nullptr && replyPathBytes <= 64);
   uint8_t routeType = useDirect ? ROUTE_TYPE_DIRECT : ROUTE_TYPE_FLOOD;
   
   // Header: version(0) + payload type + route type
@@ -3017,9 +3279,17 @@ static bool sendLoRaPeerPayload(uint8_t payloadType, const uint8_t* plaintext, s
   }
   memcpy(packet + pktIdx, macAndCipher, macCipherLen);
   pktIdx += macCipherLen;
-  
+
   // Transmit
-  int state = transmitLoRaPacket(packet, pktIdx);
+  uint32_t airtimeMs = 0;
+  int state = transmitLoRaPacket(packet, pktIdx, suggestedTimeoutMs != nullptr ? &airtimeMs : nullptr);
+  if (suggestedTimeoutMs != nullptr) {
+    uint32_t estimate = useDirect
+      ? 500UL + ((airtimeMs * 6UL + 250UL) * ((replyPathLen & 0x3F) + 1UL))
+      : 500UL + airtimeMs * 16UL;
+    *suggestedTimeoutMs = constrain(estimate, MESH_STATUS_MIN_ATTEMPT_TIMEOUT_MS,
+                                    MESH_STATUS_MAX_ATTEMPT_TIMEOUT_MS);
+  }
   bool success = (state == RADIOLIB_ERR_NONE);
   if (success) {
     Serial.printf("[LoRa] Sent peer payload type %u: %s (len=%u)\n",
@@ -3056,7 +3326,8 @@ bool sendLoRaDirectMessage(const String& message, const uint8_t* destPubKey, uin
 }
 
 // Send a remote CLI command. The repeater authorizes it from the sender's ACL role.
-static bool sendLoRaAdminCommand(const String& command, const uint8_t* destPubKey, uint8_t destHash) {
+static bool sendLoRaAdminCommand(const String& command, const uint8_t* destPubKey, uint8_t destHash,
+                                 const uint8_t* outPath = nullptr, uint8_t outPathLen = 0) {
   size_t textLen = command.length();
   if (textLen > 220) textLen = 220;
 
@@ -3066,20 +3337,66 @@ static bool sendLoRaAdminCommand(const String& command, const uint8_t* destPubKe
   plaintext[4] = TXT_TYPE_CLI_DATA << 2;
   memcpy(&plaintext[5], command.c_str(), textLen);
   return sendLoRaPeerPayload(PAYLOAD_TYPE_TXT, plaintext, 5 + textLen, "admin: " + command,
-                             destPubKey, destHash, nullptr, 0);
+                             destPubKey, destHash, outPath, outPathLen);
 }
 
 // Send MeshCore's native repeater status request. ACL membership replaces PIN login.
-static bool sendLoRaStatusRequest(const uint8_t* destPubKey, uint8_t destHash) {
+static bool sendLoRaStatusRequest(const uint8_t* destPubKey, uint8_t destHash, uint32_t& requestTag,
+                                  uint32_t& suggestedTimeoutMs, const uint8_t* outPath = nullptr,
+                                  uint8_t outPathLen = 0) {
   uint8_t plaintext[13];
-  uint32_t timestamp = nextMeshCommandTimestamp();
-  memcpy(plaintext, &timestamp, sizeof(timestamp));
+  requestTag = nextMeshCommandTimestamp();
+  memcpy(plaintext, &requestTag, sizeof(requestTag));
   plaintext[4] = REQ_TYPE_GET_STATUS;
   memset(&plaintext[5], 0, 4);  // reserved by the MeshCore request format
   uint32_t nonce = esp_random();
   memcpy(&plaintext[9], &nonce, sizeof(nonce));
   return sendLoRaPeerPayload(PAYLOAD_TYPE_REQ, plaintext, sizeof(plaintext), "status request",
-                             destPubKey, destHash, nullptr, 0);
+                             destPubKey, destHash, outPath, outPathLen, &suggestedTimeoutMs);
+}
+
+static void scheduleReciprocalPath(const uint8_t peerPubkey[32], const uint8_t* directPath,
+                                   uint8_t directPathLen, const uint8_t* advertisedPath,
+                                   uint8_t advertisedPathLen, uint32_t delayMs = 500UL) {
+  size_t directBytes = (size_t)(directPathLen & 0x3F) * ((directPathLen >> 6) + 1);
+  size_t advertisedBytes = (size_t)(advertisedPathLen & 0x3F) * ((advertisedPathLen >> 6) + 1);
+  if (directBytes > sizeof(pendingReciprocalPath.directPath) ||
+      advertisedBytes > sizeof(pendingReciprocalPath.advertisedPath)) return;
+
+  pendingReciprocalPath.active = true;
+  pendingReciprocalPath.sendAtMs = millis() + delayMs;
+  memcpy(pendingReciprocalPath.peerPubkey, peerPubkey, sizeof(pendingReciprocalPath.peerPubkey));
+  pendingReciprocalPath.directPathLen = directPathLen;
+  pendingReciprocalPath.advertisedPathLen = advertisedPathLen;
+  if (directBytes > 0) memcpy(pendingReciprocalPath.directPath, directPath, directBytes);
+  if (advertisedBytes > 0) memcpy(pendingReciprocalPath.advertisedPath, advertisedPath, advertisedBytes);
+}
+
+static void processPendingReciprocalPath() {
+  if (!pendingReciprocalPath.active || (long)(millis() - pendingReciprocalPath.sendAtMs) < 0) return;
+
+  uint8_t plaintext[70];
+  size_t plaintextLen = 0;
+  size_t advertisedBytes = (size_t)(pendingReciprocalPath.advertisedPathLen & 0x3F) *
+                           ((pendingReciprocalPath.advertisedPathLen >> 6) + 1);
+  plaintext[plaintextLen++] = pendingReciprocalPath.advertisedPathLen;
+  if (advertisedBytes > 0) {
+    memcpy(&plaintext[plaintextLen], pendingReciprocalPath.advertisedPath, advertisedBytes);
+    plaintextLen += advertisedBytes;
+  }
+  plaintext[plaintextLen++] = 0xFF;  // no embedded payload
+  uint32_t nonce = esp_random();
+  memcpy(&plaintext[plaintextLen], &nonce, sizeof(nonce));
+  plaintextLen += sizeof(nonce);
+
+  bool sent = sendLoRaPeerPayload(PAYLOAD_TYPE_PATH, plaintext, plaintextLen, "reciprocal path",
+                                  pendingReciprocalPath.peerPubkey, pendingReciprocalPath.peerPubkey[0],
+                                  pendingReciprocalPath.directPath,
+                                  pendingReciprocalPath.directPathLen);
+  Serial.printf("[MeshNode] Reciprocal path %s to peer 0x%02X\n",
+                sent ? "sent" : "failed", pendingReciprocalPath.peerPubkey[0]);
+  pendingReciprocalPath.active = false;
+  meshPeerTrafficNotBeforeMs = millis() + 250UL;
 }
 
 static uint32_t computeAckHash(const uint8_t* data, size_t dataLen, const uint8_t senderPubKey[32]) {
@@ -3946,8 +4263,10 @@ bool checkUptime(Service& service) {
 }
 
 // Forward declarations for MeshCore node check functions
-static bool sendMeshRepeaterCommand(Service& svc, bool enable);
 static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t len);
+static void processPendingMeshChecks();
+static void processPendingMeshAdminCommands();
+static void processMeshAdminResponse(const uint8_t senderPubKey[32], const String& response);
 
 // ============================================
 // MeshCore Node Monitor Functions
@@ -3973,30 +4292,193 @@ static bool sendMeshNodeAdminCommand(Service& svc, const String& command) {
     Serial.printf("[MeshNode] Invalid pubkey for service '%s'\n", svc.name.c_str());
     return false;
   }
-  return sendLoRaAdminCommand(command, pubkeyBytes, pubkeyBytes[0]);
+  const uint8_t* outPath = nullptr;
+  uint8_t outPathLen = 0;
+  int peerIdx = findPeerIndexByPubkey(pubkeyBytes);
+  if (peerIdx >= 0 && peers[peerIdx].outPathLen != 0xFF) {
+    outPath = peers[peerIdx].outPath;
+    outPathLen = peers[peerIdx].outPathLen;
+  }
+  return sendLoRaAdminCommand(command, pubkeyBytes, pubkeyBytes[0], outPath, outPathLen);
 }
 
-static bool sendMeshRepeaterCommand(Service& svc, bool enable) {
-  bool ok = sendMeshNodeAdminCommand(svc, String("set repeat ") + (enable ? "on" : "off"));
-  if (ok) {
-    svc.meshRepeaterKnownState = enable;
-    svc.meshRepeaterStateKnown = true;
-    Serial.printf("[MeshNode] Sent 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
-  } else {
-    Serial.printf("[MeshNode] Failed to send 'repeater %s' to %s\n", enable ? "on" : "off", svc.name.c_str());
+static String meshAdminSetCommand(const PendingMeshAdminCommand& pending) {
+  if (pending.kind == MESH_ADMIN_REPEAT) {
+    return String("set repeat ") + (pending.desiredValue ? "on" : "off");
   }
-  return ok;
+  return "set tx " + String(pending.desiredValue);
 }
 
-static bool sendMeshTxPowerCommand(Service& svc, int txPower) {
-  bool ok = sendMeshNodeAdminCommand(svc, "set tx " + String(txPower));
-  if (ok) {
-    svc.meshKnownTxPower = txPower;
-    Serial.printf("[MeshNode] Sent 'set tx %d' to %s\n", txPower, svc.name.c_str());
-  } else {
-    Serial.printf("[MeshNode] Failed to send 'set tx %d' to %s\n", txPower, svc.name.c_str());
+static String meshAdminGetCommand(const PendingMeshAdminCommand& pending) {
+  return pending.kind == MESH_ADMIN_REPEAT ? "get repeat" : "get tx";
+}
+
+static String meshAdminExpectedResponse(const PendingMeshAdminCommand& pending) {
+  if (pending.kind == MESH_ADMIN_REPEAT) {
+    return String("> ") + (pending.desiredValue ? "on" : "off");
   }
-  return ok;
+  return "> " + String(pending.desiredValue);
+}
+
+static void refreshMeshAppliedBatteryLevel(Service& svc) {
+  svc.meshAppliedBatteryLevel = -1;
+  for (size_t i = 0; i < svc.meshBatteryLevels.size(); i++) {
+    const Service::MeshBatteryLevel& level = svc.meshBatteryLevels[i];
+    if (svc.meshLastBatteryPct < level.minPct || svc.meshLastBatteryPct > level.maxPct) continue;
+    bool txMatches = level.txPower == MESH_TX_POWER_UNCHANGED || svc.meshKnownTxPower == level.txPower;
+    bool repeatMatches = svc.meshRepeaterStateKnown && svc.meshRepeaterKnownState == level.repeat;
+    if (txMatches && repeatMatches) svc.meshAppliedBatteryLevel = (int)i;
+    return;
+  }
+}
+
+static bool queueMeshAdminCommand(int serviceIdx, MeshAdminCommandKind kind, int desiredValue) {
+  for (int i = 0; i < MAX_PENDING_MESH_ADMIN_COMMANDS; i++) {
+    PendingMeshAdminCommand& pending = pendingMeshAdminCommands[i];
+    if (!pending.active || pending.serviceIdx != serviceIdx || pending.kind != kind) continue;
+    // If policy changed while still queued, replace the old target. An in-flight
+    // command finishes first so its response cannot be mistaken for the new one.
+    if (pending.phase == MESH_ADMIN_QUEUED || pending.phase == MESH_ADMIN_RETRY_DELAY) {
+      pending.desiredValue = desiredValue;
+      pending.attempts = 0;
+      pending.phase = MESH_ADMIN_QUEUED;
+    }
+    return true;
+  }
+  for (int i = 0; i < MAX_PENDING_MESH_ADMIN_COMMANDS; i++) {
+    if (pendingMeshAdminCommands[i].active) continue;
+    pendingMeshAdminCommands[i] = {true, serviceIdx, kind, desiredValue, 0, MESH_ADMIN_QUEUED, millis()};
+    Serial.printf("[MeshNode] Queued verified admin command for '%s': %s\n",
+                  services[serviceIdx].name.c_str(), meshAdminSetCommand(pendingMeshAdminCommands[i]).c_str());
+    return true;
+  }
+  Serial.println("[MeshNode] Admin command queue is full");
+  return false;
+}
+
+static void retryOrFailMeshAdminCommand(PendingMeshAdminCommand& pending, const String& reason) {
+  if (pending.attempts >= MESH_ADMIN_MAX_ATTEMPTS) {
+    if (pending.serviceIdx >= 0 && pending.serviceIdx < serviceCount) {
+      Service& svc = services[pending.serviceIdx];
+      svc.lastError = "Admin command not verified after " + String(pending.attempts) + " attempts";
+      svc.meshAppliedBatteryLevel = -1;
+      Serial.printf("[MeshNode] Giving up '%s' for '%s' this cycle: %s\n",
+                    meshAdminSetCommand(pending).c_str(), svc.name.c_str(), reason.c_str());
+    }
+    pending.active = false;
+    activeMeshAdminCommand = -1;
+    return;
+  }
+  pending.phase = MESH_ADMIN_RETRY_DELAY;
+  pending.phaseStartedMs = millis();
+  Serial.printf("[MeshNode] Will retry '%s' after delay (attempt %u/%u): %s\n",
+                meshAdminSetCommand(pending).c_str(), pending.attempts,
+                MESH_ADMIN_MAX_ATTEMPTS, reason.c_str());
+}
+
+static void completeMeshAdminCommand(PendingMeshAdminCommand& pending) {
+  if (pending.serviceIdx >= 0 && pending.serviceIdx < serviceCount) {
+    Service& svc = services[pending.serviceIdx];
+    if (pending.kind == MESH_ADMIN_REPEAT) {
+      svc.meshRepeaterKnownState = pending.desiredValue != 0;
+      svc.meshRepeaterStateKnown = true;
+    } else {
+      svc.meshKnownTxPower = pending.desiredValue;
+    }
+    refreshMeshAppliedBatteryLevel(svc);
+    saveServices();
+    Serial.printf("[MeshNode] Verified '%s' took effect on '%s'\n",
+                  meshAdminSetCommand(pending).c_str(), svc.name.c_str());
+  }
+  pending.active = false;
+  activeMeshAdminCommand = -1;
+}
+
+static void processMeshAdminResponse(const uint8_t senderPubKey[32], const String& response) {
+  if (activeMeshAdminCommand < 0 || activeMeshAdminCommand >= MAX_PENDING_MESH_ADMIN_COMMANDS) return;
+  PendingMeshAdminCommand& pending = pendingMeshAdminCommands[activeMeshAdminCommand];
+  if (!pending.active || pending.serviceIdx < 0 || pending.serviceIdx >= serviceCount) return;
+
+  uint8_t pubkeyBytes[32];
+  if (!parseHexKeyToBytes(services[pending.serviceIdx].meshNodePubkey, pubkeyBytes) ||
+      senderPubKey == nullptr || memcmp(senderPubKey, pubkeyBytes, sizeof(pubkeyBytes)) != 0) return;
+
+  String reply = response;
+  reply.trim();
+  if (pending.phase == MESH_ADMIN_WAIT_SET_REPLY) {
+    if (reply.equalsIgnoreCase("OK") || reply.startsWith("OK ") || reply.startsWith("OK -")) {
+      pending.phase = MESH_ADMIN_WAIT_VERIFY_DELAY;
+      pending.phaseStartedMs = millis();
+      Serial.printf("[MeshNode] '%s' acknowledged; scheduling read-back\n",
+                    meshAdminSetCommand(pending).c_str());
+    } else {
+      retryOrFailMeshAdminCommand(pending, "node replied: " + reply);
+    }
+  } else if (pending.phase == MESH_ADMIN_WAIT_VERIFY_REPLY) {
+    if (reply.equalsIgnoreCase(meshAdminExpectedResponse(pending))) {
+      completeMeshAdminCommand(pending);
+    } else {
+      retryOrFailMeshAdminCommand(pending, "read-back was '" + reply + "'");
+    }
+  }
+}
+
+static void processPendingMeshAdminCommands() {
+  unsigned long nowMs = millis();
+  if (!meshPeerTrafficReady()) return;
+  if (activeMeshAdminCommand < 0) {
+    for (int i = 0; i < MAX_PENDING_MESH_ADMIN_COMMANDS; i++) {
+      if (pendingMeshAdminCommands[i].active) {
+        activeMeshAdminCommand = i;
+        break;
+      }
+    }
+  }
+  if (activeMeshAdminCommand < 0) return;
+
+  PendingMeshAdminCommand& pending = pendingMeshAdminCommands[activeMeshAdminCommand];
+  if (!pending.active || pending.serviceIdx < 0 || pending.serviceIdx >= serviceCount) {
+    pending.active = false;
+    activeMeshAdminCommand = -1;
+    return;
+  }
+  Service& svc = services[pending.serviceIdx];
+
+  if (pending.phase == MESH_ADMIN_RETRY_DELAY) {
+    if ((unsigned long)(nowMs - pending.phaseStartedMs) < MESH_ADMIN_RETRY_DELAY_MS) return;
+    pending.phase = MESH_ADMIN_QUEUED;
+  }
+  if (pending.phase == MESH_ADMIN_QUEUED) {
+    pending.attempts++;
+    String command = meshAdminSetCommand(pending);
+    if (sendMeshNodeAdminCommand(svc, command)) {
+      pending.phase = MESH_ADMIN_WAIT_SET_REPLY;
+      pending.phaseStartedMs = nowMs;
+      Serial.printf("[MeshNode] Sent '%s' to '%s' (attempt %u/%u); waiting for OK\n",
+                    command.c_str(), svc.name.c_str(), pending.attempts, MESH_ADMIN_MAX_ATTEMPTS);
+    } else {
+      retryOrFailMeshAdminCommand(pending, "radio transmit failed");
+    }
+    return;
+  }
+  if (pending.phase == MESH_ADMIN_WAIT_VERIFY_DELAY) {
+    if ((unsigned long)(nowMs - pending.phaseStartedMs) < MESH_ADMIN_VERIFY_DELAY_MS) return;
+    String command = meshAdminGetCommand(pending);
+    if (sendMeshNodeAdminCommand(svc, command)) {
+      pending.phase = MESH_ADMIN_WAIT_VERIFY_REPLY;
+      pending.phaseStartedMs = nowMs;
+      Serial.printf("[MeshNode] Sent '%s' to verify '%s'\n",
+                    command.c_str(), meshAdminSetCommand(pending).c_str());
+    } else {
+      retryOrFailMeshAdminCommand(pending, "verification transmit failed");
+    }
+    return;
+  }
+  if ((pending.phase == MESH_ADMIN_WAIT_SET_REPLY || pending.phase == MESH_ADMIN_WAIT_VERIFY_REPLY) &&
+      (unsigned long)(nowMs - pending.phaseStartedMs) >= MESH_ADMIN_RESPONSE_TIMEOUT_MS) {
+    retryOrFailMeshAdminCommand(pending,
+      pending.phase == MESH_ADMIN_WAIT_SET_REPLY ? "no SET reply" : "no read-back reply");
+  }
 }
 
 static void applyMeshBatteryPolicy(Service& svc) {
@@ -4023,17 +4505,19 @@ static void applyMeshBatteryPolicy(Service& svc) {
   Serial.printf("[MeshNode] Applying battery level %d-%d%% to %s\n",
                 level.minPct, level.maxPct, svc.name.c_str());
 
-  bool allApplied = true;
+  int svcIdx = -1;
+  for (int i = 0; i < serviceCount; i++) {
+    if (&services[i] == &svc) { svcIdx = i; break; }
+  }
+  if (svcIdx < 0) return;
+
   if (level.txPower != MESH_TX_POWER_UNCHANGED && svc.meshKnownTxPower != level.txPower) {
-    bool txApplied = sendMeshTxPowerCommand(svc, level.txPower);
-    allApplied = txApplied && allApplied;
-    if (txApplied) delay(250);
+    queueMeshAdminCommand(svcIdx, MESH_ADMIN_TX_POWER, level.txPower);
   }
-  if (!svc.meshRepeaterStateKnown || svc.meshRepeaterKnownState != level.repeat) {
-    bool repeatChanged = sendMeshRepeaterCommand(svc, level.repeat);
-    allApplied = repeatChanged && allApplied;
+  if (svc.meshRepeaterKnownState != level.repeat) {
+    queueMeshAdminCommand(svcIdx, MESH_ADMIN_REPEAT, level.repeat ? 1 : 0);
   }
-  if (allApplied) svc.meshAppliedBatteryLevel = levelIndex;
+  refreshMeshAppliedBatteryLevel(svc);
 }
 
 // Parse MeshCore's binary repeater status response. The response begins with the
@@ -4067,6 +4551,68 @@ static void processMeshNodeResponse(int serviceIdx, const uint8_t* data, size_t 
   }
 }
 
+static bool sendMeshStatusAttempt(Service& svc, const uint8_t pubkeyBytes[32], uint32_t& requestTag,
+                                  uint32_t& timeoutMs, bool& usedDirectPath) {
+  const uint8_t* outPath = nullptr;
+  uint8_t outPathLen = 0;
+  int peerIdx = findPeerIndexByPubkey(pubkeyBytes);
+  if (peerIdx >= 0 && peers[peerIdx].outPathLen != 0xFF) {
+    outPath = peers[peerIdx].outPath;
+    outPathLen = peers[peerIdx].outPathLen;
+  }
+  usedDirectPath = outPath != nullptr;
+  return sendLoRaStatusRequest(pubkeyBytes, pubkeyBytes[0], requestTag, timeoutMs, outPath, outPathLen);
+}
+
+static void processPendingMeshChecks() {
+  if (!meshPeerTrafficReady()) return;
+  unsigned long nowMs = millis();
+  for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+    PendingMeshNodeCheck& pending = pendingMeshChecks[i];
+    if (!pending.active || (unsigned long)(nowMs - pending.sentMs) < pending.timeoutMs) continue;
+    if (pending.serviceIdx < 0 || pending.serviceIdx >= serviceCount) {
+      pending.active = false;
+      continue;
+    }
+
+    Service& svc = services[pending.serviceIdx];
+    if (pending.attempts >= MESH_STATUS_MAX_ATTEMPTS ||
+        (unsigned long)(nowMs - pending.startedMs) >= MESH_STATUS_TOTAL_TIMEOUT_MS) {
+      pending.active = false;
+      svc.lastError = "MeshCore response timeout after " + String(pending.attempts) + " attempts";
+      updateServiceStatus(svc, false);
+      Serial.printf("[MeshNode] Status request timed out for '%s' after %u attempts\n",
+                    svc.name.c_str(), pending.attempts);
+      continue;
+    }
+
+    uint8_t pubkeyBytes[32];
+    uint32_t requestTag = 0;
+    uint32_t timeoutMs = MESH_STATUS_MIN_ATTEMPT_TIMEOUT_MS;
+    bool usedDirectPath = false;
+    bool hasValidPubkey = parseHexKeyToBytes(svc.meshNodePubkey, pubkeyBytes);
+    if (hasValidPubkey && pending.usedDirectPath) {
+      int peerIdx = findPeerIndexByPubkey(pubkeyBytes);
+      if (peerIdx >= 0) {
+        peers[peerIdx].outPathLen = 0xFF;
+        Serial.printf("[MeshNode] Direct route to '%s' timed out; retrying by flood\n", svc.name.c_str());
+      }
+    }
+    bool sent = hasValidPubkey &&
+                sendMeshStatusAttempt(svc, pubkeyBytes, requestTag, timeoutMs, usedDirectPath);
+    if (sent) {
+      pending.requestTags[pending.attempts] = requestTag;
+      pending.attempts++;
+    }
+    pending.sentMs = nowMs;
+    pending.timeoutMs = sent ? timeoutMs : 500UL;
+    pending.usedDirectPath = usedDirectPath;
+    Serial.printf("[MeshNode] %s status request to '%s' (attempt %u/%u, timeout %ums)\n",
+                  sent ? "Retried" : "Deferred", svc.name.c_str(), pending.attempts,
+                  MESH_STATUS_MAX_ATTEMPTS, timeoutMs);
+  }
+}
+
 // Send a native status request. The repeater identifies and authorizes this
 // monitor by its public key in Access Control; no password/PIN login is sent.
 // Returns true if a response arrived since the previous scheduled check.
@@ -4097,18 +4643,37 @@ bool checkMeshNode(Service& svc, bool manualCheck, bool* requestSent) {
   upsertPeer(pubkeyBytes[0], pubkeyBytes, svc.name, 0);
   updateAdvertCache(pubkeyBytes, svc.name, 0);
 
-  bool sent = sendLoRaStatusRequest(pubkeyBytes, pubkeyBytes[0]);
-  if (requestSent != nullptr) *requestSent = sent;
-  if (sent && svcIdx >= 0) {
-    registerPendingMeshCheck(pubkeyBytes[0], svcIdx, manualCheck);
-    Serial.printf("[MeshNode] Sent status request to '%s' (hash=0x%02X)\n",
-                  svc.name.c_str(), pubkeyBytes[0]);
+  // A manual check can join an already-running automatic request instead of
+  // transmitting over its reply window.
+  if (svcIdx >= 0 && hasPendingMeshCheckForService(svcIdx)) {
+    for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
+      if (pendingMeshChecks[i].active && pendingMeshChecks[i].serviceIdx == svcIdx) {
+        pendingMeshChecks[i].manual = pendingMeshChecks[i].manual || manualCheck;
+      }
+    }
+    if (requestSent != nullptr) *requestSent = true;
+    svc.lastError = "Waiting for MeshCore response";
+    return false;
+  }
+
+  uint32_t requestTag = 0;
+  uint32_t timeoutMs = MESH_STATUS_MIN_ATTEMPT_TIMEOUT_MS;
+  bool usedDirectPath = false;
+  bool sent = sendMeshStatusAttempt(svc, pubkeyBytes, requestTag, timeoutMs, usedDirectPath);
+  bool queued = svcIdx >= 0;
+  if (requestSent != nullptr) *requestSent = sent || queued;
+  if (queued) {
+    registerPendingMeshCheck(pubkeyBytes[0], svcIdx, manualCheck, requestTag,
+                             sent ? timeoutMs : 500UL, usedDirectPath, sent);
+    Serial.printf("[MeshNode] %s %s status request to '%s' (hash=0x%02X, timeout=%ums)\n",
+                  sent ? "Sent" : "Queued", usedDirectPath ? "direct" : "flood",
+                  svc.name.c_str(), pubkeyBytes[0], sent ? timeoutMs : 500UL);
   }
 
   // Determine result based on whether we've received a fresh response recently
   if (svc.meshLastResponseMs == 0) {
     // Never received a response yet
-    svc.lastError = sent ? "Waiting for ACL-authorized response" : "LoRa send failed";
+    svc.lastError = (sent || queued) ? "Waiting for ACL-authorized response" : "LoRa send failed";
     return false;
   }
 
@@ -6074,6 +6639,7 @@ void setup() {
               svc.meshRepeaterControl = false;
             }
             resetMeshBatteryRuntime(svc);
+            readMeshCommandCache(obj, svc);
             svc.consecutivePasses = 0;
             svc.consecutiveFails = 0;
             svc.isUp = false;
@@ -6208,6 +6774,13 @@ void setup() {
         request->send(400, "text/plain", "Add at least one battery level before enabling the policy");
         return;
       }
+      cancelPendingMeshChecksForService(idx);
+      cancelPendingMeshAdminCommandsForService(idx);
+      ServiceType previousType = services[idx].type;
+      String previousMeshPubkey = services[idx].meshNodePubkey;
+      bool previousRepeatState = services[idx].meshRepeaterKnownState;
+      bool previousRepeatKnown = services[idx].meshRepeaterStateKnown;
+      int previousTxPower = services[idx].meshKnownTxPower;
       services[idx].name = doc["name"].as<String>();
       services[idx].type = (ServiceType)doc["type"].as<int>();
       services[idx].enabled = doc["enabled"].as<bool>();
@@ -6241,8 +6814,17 @@ void setup() {
       services[idx].meshNodePubkey = doc["meshNodePubkey"].isNull() ? "" : doc["meshNodePubkey"].as<String>();
       services[idx].meshRepeaterControl = policySvc.meshRepeaterControl;
       services[idx].meshBatteryLevels = policySvc.meshBatteryLevels;
-      services[idx].meshRepeaterStateKnown = false;
-      services[idx].meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
+      bool sameMeshNode = previousType == TYPE_MESHCORE_NODE && services[idx].type == TYPE_MESHCORE_NODE &&
+                          previousMeshPubkey.equalsIgnoreCase(services[idx].meshNodePubkey);
+      if (sameMeshNode) {
+        services[idx].meshRepeaterKnownState = previousRepeatState;
+        services[idx].meshRepeaterStateKnown = previousRepeatKnown;
+        services[idx].meshKnownTxPower = previousTxPower;
+      } else {
+        services[idx].meshRepeaterKnownState = true;
+        services[idx].meshRepeaterStateKnown = true;
+        services[idx].meshKnownTxPower = MESH_TX_POWER_UNCHANGED;
+      }
       services[idx].meshAppliedBatteryLevel = -1;
       // Auto-discover MAC address if WoL enabled but no MAC specified
       if (services[idx].alertWol && services[idx].wolMacAddress.length() == 0) {
@@ -6266,6 +6848,8 @@ void setup() {
     }
 
     String deletedId = services[idx].id;
+    cancelPendingMeshChecksForService(idx, true);
+    cancelPendingMeshAdminCommandsForService(idx, true);
     // Shift services array
     for (int i = idx; i < serviceCount - 1; i++) {
       services[i] = services[i + 1];
@@ -6457,7 +7041,14 @@ void setup() {
       return;
     }
 
-    if ((unsigned long)(millis() - startedMs) >= 15000UL) {
+    if (!hasPendingMeshCheckForService(idx, true)) {
+      AsyncWebServerResponse *response = request->beginResponse(200, "application/json", getServiceCheckResultJson(svc, false));
+      response->addHeader("Cache-Control", "no-store");
+      request->send(response);
+      return;
+    }
+
+    if ((unsigned long)(millis() - startedMs) >= MESH_STATUS_TOTAL_TIMEOUT_MS) {
       bool wasPending = false;
       for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
         if (pendingMeshChecks[i].active && pendingMeshChecks[i].manual && pendingMeshChecks[i].serviceIdx == idx) {
@@ -7216,7 +7807,7 @@ void loop() {
           } else {
             Serial.printf("[LoRa] Invalid received packet length: %u\n", (unsigned int)packetLen);
           }
-          int16_t rxState = radio.startReceive();
+          int16_t rxState = startLoRaReceive();
           if (rxState != RADIOLIB_ERR_NONE) {
             Serial.printf("[LoRa] Failed to resume receive mode, code: %d\n", rxState);
           }
@@ -7299,6 +7890,9 @@ void loop() {
   }
   
   // Check all services periodically
+  processPendingReciprocalPath();
+  processPendingMeshChecks();
+  processPendingMeshAdminCommands();
   checkAllServices();
 
   // Handle deferred "Install Now" request from the web UI
@@ -7481,9 +8075,14 @@ void setupLoRa() {
   
   Serial.print("Initializing SX1262... ");
   
-  // Initialize the radio with basic settings
+  // MeshCore lengthens the preamble at lower spreading factors. In particular,
+  // an 8-symbol preamble is shorter than MeshCore peers expect and makes packet
+  // acquisition needlessly fragile in both directions.
+  uint16_t meshPreambleSymbols = settings.loraSpreadingFactor <= 8 ? 32 : 16;
+
+  // Initialize the radio with MeshCore-compatible settings.
   int state = radio.begin(settings.loraFreq, settings.loraBandwidth, settings.loraSpreadingFactor, settings.loraCodingRate, 
-                          0x12, 22, 8, LORA_TCXO_VOLTAGE);
+                          LORA_SYNC_WORD, 22, meshPreambleSymbols, LORA_TCXO_VOLTAGE);
   
   if (state == RADIOLIB_ERR_NONE) {
     Serial.println("success!");
@@ -7492,6 +8091,27 @@ void setupLoRa() {
     Serial.println(state);
     while (true) { delay(10); }
   }
+
+  state = radio.setCRC(1);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("Failed to enable LoRa CRC, code: %d\n", state);
+  }
+
+  // Same timeout calculation used by MeshCore's SX1262 wrapper. These bounds
+  // distinguish a live reception from stale latched preamble/header IRQ bits.
+  uint32_t symbolUs = (uint32_t)(((uint64_t)10000 << settings.loraSpreadingFactor) /
+                                 (settings.loraBandwidth * 10.0f));
+  uint32_t sfCoefficientX4 =
+      (settings.loraSpreadingFactor == 5 || settings.loraSpreadingFactor == 6) ? 25 : 17;
+  uint32_t preambleUs =
+      ((((uint32_t)meshPreambleSymbols + 8U) * 4U + sfCoefficientX4) * symbolUs) / 4U;
+  uint32_t totalUs = radio.getTimeOnAir(255);
+  uint32_t payloadUs = totalUs > preambleUs ? totalUs - preambleUs : 4000000UL - preambleUs;
+  if (settings.loraCodingRate >= 5 && settings.loraCodingRate < 8) {
+    payloadUs = (payloadUs * 8U) / settings.loraCodingRate;
+  }
+  loraPreambleDeadlineMs = max(1UL, (preambleUs + 999UL) / 1000UL);
+  loraPayloadDeadlineMs = max(1UL, (payloadUs + 999UL) / 1000UL);
   
   // Try WITHOUT IQ inversion first to see if we receive data
   // (Transmitter might not actually be inverting despite the flag)
@@ -7508,6 +8128,11 @@ void setupLoRa() {
   Serial.println(" kHz");
   Serial.print("Coding Rate: 4/");
   Serial.println(settings.loraCodingRate);
+  Serial.print("Preamble: ");
+  Serial.print(meshPreambleSymbols);
+  Serial.printf(" symbols (RX deadlines %lu/%lu ms)\n",
+                (unsigned long)loraPreambleDeadlineMs,
+                (unsigned long)loraPayloadDeadlineMs);
   Serial.print("Channel: ");
   Serial.println(settings.channelName);
   Serial.println("========================\n");
@@ -7519,7 +8144,7 @@ void setupLoRa() {
   ensureLoraRadioMutex();
   radio.setDio1Action(onLoraPacketReceived);
   loraPacketReceived = false;
-  state = radio.startReceive();
+  state = startLoRaReceive();
   if (state != RADIOLIB_ERR_NONE) {
     Serial.print("Failed to start receive mode, code ");
     Serial.println(state);
@@ -8045,6 +8670,32 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
         Serial.println("[LoRa] Direct message decrypted using SHA-256 derived key (non-standard)");
       }
     }
+
+    // A one-byte MeshCore node hash is intentionally allowed to collide. Match
+    // companion behavior by trying every cached identity with this hash until
+    // the MAC verifies, rather than trusting the first cache entry.
+    if (decryptedLen == 0) {
+      for (int candidateIdx = 0; candidateIdx < MAX_PEERS; candidateIdx++) {
+        PeerInfo& candidate = peers[candidateIdx];
+        if (!candidate.inUse ||
+            (candidate.hash != srcHash && candidate.altHash != srcHash) ||
+            candidate.ed25519_pub == senderPubKey) continue;
+
+        uint8_t candidateShared[32];
+        if (!deriveSharedSecretWithPeer(candidate.ed25519_pub, candidateShared)) continue;
+        decryptedLen = verifyAndDecrypt(candidateShared, sizeof(candidateShared), decrypted, encrypted, encryptedLen);
+        if (decryptedLen == 0) {
+          uint8_t derivedKey[32];
+          deriveDirectKeyFromShared(candidateShared, derivedKey);
+          decryptedLen = verifyAndDecrypt(derivedKey, sizeof(derivedKey), decrypted, encrypted, encryptedLen);
+        }
+        if (decryptedLen > 0) {
+          senderPubKey = candidate.ed25519_pub;
+          Serial.printf("[LoRa] Resolved colliding node hash 0x%02X by MAC verification\n", srcHash);
+          break;
+        }
+      }
+    }
     
     if (decryptedLen == 0) {
       Serial.println("Decryption or MAC verification failed");
@@ -8072,6 +8723,15 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       uint8_t extraType = decrypted[1 + returnPathBytes] & 0x0F;
       
       Serial.printf("[PATH] Return path from peer (len=%d), extra_type=%d\n", returnPathLen, extraType);
+      if (senderPubKey != nullptr) {
+        rememberPeerPath(senderPubKey, returnPath, returnPathLen);
+        if (routeType == ROUTE_TYPE_FLOOD || routeType == ROUTE_TYPE_TRANSPORT_FLOOD) {
+          // Complete MeshCore's two-way path exchange. The inner path routes
+          // this packet to the peer; the received outer path tells the peer how
+          // to route future direct responses back to us.
+          scheduleReciprocalPath(senderPubKey, returnPath, returnPathLen, senderPath, pathLen);
+        }
+      }
       
       // If there's an embedded ACK in the PATH, process it
       if (extraType == PAYLOAD_TYPE_ACK && 1 + returnPathBytes + 1 + 4 <= decryptedLen) {
@@ -8083,8 +8743,10 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
       // A request sent by flood receives its response inside a PATH packet.
       if (extraType == PAYLOAD_TYPE_RESPONSE) {
         size_t responseOffset = 1 + returnPathBytes + 1;
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
-        if (pendingSvcIdx >= 0 && responseOffset <= decryptedLen) {
+        int pendingSvcIdx = responseOffset <= decryptedLen
+          ? consumePendingMeshCheck(senderHash, &decrypted[responseOffset], decryptedLen - responseOffset)
+          : -1;
+        if (pendingSvcIdx >= 0) {
           processMeshNodeResponse(pendingSvcIdx, &decrypted[responseOffset], decryptedLen - responseOffset);
           updateServiceStatus(services[pendingSvcIdx], true);
           Serial.println("[MeshNode] Embedded status response consumed");
@@ -8101,11 +8763,22 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
                     payloadType == PAYLOAD_TYPE_REQ ? "REQUEST" : "RESPONSE",
                     senderHash, decryptedLen);
       if (payloadType == PAYLOAD_TYPE_RESPONSE) {
-        int pendingSvcIdx = consumePendingMeshCheck(senderHash);
+        int pendingSvcIdx = consumePendingMeshCheck(senderHash, decrypted, decryptedLen);
         if (pendingSvcIdx >= 0) {
           processMeshNodeResponse(pendingSvcIdx, decrypted, decryptedLen);
           updateServiceStatus(services[pendingSvcIdx], true);
           Serial.println("[MeshNode] Status response consumed");
+        }
+        if ((routeType == ROUTE_TYPE_FLOOD || routeType == ROUTE_TYPE_TRANSPORT_FLOOD) &&
+            senderPubKey != nullptr) {
+          int peerIdx = findPeerIndexByPubkey(senderPubKey);
+          if (peerIdx >= 0 && peers[peerIdx].outPathLen != 0xFF) {
+            // The peer is still flooding replies despite our known route to it,
+            // which indicates it missed the reciprocal path. Re-advertise our
+            // return path just as MeshCore companions do.
+            scheduleReciprocalPath(senderPubKey, peers[peerIdx].outPath, peers[peerIdx].outPathLen,
+                                   senderPath, pathLen, 3000UL);
+          }
         }
       }
       Serial.println("=== Packet Processing Complete ===\n");
@@ -8171,6 +8844,15 @@ void handleLoRaMessage(const uint8_t* message, size_t messageLen) {
 
     // Remote CLI output is an administration response, not a user message or command.
     if (txtTypeKind == TXT_TYPE_CLI_DATA) {
+      processMeshAdminResponse(senderPubKey, text);
+      if ((routeType == ROUTE_TYPE_FLOOD || routeType == ROUTE_TYPE_TRANSPORT_FLOOD) &&
+          senderPubKey != nullptr) {
+        int peerIdx = findPeerIndexByPubkey(senderPubKey);
+        if (peerIdx >= 0 && peers[peerIdx].outPathLen != 0xFF) {
+          scheduleReciprocalPath(senderPubKey, peers[peerIdx].outPath, peers[peerIdx].outPathLen,
+                                 senderPath, pathLen, 3000UL);
+        }
+      }
       Serial.println("[MeshNode] Remote CLI response consumed");
       Serial.println("=== Packet Processing Complete ===\n");
       return;
