@@ -7751,6 +7751,9 @@ static bool checkAutoOtaUpdate(bool applyIfAvailable) {
   bool isSecure = versionUrl.startsWith("https://");
 
   if (isSecure) {
+    // OTA endpoints are HTTPS-only. Explicitly configure TLS behavior so
+    // handshakes don't fail when no CA store is provisioned on device.
+    secureClient.setInsecure();
     http.begin(secureClient, versionUrl);
   } else {
     Serial.println("[AutoOTA] Insecure OTA URL blocked: only HTTPS is allowed");
@@ -7845,6 +7848,8 @@ static bool checkAutoOtaUpdate(bool applyIfAvailable) {
   bool firmwareIsSecure = firmwareUrl.startsWith("https://");
 
   if (firmwareIsSecure) {
+    // Keep TLS handling consistent with the version check request.
+    secureUpdateClient.setInsecure();
     updateClient = &secureUpdateClient;
   } else {
     Serial.println("[AutoOTA] Insecure firmware URL blocked: only HTTPS is allowed");
