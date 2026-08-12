@@ -100,6 +100,7 @@ enum CompareOp {
 struct Service {
   String id;
   String name;
+  String group;
   ServiceType type;
   String host;
   int port;
@@ -2626,6 +2627,7 @@ void saveServices() {
     JsonObject svc = array.add<JsonObject>();
     svc["id"] = services[i].id;
     svc["name"] = services[i].name;
+    svc["group"] = services[i].group;
     svc["type"] = (int)services[i].type;
     svc["host"] = services[i].host;
     svc["port"] = services[i].port;
@@ -2706,6 +2708,8 @@ void loadServices() {
     
     services[serviceCount].id = svc["id"].as<String>();
     services[serviceCount].name = svc["name"].as<String>();
+    services[serviceCount].group = svc["group"].isNull() ? "" : svc["group"].as<String>();
+    services[serviceCount].group.trim();
     services[serviceCount].type = (ServiceType)svc["type"].as<int>();
     services[serviceCount].host = svc["host"].as<String>();
     services[serviceCount].port = svc["port"].as<int>();
@@ -2785,6 +2789,7 @@ void initDemoServices() {
   Service httpSvc;
   httpSvc.id = "svc1";
   httpSvc.name = "Example HTTP";
+  httpSvc.group = "";
   httpSvc.type = TYPE_HTTP_GET;
   httpSvc.url = "http://example.com";
   httpSvc.expectedResponse = "Example Domain";
@@ -2814,6 +2819,7 @@ void initDemoServices() {
   Service pingSvc;
   pingSvc.id = "svc2";
   pingSvc.name = "Ping Google";
+  pingSvc.group = "";
   pingSvc.type = TYPE_PING;
   pingSvc.host = "8.8.8.8";
   pingSvc.cronExpression = "* * * * *";
@@ -2842,6 +2848,7 @@ void initDemoServices() {
   Service snmpSvc;
   snmpSvc.id = "svc3";
   snmpSvc.name = "SNMP Device";
+  snmpSvc.group = "";
   snmpSvc.type = TYPE_SNMP_GET;
   snmpSvc.host = "192.168.1.100";
   snmpSvc.snmpOid = "1.3.6.1.2.1.1.1.0";
@@ -2978,6 +2985,7 @@ String getServicesJson() {
   for (int i = 0; i < serviceCount; i++) {
     JsonObject obj = arr.createNestedObject();
     obj["name"] = services[i].name;
+    obj["group"] = services[i].group;
     obj["type"] = services[i].type;
     obj["enabled"] = services[i].enabled;
     obj["host"] = services[i].host;
@@ -5960,7 +5968,10 @@ void setup() {
     html += ".icon-btn:disabled{cursor:wait;opacity:0.55}";
     html += ".icon-btn.delete:hover{background:#fed7d7}";
     html += ".service-info{color:#718096;font-size:12px;margin-top:8px}";
-    html += ".services-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}";
+    html += ".services-grid{display:flex;flex-direction:column;gap:14px}";
+    html += ".service-group{width:100%;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px}";
+    html += ".service-group-title{font-size:14px;font-weight:700;letter-spacing:0.3px;text-transform:uppercase;color:#4a5568;margin-bottom:12px}";
+    html += ".service-group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}";
     html += ".service-card{background:#fff;border-radius:12px;padding:20px;border-left:4px solid #cbd5e0;transition:all 0.3s ease;cursor:pointer}";
     html += ".service-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.1)}";
     html += ".service-card.up{border-left-color:#48bb78}";
@@ -6013,7 +6024,7 @@ void setup() {
     html += ".btn-group{display:flex;gap:12px;margin-top:24px}";
     html += ".btn-cancel{background:#e2e8f0;color:#4a5568}";
     html += ".btn-cancel:hover{background:#cbd5e0}";
-    html += "@media(max-width:768px){.services-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.battery-level{grid-template-columns:1fr 1fr}.modal-content{padding:24px}}";
+    html += "@media(max-width:768px){.service-group-grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.form-row{grid-template-columns:1fr}.battery-level{grid-template-columns:1fr 1fr}.modal-content{padding:24px}}";
     html += "</style></head><body>";
     html += "<canvas id='meshBg'></canvas>";
     html += "<div class='container'>";
@@ -6046,71 +6057,100 @@ void setup() {
     }
     html += "</div>";
     html += "<div class='services-grid'>";
+    std::vector<String> serviceGroups;
+    bool hasUngroupedServices = false;
     for (int i = 0; i < serviceCount; i++) {
-      String statusClass = services[i].isUp ? "up" : "down";
-      String statusText = services[i].isUp ? "up" : "down";
-      String statusBadgeClass = services[i].isUp ? "status-up" : "status-down";
-      html += "<div class='service-card " + statusClass + "' id='serviceCard" + String(i) + "'>";
-      html += "<div class='service-header'>";
-      html += "<div class='service-name'>" + services[i].name + "</div>";
-      html += "<div class='service-actions'>";
-      if (isAuthed) {
-        html += "<button class='icon-btn' id='checkServiceBtn" + String(i) + "' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
+      String groupName = services[i].group;
+      groupName.trim();
+      if (groupName.length() == 0) {
+        hasUngroupedServices = true;
+        continue;
       }
-      if (services[i].type == TYPE_MESHCORE_NODE) {
-        html += "<button class='icon-btn' onclick='viewBatteryGraph(" + String(i) + ")' title='Battery Graph'>📈</button>";
-      } else if (services[i].type == TYPE_SNMP_GET) {
-        html += "<button class='icon-btn' onclick='viewSnmpGraph(" + String(i) + ")' title='SNMP Value Graph'>📈</button>";
-      }
-      html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
-      if (isAuthed) {
-        html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
-        html += "<button class='icon-btn delete' onclick='deleteService(" + String(i) + ")' title='Delete'>🗑️</button>";
-      }
-      html += "</div>";
-      html += "</div>";
-      html += "<span class='service-status " + statusBadgeClass + "' id='serviceStatus" + String(i) + "'>" + statusText + "</span>";
-      const char* svcTypeName[] = {"HTTP GET","Ping","SNMP GET","Port","Push","Uptime","MeshCore Node","Unknown"};
-      int svcTypeId = (int)services[i].type;
-      if (svcTypeId < 0 || svcTypeId > 7) svcTypeId = 7;
-      String typeLabel = svcTypeName[svcTypeId];
-      String infoStr = "Type: " + typeLabel;
-      if (services[i].type != TYPE_MESHCORE_NODE) infoStr += " | Host: " + services[i].host;
-      html += "<div class='service-info'>" + infoStr + "</div>";
-      if (services[i].type == TYPE_PUSH) {
-        String pushUrl = getPushUrl(services[i]);
-        if (pushUrl.length() > 0) {
-          html += "<div class='service-info'>Push URL: " + pushUrl + "</div>";
+      bool seen = false;
+      for (const String& existing : serviceGroups) {
+        if (existing == groupName) {
+          seen = true;
+          break;
         }
       }
-      if (services[i].type == TYPE_MESHCORE_NODE) {
-        String battColor = services[i].meshLastBatteryPct >= 50 ? "#48bb78" : (services[i].meshLastBatteryPct >= 20 ? "#d69e2e" : "#f56565");
-        html += "<div class='service-info' id='serviceMesh" + String(i) + "'" + (services[i].meshLastResponseMs > 0 ? "" : " style='display:none'") + ">Battery: <span style='color:" + battColor + ";font-weight:600'>" +
-                String(services[i].meshLastBatteryPct) + "% (" + String(services[i].meshLastBatteryV, 2) + "V)</span>";
-        if (services[i].meshRepeaterControl) {
-          html += " | Repeater: " + String(services[i].meshRepeaterStateKnown ?
-                                            (services[i].meshRepeaterKnownState ? "on" : "off") : "pending");
-          if (services[i].meshKnownTxPower != MESH_TX_POWER_UNCHANGED) {
-            html += " | TX: " + String(services[i].meshKnownTxPower) + " dBm";
+      if (!seen) serviceGroups.push_back(groupName);
+    }
+    if (hasUngroupedServices) serviceGroups.push_back("Ungrouped");
+
+    for (const String& groupName : serviceGroups) {
+      html += "<div class='service-group'><div class='service-group-title'>" + groupName + "</div><div class='service-group-grid'>";
+      for (int i = 0; i < serviceCount; i++) {
+        String currentGroup = services[i].group;
+        currentGroup.trim();
+        if (currentGroup.length() == 0) currentGroup = "Ungrouped";
+        if (currentGroup != groupName) continue;
+
+        String statusClass = services[i].isUp ? "up" : "down";
+        String statusText = services[i].isUp ? "up" : "down";
+        String statusBadgeClass = services[i].isUp ? "status-up" : "status-down";
+        html += "<div class='service-card " + statusClass + "' id='serviceCard" + String(i) + "'>";
+        html += "<div class='service-header'>";
+        html += "<div class='service-name'>" + services[i].name + "</div>";
+        html += "<div class='service-actions'>";
+        if (isAuthed) {
+          html += "<button class='icon-btn' id='checkServiceBtn" + String(i) + "' onclick='checkServiceNow(" + String(i) + ")' title='Check Now'>▶️</button>";
+        }
+        if (services[i].type == TYPE_MESHCORE_NODE) {
+          html += "<button class='icon-btn' onclick='viewBatteryGraph(" + String(i) + ")' title='Battery Graph'>📈</button>";
+        } else if (services[i].type == TYPE_SNMP_GET) {
+          html += "<button class='icon-btn' onclick='viewSnmpGraph(" + String(i) + ")' title='SNMP Value Graph'>📈</button>";
+        }
+        html += "<button class='icon-btn' onclick='viewHistory(" + String(i) + ")' title='History'>🕒</button>";
+        if (isAuthed) {
+          html += "<button class='icon-btn' onclick='editService(" + String(i) + ")' title='Edit'>✏️</button>";
+          html += "<button class='icon-btn delete' onclick='deleteService(" + String(i) + ")' title='Delete'>🗑️</button>";
+        }
+        html += "</div>";
+        html += "</div>";
+        html += "<span class='service-status " + statusBadgeClass + "' id='serviceStatus" + String(i) + "'>" + statusText + "</span>";
+        const char* svcTypeName[] = {"HTTP GET","Ping","SNMP GET","Port","Push","Uptime","MeshCore Node","Unknown"};
+        int svcTypeId = (int)services[i].type;
+        if (svcTypeId < 0 || svcTypeId > 7) svcTypeId = 7;
+        String typeLabel = svcTypeName[svcTypeId];
+        String infoStr = "Type: " + typeLabel;
+        if (services[i].type != TYPE_MESHCORE_NODE) infoStr += " | Host: " + services[i].host;
+        html += "<div class='service-info'>" + infoStr + "</div>";
+        if (services[i].type == TYPE_PUSH) {
+          String pushUrl = getPushUrl(services[i]);
+          if (pushUrl.length() > 0) {
+            html += "<div class='service-info'>Push URL: " + pushUrl + "</div>";
           }
+        }
+        if (services[i].type == TYPE_MESHCORE_NODE) {
+          String battColor = services[i].meshLastBatteryPct >= 50 ? "#48bb78" : (services[i].meshLastBatteryPct >= 20 ? "#d69e2e" : "#f56565");
+          html += "<div class='service-info' id='serviceMesh" + String(i) + "'" + (services[i].meshLastResponseMs > 0 ? "" : " style='display:none'") + ">Battery: <span style='color:" + battColor + ";font-weight:600'>" +
+                  String(services[i].meshLastBatteryPct) + "% (" + String(services[i].meshLastBatteryV, 2) + "V)</span>";
+          if (services[i].meshRepeaterControl) {
+            html += " | Repeater: " + String(services[i].meshRepeaterStateKnown ?
+                                              (services[i].meshRepeaterKnownState ? "on" : "off") : "pending");
+            if (services[i].meshKnownTxPower != MESH_TX_POWER_UNCHANGED) {
+              html += " | TX: " + String(services[i].meshKnownTxPower) + " dBm";
+            }
+          }
+          html += "</div>";
+        }
+        html += "<div class='service-error' id='serviceError" + String(i) + "'" + (services[i].lastError.length() > 0 ? "" : " style='display:none'") + ">" + services[i].lastError + "</div>";
+        html += "<div class='service-check-message' id='serviceCheckMessage" + String(i) + "' style='display:none'></div>";
+        // Show enabled alert channels (only show those that are globally enabled)
+        String channels = "";
+        if (settings.loraEnabled && services[i].alertLora) channels += "📡";
+        if (settings.ntfyEnabled && services[i].alertNtfy) channels += "🔔";
+        if (settings.discordEnabled && services[i].alertDiscord) channels += "💬";
+        if (settings.webhookEnabled && services[i].alertWebhook) channels += "🌐";
+        if (settings.emailEnabled && services[i].alertEmail) channels += "📧";
+        if (settings.mqttEnabled && services[i].alertMqtt) channels += "📨";
+        if (services[i].alertWol) channels += "⏰";
+        if (channels.length() > 0) {
+          html += "<div class='service-info' style='margin-top:4px;font-size:12px;opacity:0.85'>Alerts: " + channels + "</div>";
         }
         html += "</div>";
       }
-      html += "<div class='service-error' id='serviceError" + String(i) + "'" + (services[i].lastError.length() > 0 ? "" : " style='display:none'") + ">" + services[i].lastError + "</div>";
-      html += "<div class='service-check-message' id='serviceCheckMessage" + String(i) + "' style='display:none'></div>";
-      // Show enabled alert channels (only show those that are globally enabled)
-      String channels = "";
-      if (settings.loraEnabled && services[i].alertLora) channels += "📡";
-      if (settings.ntfyEnabled && services[i].alertNtfy) channels += "🔔";
-      if (settings.discordEnabled && services[i].alertDiscord) channels += "💬";
-      if (settings.webhookEnabled && services[i].alertWebhook) channels += "🌐";
-      if (settings.emailEnabled && services[i].alertEmail) channels += "📧";
-      if (settings.mqttEnabled && services[i].alertMqtt) channels += "📨";
-      if (services[i].alertWol) channels += "⏰";
-      if (channels.length() > 0) {
-        html += "<div class='service-info' style='margin-top:4px;font-size:12px;opacity:0.85'>Alerts: " + channels + "</div>";
-      }
-      html += "</div>";
+      html += "</div></div>";
     }
     html += "</div></div>";
     
@@ -6146,6 +6186,8 @@ void setup() {
     html += "<form id='serviceForm'><input type='hidden' id='serviceIndex' value='-1'><input type='hidden' id='servicePushToken' value=''>";
     html += "<div class='form-group'><label class='form-label'>Service Name</label>";
     html += "<input type='text' id='serviceName' class='form-input' required></div>";
+    html += "<div class='form-group'><label class='form-label'>Group</label>";
+    html += "<input type='text' id='serviceGroup' class='form-input' placeholder='e.g. Infrastructure, Databases'></div>";
     html += "<div class='form-row'>";
     html += "<div class='form-group'><label class='form-label'>Type</label>";
     html += "<select id='serviceType' class='form-select'>";
@@ -6227,6 +6269,7 @@ void setup() {
     html += "<button class='close-btn' onclick='closeBatteryGraph()'>×</button></div>";
     html += "<div id='batteryGraphMessage' style='color:#718096;font-size:13px;margin-bottom:10px'></div>";
     html += "<canvas id='batteryGraphCanvas' style='display:block;width:100%;height:320px;border:1px solid #e2e8f0;border-radius:8px;background:#fff'></canvas>";
+    html += "<div id='batteryGraphTooltip' style='position:fixed;display:none;pointer-events:none;padding:6px 8px;background:rgba(45,55,72,0.95);color:#fff;font-size:12px;border-radius:6px;z-index:3000;box-shadow:0 6px 16px rgba(0,0,0,0.2);max-width:280px'></div>";
     html += "</div></div>";
     
     // JavaScript
@@ -6256,9 +6299,9 @@ void setup() {
 
     html += "function closeHistoryModal(){document.getElementById('historyModal').classList.remove('show');modalOpen=false;}";
 
-    html += "function closeBatteryGraph(){document.getElementById('batteryGraphModal').classList.remove('show');modalOpen=false;}";
+    html += "function closeBatteryGraph(){document.getElementById('batteryGraphModal').classList.remove('show');const tt=document.getElementById('batteryGraphTooltip');if(tt)tt.style.display='none';modalOpen=false;}";
     html += "function graphNumber(v){const a=Math.abs(v);return a>=1000000||a>0&&a<0.001?v.toExponential(2):Number(v.toPrecision(6)).toString();}";
-    html += "function drawMetricGraph(samples,percentScale){const canvas=document.getElementById('batteryGraphCanvas'),box=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,box.width),h=320;canvas.width=w*dpr;canvas.height=h*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const pad={l:66,r:18,t:18,b:46},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;let minV=percentScale?0:Math.min(...samples.map(s=>s.p)),maxV=percentScale?100:Math.max(...samples.map(s=>s.p));if(!samples.length){minV=0;maxV=100;}if(maxV===minV){const margin=Math.abs(maxV)*0.05||1;minV-=margin;maxV+=margin;}ctx.font='12px sans-serif';ctx.lineWidth=1;for(let step=0;step<=5;step++){const value=minV+(maxV-minV)*step/5,y=pad.t+ph*(1-step/5);ctx.strokeStyle='#edf2f7';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.fillStyle='#718096';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(percentScale?Math.round(value)+'%':graphNumber(value),pad.l-8,y);}if(!samples.length)return;let minT=samples[0].t,maxT=samples[samples.length-1].t;if(maxT===minT)maxT=minT+1;const x=t=>pad.l+(t-minT)/(maxT-minT)*pw,y=p=>pad.t+ph*(1-(p-minV)/(maxV-minV));ctx.strokeStyle='#667eea';ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();samples.forEach((s,i)=>{if(i)ctx.lineTo(x(s.t),y(s.p));else ctx.moveTo(x(s.t),y(s.p));});ctx.stroke();ctx.fillStyle='#667eea';samples.forEach(s=>{ctx.beginPath();ctx.arc(x(s.t),y(s.p),samples.length<80?2.5:1.5,0,Math.PI*2);ctx.fill();});ctx.fillStyle='#718096';ctx.textBaseline='top';ctx.textAlign='left';ctx.fillText(new Date(minT*1000).toLocaleString(),pad.l,h-pad.b+10);ctx.textAlign='right';ctx.fillText(new Date(samples[samples.length-1].t*1000).toLocaleString(),w-pad.r,h-pad.b+10);}";
+    html += "function drawMetricGraph(samples,percentScale){const canvas=document.getElementById('batteryGraphCanvas'),tooltip=document.getElementById('batteryGraphTooltip'),box=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,box.width),h=320;canvas.width=w*dpr;canvas.height=h*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const pad={l:66,r:18,t:18,b:46},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;let minV=percentScale?0:Math.min(...samples.map(s=>s.p)),maxV=percentScale?100:Math.max(...samples.map(s=>s.p));if(!samples.length){minV=0;maxV=100;}if(maxV===minV){const margin=Math.abs(maxV)*0.05||1;minV-=margin;maxV+=margin;}ctx.font='12px sans-serif';ctx.lineWidth=1;for(let step=0;step<=5;step++){const value=minV+(maxV-minV)*step/5,y=pad.t+ph*(1-step/5);ctx.strokeStyle='#edf2f7';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.fillStyle='#718096';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(percentScale?Math.round(value)+'%':graphNumber(value),pad.l-8,y);}if(!samples.length){canvas.onmousemove=null;canvas.onmouseleave=null;if(tooltip)tooltip.style.display='none';return;}let minT=samples[0].t,maxT=samples[samples.length-1].t;if(maxT===minT)maxT=minT+1;const x=t=>pad.l+(t-minT)/(maxT-minT)*pw,y=p=>pad.t+ph*(1-(p-minV)/(maxV-minV));const points=samples.map(s=>({x:x(s.t),y:y(s.p),s:s}));ctx.strokeStyle='#667eea';ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();points.forEach((pt,i)=>{if(i)ctx.lineTo(pt.x,pt.y);else ctx.moveTo(pt.x,pt.y);});ctx.stroke();ctx.fillStyle='#667eea';points.forEach(pt=>{ctx.beginPath();ctx.arc(pt.x,pt.y,samples.length<80?2.5:1.5,0,Math.PI*2);ctx.fill();});ctx.fillStyle='#718096';ctx.textBaseline='top';ctx.textAlign='left';ctx.fillText(new Date(minT*1000).toLocaleString(),pad.l,h-pad.b+10);ctx.textAlign='right';ctx.fillText(new Date(samples[samples.length-1].t*1000).toLocaleString(),w-pad.r,h-pad.b+10);canvas.onmouseleave=()=>{if(tooltip)tooltip.style.display='none';};canvas.onmousemove=e=>{if(!tooltip)return;const rect=canvas.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;let nearest=null,best=Infinity;for(const pt of points){const dx=pt.x-mx,dy=pt.y-my,d=Math.sqrt(dx*dx+dy*dy);if(d<best){best=d;nearest=pt;}}if(!nearest||best>10){tooltip.style.display='none';return;}const valueText=percentScale?nearest.s.p+'%':graphNumber(nearest.s.p);const extra=nearest.s.mv!=null?' ('+(nearest.s.mv/1000).toFixed(2)+'V)':'';tooltip.textContent=valueText+extra+' at '+new Date(nearest.s.t*1000).toLocaleString();tooltip.style.display='block';tooltip.style.left=(e.clientX+12)+'px';tooltip.style.top=(e.clientY+12)+'px';};}";
     html += "async function viewBatteryGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage');document.getElementById('batteryGraphTitle').textContent='Battery History - '+(svc?.name||'MeshCore Node');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],true);try{const res=await fetch('/api/mesh-battery-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),pct=Number(p[1]),mv=Number(p[2]);if(Number.isFinite(t)&&Number.isFinite(pct)&&Number.isFinite(mv)&&t>0)samples.push({t:t,p:pct,mv:mv});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No battery samples yet.';drawMetricGraph([],true);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' samples · Latest: '+last.p+'% ('+(last.mv/1000).toFixed(2)+'V) at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,true);}catch(e){msg.textContent='Failed to load battery history';drawMetricGraph([],true);}}";
     html += "async function viewSnmpGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage');document.getElementById('batteryGraphTitle').textContent='SNMP Value History - '+(svc?.name||'SNMP Check');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],false);try{const res=await fetch('/api/snmp-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),value=Number(p[1]);if(Number.isFinite(t)&&Number.isFinite(value)&&t>0)samples.push({t:t,p:value});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No changed numeric values yet.';drawMetricGraph([],false);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' changed values · Latest: '+graphNumber(last.p)+' at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,false);}catch(e){msg.textContent='Failed to load SNMP history';drawMetricGraph([],false);}}";
 
@@ -6279,6 +6322,7 @@ void setup() {
     html += "function editService(i){if(!isAuthed){alert('Login required');return;}document.getElementById('modalTitle').textContent='Edit Service';";
     html += "const s=services[i];document.getElementById('serviceIndex').value=i;";
     html += "document.getElementById('serviceName').value=s.name;";
+    html += "document.getElementById('serviceGroup').value=s.group||'';";
     html += "document.getElementById('serviceType').value=s.type;";
     html += "document.getElementById('serviceEnabled').value=s.enabled?'true':'false';";
     html += "document.getElementById('serviceHost').value=s.host||'';";
@@ -6320,6 +6364,7 @@ void setup() {
     html += "}catch(e){setCheckMessage(i,'Check failed: '+e.message,'#e53e3e');}finally{if(btn){btn.disabled=false;btn.textContent='▶️';}}}";
     html += "document.getElementById('serviceForm').onsubmit=function(e){e.preventDefault();if(!isAuthed){alert('Login required');return;}const meshBatteryLevels=collectMeshBatteryLevels();if(meshBatteryLevels===null)return;if(document.getElementById('serviceMeshRepeaterControl').checked&&!meshBatteryLevels.length){alert('Add at least one battery level before enabling the policy.');return;}";
     html += "const data={name:document.getElementById('serviceName').value,";
+    html += "group:document.getElementById('serviceGroup').value.trim(),";
     html += "type:parseInt(document.getElementById('serviceType').value),";
     html += "enabled:document.getElementById('serviceEnabled').value==='true',";
     html += "host:document.getElementById('serviceHost').value,";
@@ -6453,12 +6498,16 @@ void setup() {
     html += ".stat{background:#1e293b;border-radius:12px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,0.2);}";
     html += ".stat .value{font-size:32px;font-weight:700;color:#f8fafc;}";
     html += ".stat .label{color:#cbd5e1;font-size:12px;text-transform:uppercase;letter-spacing:1px;}";
-    html += ".services{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;}";
+    html += ".services{display:flex;flex-direction:column;gap:12px;}";
+    html += ".service-group{width:100%;background:#111827;border:1px solid #334155;border-radius:12px;padding:12px;}";
+    html += ".service-group-title{font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#cbd5e1;margin-bottom:10px;}";
+    html += ".service-group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;}";
     html += ".card{background:#1e293b;border-radius:12px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,0.2);border-left:4px solid #334155;}";
     html += ".card.up{border-left-color:#22c55e;} .card.down{border-left-color:#ef4444;}";
     html += ".name{font-size:16px;font-weight:700;color:#f8fafc;margin-bottom:6px;}";
     html += ".meta{color:#cbd5e1;font-size:13px;} .status-badge{display:inline-block;padding:4px 10px;border-radius:12px;font-weight:700;font-size:12px;margin-top:6px;}";
     html += ".status-up{background:#22c55e33;color:#bbf7d0;} .status-down{background:#ef444433;color:#fecdd3;}";
+    html += "@media(max-width:768px){.service-group-grid{grid-template-columns:1fr;}}";
     html += "</style></head><body><canvas id='meshBg'></canvas><div class='container'>";
 
     int upCount = 0, downCount = 0;
@@ -6477,26 +6526,55 @@ void setup() {
     html += "</div>";
 
     html += "<div class='services'>";
+    std::vector<String> serviceGroups;
+    bool hasUngroupedServices = false;
     for (int i = 0; i < serviceCount; i++) {
-      String statusClass = services[i].isUp ? "up" : "down";
-      String badge = services[i].isUp ? "<span class='status-badge status-up'>UP</span>" : "<span class='status-badge status-down'>DOWN</span>";
-      html += "<div class='card " + statusClass + "'>";
-      html += "<div class='name'>" + services[i].name + "</div>";
-      html += badge;
-      html += "<div class='meta'>Type: " + String(services[i].type) + "</div>";
-      if (services[i].host.length() > 0) {
-        html += "<div class='meta'>Host: " + services[i].host + "</div>";
+      String groupName = services[i].group;
+      groupName.trim();
+      if (groupName.length() == 0) {
+        hasUngroupedServices = true;
+        continue;
       }
-      if (services[i].type == TYPE_HTTP_GET && services[i].url.length() > 0) {
-        html += "<div class='meta'>URL: " + services[i].url + "</div>";
+      bool seen = false;
+      for (const String& existing : serviceGroups) {
+        if (existing == groupName) {
+          seen = true;
+          break;
+        }
       }
-      if (services[i].type == TYPE_PORT && services[i].port > 0) {
-        html += "<div class='meta'>Port: " + String(services[i].port) + "</div>";
+      if (!seen) serviceGroups.push_back(groupName);
+    }
+    if (hasUngroupedServices) serviceGroups.push_back("Ungrouped");
+
+    for (const String& groupName : serviceGroups) {
+      html += "<div class='service-group'><div class='service-group-title'>" + groupName + "</div><div class='service-group-grid'>";
+      for (int i = 0; i < serviceCount; i++) {
+        String currentGroup = services[i].group;
+        currentGroup.trim();
+        if (currentGroup.length() == 0) currentGroup = "Ungrouped";
+        if (currentGroup != groupName) continue;
+
+        String statusClass = services[i].isUp ? "up" : "down";
+        String badge = services[i].isUp ? "<span class='status-badge status-up'>UP</span>" : "<span class='status-badge status-down'>DOWN</span>";
+        html += "<div class='card " + statusClass + "'>";
+        html += "<div class='name'>" + services[i].name + "</div>";
+        html += badge;
+        html += "<div class='meta'>Type: " + String(services[i].type) + "</div>";
+        if (services[i].host.length() > 0) {
+          html += "<div class='meta'>Host: " + services[i].host + "</div>";
+        }
+        if (services[i].type == TYPE_HTTP_GET && services[i].url.length() > 0) {
+          html += "<div class='meta'>URL: " + services[i].url + "</div>";
+        }
+        if (services[i].type == TYPE_PORT && services[i].port > 0) {
+          html += "<div class='meta'>Port: " + String(services[i].port) + "</div>";
+        }
+        if (!services[i].isUp && services[i].lastError.length() > 0) {
+          html += "<div class='meta'>" + services[i].lastError + "</div>";
+        }
+        html += "</div>";
       }
-      if (!services[i].isUp && services[i].lastError.length() > 0) {
-        html += "<div class='meta'>" + services[i].lastError + "</div>";
-      }
-      html += "</div>";
+      html += "</div></div>";
     }
     html += "</div>";
     html += "</div><script>setInterval(()=>location.reload(),20000);";
@@ -6547,6 +6625,7 @@ void setup() {
       JsonObject obj = array.add<JsonObject>();
       obj["id"] = services[i].id;
       obj["name"] = services[i].name;
+      obj["group"] = services[i].group;
       obj["type"] = services[i].type;
       obj["host"] = services[i].host;
       obj["port"] = services[i].port;
@@ -6604,6 +6683,8 @@ void setup() {
             Service svc;
             svc.id = obj["id"].as<String>();
             svc.name = obj["name"].as<String>();
+            svc.group = obj["group"].isNull() ? "" : obj["group"].as<String>();
+            svc.group.trim();
             svc.type = (ServiceType)obj["type"].as<int>();
             svc.host = obj["host"].as<String>();
             svc.port = obj["port"].as<int>();
@@ -6681,6 +6762,8 @@ void setup() {
       Service svc;
       svc.id = "svc" + String(serviceCount + 1);
       svc.name = doc["name"].as<String>();
+      svc.group = doc["group"].isNull() ? "" : doc["group"].as<String>();
+      svc.group.trim();
       svc.type = (ServiceType)doc["type"].as<int>();
       svc.enabled = doc["enabled"].as<bool>();
       svc.host = doc["host"].as<String>();
@@ -6782,6 +6865,8 @@ void setup() {
       bool previousRepeatKnown = services[idx].meshRepeaterStateKnown;
       int previousTxPower = services[idx].meshKnownTxPower;
       services[idx].name = doc["name"].as<String>();
+      services[idx].group = doc["group"].isNull() ? "" : doc["group"].as<String>();
+      services[idx].group.trim();
       services[idx].type = (ServiceType)doc["type"].as<int>();
       services[idx].enabled = doc["enabled"].as<bool>();
       services[idx].host = doc["host"].as<String>();
