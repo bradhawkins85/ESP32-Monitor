@@ -793,6 +793,56 @@ static void deleteMeshBatteryHistory(const String &serviceId) {
   }
 }
 
+static bool parseUnixEpoch(const String& text, time_t& out) {
+  const char* raw = text.c_str();
+  if (raw == nullptr || *raw == '\0') return false;
+  char* end = nullptr;
+  unsigned long long parsed = strtoull(raw, &end, 10);
+  if (end == raw || *end != '\0') return false;
+  out = (time_t)parsed;
+  return true;
+}
+
+static bool batteryHistoryRangeSeconds(const String& rangeKey, uint32_t& secondsOut) {
+  if (rangeKey == "12h") {
+    secondsOut = 12UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "1d") {
+    secondsOut = 1UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "3d") {
+    secondsOut = 3UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "7d") {
+    secondsOut = 7UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "14d") {
+    secondsOut = 14UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "1mo") {
+    secondsOut = 30UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "3mo") {
+    secondsOut = 90UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "6mo") {
+    secondsOut = 180UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  if (rangeKey == "1y") {
+    secondsOut = 365UL * 24UL * 60UL * 60UL;
+    return true;
+  }
+  return false;
+}
+
 // ============================================
 // SNMP Numeric History (LittleFS)
 // Stores changed numeric values only: <unix_epoch_seconds>,<value>\n
@@ -6431,6 +6481,24 @@ void setup() {
     html += "<div class='modal-header'><div class='modal-title' id='batteryGraphTitle'>Battery History</div>";
     html += "<button class='close-btn' onclick='closeBatteryGraph()'>×</button></div>";
     html += "<div id='batteryGraphMessage' style='color:#718096;font-size:13px;margin-bottom:10px'></div>";
+    html += "<div id='batteryGraphRangeRow' style='display:none;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px'>";
+    html += "<label style='display:flex;flex-direction:column;gap:4px;font-size:13px;color:#4a5568'>Range<select id='batteryGraphRange' class='form-select' style='min-width:150px'>";
+    html += "<option value='custom'>Custom time range</option>";
+    html += "<option value='12h'>12 Hours</option>";
+    html += "<option value='1d'>1 Day</option>";
+    html += "<option value='3d'>3 Day</option>";
+    html += "<option value='7d'>7 Day</option>";
+    html += "<option value='14d'>14 Day</option>";
+    html += "<option value='1mo'>1 Month</option>";
+    html += "<option value='3mo'>3 Month</option>";
+    html += "<option value='6mo'>6 Month</option>";
+    html += "<option value='1y'>1 Year</option>";
+    html += "<option value='all' selected>All</option>";
+    html += "</select></label>";
+    html += "<label id='batteryGraphStartWrap' style='display:none;flex-direction:column;gap:4px;font-size:13px;color:#4a5568'>Start<input id='batteryGraphStart' type='datetime-local' class='form-input'></label>";
+    html += "<label id='batteryGraphEndWrap' style='display:none;flex-direction:column;gap:4px;font-size:13px;color:#4a5568'>End<input id='batteryGraphEnd' type='datetime-local' class='form-input'></label>";
+    html += "<button type='button' class='btn btn-secondary' onclick='reloadBatteryGraphRange()'>Apply</button>";
+    html += "</div>";
     html += "<canvas id='batteryGraphCanvas' style='display:block;width:100%;height:320px;border:1px solid #e2e8f0;border-radius:8px;background:#fff'></canvas>";
     html += "<div id='batteryGraphTooltip' style='position:fixed;display:none;pointer-events:none;padding:6px 8px;background:rgba(45,55,72,0.95);color:#fff;font-size:12px;border-radius:6px;z-index:3000;box-shadow:0 6px 16px rgba(0,0,0,0.2);max-width:280px'></div>";
     html += "</div></div>";
@@ -6442,6 +6510,8 @@ void setup() {
     html += "const globalChannels=" + getGlobalAlertChannelsJson() + ";";
     html += "const isAuthed=" + String(isAuthed ? "true" : "false") + ";";
     html += "let modalOpen=false;";
+    html += "let activeBatteryGraphServiceIndex=-1;";
+    html += "let activeBatteryGraphKind='';";
     // Alert channel rendering helper
     html += "const channelDefs=[{key:'lora',label:'📡 LoRa',field:'alertLora'},{key:'ntfy',label:'🔔 Ntfy',field:'alertNtfy'},{key:'discord',label:'💬 Discord',field:'alertDiscord'},{key:'webhook',label:'🌐 Webhook',field:'alertWebhook'},{key:'email',label:'📧 Email',field:'alertEmail'},{key:'mqtt',label:'📨 MQTT',field:'alertMqtt'},{key:'wol',label:'⏰ WoL',field:'alertWol',alwaysShow:true}];";;
     html += "function renderAlertChannels(vals){const c=document.getElementById('alertChannelsContainer');c.innerHTML='';let any=false;channelDefs.forEach(ch=>{if(!ch.alwaysShow&&!globalChannels[ch.key])return;any=true;const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer';const cb=document.createElement('input');cb.type='checkbox';cb.id='alert_'+ch.field;cb.checked=vals[ch.field]===true;lbl.appendChild(cb);lbl.appendChild(document.createTextNode(ch.label));c.appendChild(lbl);});document.getElementById('alertChannelsGroup').style.display=any?'':'none';updateLoraRecipientsVisibility();}";
@@ -6468,11 +6538,16 @@ void setup() {
 
     html += "function closeHistoryModal(){document.getElementById('historyModal').classList.remove('show');modalOpen=false;}";
 
-    html += "function closeBatteryGraph(){document.getElementById('batteryGraphModal').classList.remove('show');const tt=document.getElementById('batteryGraphTooltip');if(tt)tt.style.display='none';modalOpen=false;}";
+    html += "function closeBatteryGraph(){document.getElementById('batteryGraphModal').classList.remove('show');const tt=document.getElementById('batteryGraphTooltip');if(tt)tt.style.display='none';activeBatteryGraphServiceIndex=-1;activeBatteryGraphKind='';modalOpen=false;}";
     html += "function graphNumber(v){const a=Math.abs(v);return a>=1000000||a>0&&a<0.001?v.toExponential(2):Number(v.toPrecision(6)).toString();}";
+    html += "function updateBatteryGraphRangeControls(){const range=(document.getElementById('batteryGraphRange')?.value)||'all';const showCustom=range==='custom';const startWrap=document.getElementById('batteryGraphStartWrap');const endWrap=document.getElementById('batteryGraphEndWrap');if(startWrap)startWrap.style.display=showCustom?'flex':'none';if(endWrap)endWrap.style.display=showCustom?'flex':'none';}";
+    html += "function datetimeLocalToEpoch(value){if(!value)return null;const dt=new Date(value);if(!Number.isFinite(dt.getTime()))return null;return Math.floor(dt.getTime()/1000);}";
+    html += "function batteryGraphRangeQuery(){const range=(document.getElementById('batteryGraphRange')?.value)||'all';if(range==='all')return '?range=all';if(range==='custom'){const start=datetimeLocalToEpoch(document.getElementById('batteryGraphStart')?.value||'');const end=datetimeLocalToEpoch(document.getElementById('batteryGraphEnd')?.value||'');if(!Number.isFinite(start)||!Number.isFinite(end))throw new Error('Choose both a custom start and end time.');if(start>end)throw new Error('Custom start must be before the end time.');return '?range=custom&start='+encodeURIComponent(String(start))+'&end='+encodeURIComponent(String(end));}return '?range='+encodeURIComponent(range);}";
+    html += "function reloadBatteryGraphRange(){if(activeBatteryGraphKind!=='battery'||activeBatteryGraphServiceIndex<0)return;viewBatteryGraph(activeBatteryGraphServiceIndex);}";
+    html += "document.addEventListener('change',e=>{if(e.target&&e.target.id==='batteryGraphRange')updateBatteryGraphRangeControls();});";
     html += "function drawMetricGraph(samples,percentScale){const canvas=document.getElementById('batteryGraphCanvas'),tooltip=document.getElementById('batteryGraphTooltip'),box=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.max(300,box.width),h=320;canvas.width=w*dpr;canvas.height=h*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const pad={l:66,r:18,t:18,b:46},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;let minV=percentScale?0:Math.min(...samples.map(s=>s.p)),maxV=percentScale?100:Math.max(...samples.map(s=>s.p));if(!samples.length){minV=0;maxV=100;}if(maxV===minV){const margin=Math.abs(maxV)*0.05||1;minV-=margin;maxV+=margin;}ctx.font='12px sans-serif';ctx.lineWidth=1;for(let step=0;step<=5;step++){const value=minV+(maxV-minV)*step/5,y=pad.t+ph*(1-step/5);ctx.strokeStyle='#edf2f7';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.fillStyle='#718096';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(percentScale?Math.round(value)+'%':graphNumber(value),pad.l-8,y);}if(!samples.length){canvas.onmousemove=null;canvas.onmouseleave=null;if(tooltip)tooltip.style.display='none';return;}let minT=samples[0].t,maxT=samples[samples.length-1].t;if(maxT===minT)maxT=minT+1;const x=t=>pad.l+(t-minT)/(maxT-minT)*pw,y=p=>pad.t+ph*(1-(p-minV)/(maxV-minV));const points=samples.map(s=>({x:x(s.t),y:y(s.p),s:s}));ctx.strokeStyle='#667eea';ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();points.forEach((pt,i)=>{if(i)ctx.lineTo(pt.x,pt.y);else ctx.moveTo(pt.x,pt.y);});ctx.stroke();ctx.fillStyle='#667eea';points.forEach(pt=>{ctx.beginPath();ctx.arc(pt.x,pt.y,samples.length<80?2.5:1.5,0,Math.PI*2);ctx.fill();});ctx.fillStyle='#718096';ctx.textBaseline='top';ctx.textAlign='left';ctx.fillText(new Date(minT*1000).toLocaleString(),pad.l,h-pad.b+10);ctx.textAlign='right';ctx.fillText(new Date(samples[samples.length-1].t*1000).toLocaleString(),w-pad.r,h-pad.b+10);canvas.onmouseleave=()=>{if(tooltip)tooltip.style.display='none';};canvas.onmousemove=e=>{if(!tooltip)return;const rect=canvas.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;let nearest=null,best=Infinity;for(const pt of points){const dx=pt.x-mx,dy=pt.y-my,d=Math.sqrt(dx*dx+dy*dy);if(d<best){best=d;nearest=pt;}}if(!nearest||best>10){tooltip.style.display='none';return;}const valueText=percentScale?nearest.s.p+'%':graphNumber(nearest.s.p);const extra=nearest.s.mv!=null?' ('+(nearest.s.mv/1000).toFixed(2)+'V)':'';tooltip.textContent=valueText+extra+' at '+new Date(nearest.s.t*1000).toLocaleString();tooltip.style.display='block';tooltip.style.left=(e.clientX+12)+'px';tooltip.style.top=(e.clientY+12)+'px';};}";
-    html += "async function viewBatteryGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage');document.getElementById('batteryGraphTitle').textContent='Battery History - '+(svc?.name||'MeshCore Node');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],true);try{const res=await fetch('/api/mesh-battery-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),pct=Number(p[1]),mv=Number(p[2]);if(Number.isFinite(t)&&Number.isFinite(pct)&&Number.isFinite(mv)&&t>0)samples.push({t:t,p:pct,mv:mv});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No battery samples yet.';drawMetricGraph([],true);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' samples · Latest: '+last.p+'% ('+(last.mv/1000).toFixed(2)+'V) at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,true);}catch(e){msg.textContent='Failed to load battery history';drawMetricGraph([],true);}}";
-    html += "async function viewSnmpGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage');document.getElementById('batteryGraphTitle').textContent='SNMP Value History - '+(svc?.name||'SNMP Check');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],false);try{const res=await fetch('/api/snmp-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),value=Number(p[1]);if(Number.isFinite(t)&&Number.isFinite(value)&&t>0)samples.push({t:t,p:value});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No changed numeric values yet.';drawMetricGraph([],false);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' changed values · Latest: '+graphNumber(last.p)+' at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,false);}catch(e){msg.textContent='Failed to load SNMP history';drawMetricGraph([],false);}}";
+    html += "async function viewBatteryGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage'),rangeRow=document.getElementById('batteryGraphRangeRow');activeBatteryGraphServiceIndex=i;activeBatteryGraphKind='battery';if(rangeRow)rangeRow.style.display='flex';updateBatteryGraphRangeControls();document.getElementById('batteryGraphTitle').textContent='Battery History - '+(svc?.name||'MeshCore Node');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],true);try{const query=batteryGraphRangeQuery();const res=await fetch('/api/mesh-battery-history/'+i+query,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),pct=Number(p[1]),mv=Number(p[2]);if(Number.isFinite(t)&&Number.isFinite(pct)&&Number.isFinite(mv)&&t>0)samples.push({t:t,p:pct,mv:mv});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No battery samples for the selected range.';drawMetricGraph([],true);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' samples · Latest: '+last.p+'% ('+(last.mv/1000).toFixed(2)+'V) at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,true);}catch(e){msg.textContent=e&&e.message?e.message:'Failed to load battery history';drawMetricGraph([],true);}}";
+    html += "async function viewSnmpGraph(i){const svc=services[i],modal=document.getElementById('batteryGraphModal'),msg=document.getElementById('batteryGraphMessage'),rangeRow=document.getElementById('batteryGraphRangeRow');activeBatteryGraphServiceIndex=i;activeBatteryGraphKind='snmp';if(rangeRow)rangeRow.style.display='none';document.getElementById('batteryGraphTitle').textContent='SNMP Value History - '+(svc?.name||'SNMP Check');msg.textContent='Loading...';modal.classList.add('show');modalOpen=true;drawMetricGraph([],false);try{const res=await fetch('/api/snmp-history/'+i,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);const txt=await res.text(),samples=[];txt.split(/\\r?\\n/).forEach(line=>{const p=line.split(','),t=Number(p[0]),value=Number(p[1]);if(Number.isFinite(t)&&Number.isFinite(value)&&t>0)samples.push({t:t,p:value});});samples.sort((a,b)=>a.t-b.t);if(!samples.length){msg.textContent='No changed numeric values yet.';drawMetricGraph([],false);return;}const last=samples[samples.length-1];msg.textContent=samples.length+' changed values · Latest: '+graphNumber(last.p)+' at '+new Date(last.t*1000).toLocaleString();drawMetricGraph(samples,false);}catch(e){msg.textContent='Failed to load SNMP history';drawMetricGraph([],false);}}";
 
     html += "async function viewHistory(i){try{";
     html += "const svc=services[i];document.getElementById('historyTitle').textContent='History - '+(svc?.name||'Service');";
@@ -7192,6 +7267,44 @@ void setup() {
       return;
     }
 
+    String range = "all";
+    if (request->hasParam("range")) {
+      range = request->getParam("range")->value();
+      range.toLowerCase();
+    }
+
+    time_t minTs = 0;
+    time_t maxTs = 0;
+    if (range == "custom") {
+      if (!request->hasParam("start") || !request->hasParam("end")) {
+        request->send(400, "text/plain", "Custom range requires start and end");
+        return;
+      }
+      time_t parsedStart = 0;
+      time_t parsedEnd = 0;
+      if (!parseUnixEpoch(request->getParam("start")->value(), parsedStart) ||
+          !parseUnixEpoch(request->getParam("end")->value(), parsedEnd)) {
+        request->send(400, "text/plain", "Invalid custom range values");
+        return;
+      }
+      if (parsedStart > parsedEnd) {
+        request->send(400, "text/plain", "Custom range start must be <= end");
+        return;
+      }
+      minTs = parsedStart;
+      maxTs = parsedEnd;
+    } else if (range != "all" && range.length() > 0) {
+      uint32_t seconds = 0;
+      if (!batteryHistoryRangeSeconds(range, seconds)) {
+        request->send(400, "text/plain", "Unsupported range");
+        return;
+      }
+      time_t now = time(nullptr);
+      if (now > 0) {
+        minTs = now - (time_t)seconds;
+      }
+    }
+
     String path = batteryHistoryFileForServiceId(services[idx].id);
     if (!LittleFS.exists(path)) {
       AsyncWebServerResponse *resp = request->beginResponse(200, "text/csv", "");
@@ -7208,11 +7321,19 @@ void setup() {
 
     AsyncResponseStream *response = request->beginResponseStream("text/csv");
     response->addHeader("Cache-Control", "no-store");
-    uint8_t buf[512];
     while (f.available()) {
-      size_t n = f.read(buf, sizeof(buf));
-      if (n == 0) break;
-      response->write(buf, n);
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+      int comma = line.indexOf(',');
+      if (comma <= 0) continue;
+
+      time_t ts = 0;
+      if (!parseUnixEpoch(line.substring(0, comma), ts)) continue;
+      if (minTs > 0 && ts < minTs) continue;
+      if (maxTs > 0 && ts > maxTs) continue;
+
+      response->println(line);
     }
     f.close();
     request->send(response);
