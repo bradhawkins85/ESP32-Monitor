@@ -180,7 +180,8 @@ struct DirectNodeConfig {
 };
 
 // --- Service Array and Count ---
-#define MAX_SERVICES 16
+// WSL3 can only sustain up to 10 active services reliably.
+#define MAX_SERVICES 10
 Service services[MAX_SERVICES];
 int serviceCount = 0;
 
@@ -3526,6 +3527,100 @@ static bool sendLoRaStatusRequest(const uint8_t* destPubKey, uint8_t destHash, u
                              destPubKey, destHash, outPath, outPathLen, &suggestedTimeoutMs);
 }
 
+// Send MeshCore status request as a guest ANON_REQ. This is used for battery
+// polling when no automated policy changes are needed.
+static bool sendLoRaGuestStatusRequest(const uint8_t* destPubKey, uint8_t destHash, uint32_t& requestTag,
+                                       uint32_t& suggestedTimeoutMs, const uint8_t* outPath = nullptr,
+                                       uint8_t outPathLen = 0) {
+  if (!settings.loraEnabled) return false;
+
+  if (destPubKey == nullptr) {
+    Serial.println("[LoRa] ERROR: Missing destination public key for guest status request");
+    return false;
+  }
+
+  uint8_t plaintext[13];
+  requestTag = nextMeshCommandTimestamp();
+  memcpy(plaintext, &requestTag, sizeof(requestTag));
+  plaintext[4] = REQ_TYPE_GET_STATUS;
+  memset(&plaintext[5], 0, 4);
+  uint32_t nonce = esp_random();
+  memcpy(&plaintext[9], &nonce, sizeof(nonce));
+
+  uint8_t channelKey[32];
+  size_t channelKeyLen = 32;
+  if (!deriveSharedSecretWithPeer(destPubKey, channelKey)) {
+    Serial.println("[LoRa] ERROR: Failed to derive shared secret for guest status request");
+    return false;
+  }
+
+  uint8_t macAndCipher[256];
+  size_t macCipherLen =
+      encryptAndSign(channelKey, channelKeyLen, macAndCipher, sizeof(macAndCipher), plaintext, sizeof(plaintext));
+  if (macCipherLen == 0) {
+    Serial.println("[LoRa] ERROR: Failed to encrypt guest status request");
+    return false;
+  }
+
+  uint8_t packet[292];
+  size_t pktIdx = 0;
+
+  size_t outPathBytes = (outPathLen & 0x3F) * ((outPathLen >> 6) + 1);
+  bool useDirect = (outPath != nullptr && outPathBytes <= 64);
+  uint8_t routeType = useDirect ? ROUTE_TYPE_DIRECT : ROUTE_TYPE_FLOOD;
+
+  uint8_t header = (uint8_t)((routeType & 0x03) | ((PAYLOAD_TYPE_ANON_REQ & 0x0F) << 2));
+  packet[pktIdx++] = header;
+
+  if (useDirect) {
+    packet[pktIdx++] = outPathLen;
+    memcpy(&packet[pktIdx], outPath, outPathBytes);
+    pktIdx += outPathBytes;
+    Serial.printf("[LoRa] Using DIRECT routing with path_len=%d for guest status\n", outPathLen);
+  } else {
+    packet[pktIdx++] = 0;
+    Serial.println("[LoRa] Using FLOOD routing for guest status");
+  }
+
+  packet[pktIdx++] = destHash;
+  memcpy(&packet[pktIdx], ed25519_public_key, 32);
+  pktIdx += 32;
+
+  if (pktIdx + macCipherLen > sizeof(packet)) {
+    Serial.println("[LoRa] ERROR: Guest status packet buffer too small");
+    return false;
+  }
+  memcpy(packet + pktIdx, macAndCipher, macCipherLen);
+  pktIdx += macCipherLen;
+
+  uint32_t airtimeMs = 0;
+  int state = transmitLoRaPacket(packet, pktIdx, &airtimeMs);
+  uint32_t estimate = useDirect
+      ? 500UL + ((airtimeMs * 6UL + 250UL) * ((outPathLen & 0x3F) + 1UL))
+      : 500UL + airtimeMs * 16UL;
+  suggestedTimeoutMs = constrain(estimate, MESH_STATUS_MIN_ATTEMPT_TIMEOUT_MS,
+                                 MESH_STATUS_MAX_ATTEMPT_TIMEOUT_MS);
+
+  bool success = (state == RADIOLIB_ERR_NONE);
+  if (success) {
+    Serial.printf("[LoRa] Sent guest status request (len=%u)\n", (unsigned int)pktIdx);
+  } else {
+    Serial.printf("[LoRa] Failed to send guest status request, code: %d\n", state);
+  }
+
+  String peerName = "";
+  int pi = findPeerIndexByHash(destHash);
+  if (pi >= 0) peerName = peers[pi].name;
+  if (peerName.length() == 0) {
+    char hx[8];
+    snprintf(hx, sizeof(hx), "0x%02X", destHash);
+    peerName = hx;
+  }
+  appendLoraLog('S', 'D', peerName, "guest status request", success);
+
+  return success;
+}
+
 static void scheduleReciprocalPath(const uint8_t peerPubkey[32], const uint8_t* directPath,
                                    uint8_t directPathLen, const uint8_t* advertisedPath,
                                    uint8_t advertisedPathLen, uint32_t delayMs = 500UL) {
@@ -4765,6 +4860,11 @@ static bool sendMeshStatusAttempt(Service& svc, const uint8_t pubkeyBytes[32], u
     outPathLen = peers[peerIdx].outPathLen;
   }
   usedDirectPath = outPath != nullptr;
+
+  bool guestBatteryAccess = !svc.meshRepeaterControl;
+  if (guestBatteryAccess) {
+    return sendLoRaGuestStatusRequest(pubkeyBytes, pubkeyBytes[0], requestTag, timeoutMs, outPath, outPathLen);
+  }
   return sendLoRaStatusRequest(pubkeyBytes, pubkeyBytes[0], requestTag, timeoutMs, outPath, outPathLen);
 }
 
@@ -4877,7 +4977,12 @@ bool checkMeshNode(Service& svc, bool manualCheck, bool* requestSent) {
   // Determine result based on whether we've received a fresh response recently
   if (svc.meshLastResponseMs == 0) {
     // Never received a response yet
-    svc.lastError = (sent || queued) ? "Waiting for ACL-authorized response" : "LoRa send failed";
+    bool guestBatteryAccess = !svc.meshRepeaterControl;
+    if (sent || queued) {
+      svc.lastError = guestBatteryAccess ? "Waiting for guest status response" : "Waiting for ACL-authorized response";
+    } else {
+      svc.lastError = "LoRa send failed";
+    }
     return false;
   }
 
@@ -6451,7 +6556,7 @@ void setup() {
     // MeshCore Node fields (shown only for type 6)
     html += "<div class='form-group' data-types='6'><label class='form-label'>Node Public Key (64 hex chars)</label>";
     html += "<input type='text' id='serviceMeshPubkey' class='form-input' placeholder='e.g. 01ab23cd...' maxlength='64'></div>";
-    html += "<div class='form-group' data-types='6'><div class='hint'>Add this ESP Monitor public key to the repeater's Access Control list with Admin permission:<br><code>" + getOurMeshPublicKeyHex() + "</code><br>Status checks and setting changes use this identity; no PIN is required.</div></div>";
+    html += "<div class='form-group' data-types='6'><div class='hint'>Add this ESP Monitor public key to the repeater's Access Control list with Admin permission:<br><code>" + getOurMeshPublicKeyHex() + "</code><br>When Automated Battery Policy is enabled, status checks and setting changes use this identity. When disabled, battery polling uses guest access.</div></div>";
     html += "<div class='form-group' data-types='6'><label class='form-label' style='display:flex;align-items:center;gap:8px'>";
     html += "<input type='checkbox' id='serviceMeshRepeaterControl'>Enable Automated Battery Policy</label>";
     html += "<div class='hint'>On each status response, the matching range sets TX power and repeater forwarding. Uncovered percentages leave its current settings unchanged.</div></div>";
