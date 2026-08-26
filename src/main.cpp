@@ -194,14 +194,17 @@ int serviceCount = 0;
 #define MESH_STATUS_MAX_ATTEMPT_TIMEOUT_MS 60000UL
 #define MESH_STATUS_MAX_ATTEMPTS 3
 #define MESH_STATUS_TOTAL_TIMEOUT_MS ((MESH_STATUS_MAX_ATTEMPT_TIMEOUT_MS * MESH_STATUS_MAX_ATTEMPTS) + 3000UL)
+#define MESH_STATUS_LATE_RESPONSE_WINDOW_MS 240000UL
 
 struct PendingMeshNodeCheck {
   bool active;
+  bool timedOut;
   bool manual;
   uint8_t senderHash;     // First byte of target node's pubkey
   int serviceIdx;         // Index into services[]
   unsigned long startedMs;
   unsigned long sentMs;   // millis() when request was sent
+  unsigned long lateAcceptUntilMs;
   uint32_t timeoutMs;
   bool usedDirectPath;
   uint8_t attempts;
@@ -293,6 +296,7 @@ static void cancelPendingMeshAdminCommandsForService(int serviceIdx, bool servic
 static void initPendingMeshChecks() {
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     pendingMeshChecks[i].active = false;
+    pendingMeshChecks[i].timedOut = false;
   }
 }
 
@@ -300,13 +304,17 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool ma
                                      uint32_t timeoutMs, bool usedDirectPath, bool initialSent = true) {
   // Reuse an existing slot for the same hash, or find a free one
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
-    if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
+    if ((pendingMeshChecks[i].active || pendingMeshChecks[i].timedOut) &&
+        pendingMeshChecks[i].senderHash == senderHash) {
       pendingMeshChecks[i].serviceIdx = serviceIdx;
       pendingMeshChecks[i].startedMs = millis();
       pendingMeshChecks[i].sentMs = millis();
+      pendingMeshChecks[i].lateAcceptUntilMs = 0;
       pendingMeshChecks[i].timeoutMs = timeoutMs;
       pendingMeshChecks[i].usedDirectPath = usedDirectPath;
       pendingMeshChecks[i].manual = pendingMeshChecks[i].manual || manual;
+      pendingMeshChecks[i].active = true;
+      pendingMeshChecks[i].timedOut = false;
       pendingMeshChecks[i].attempts = initialSent ? 1 : 0;
       memset(pendingMeshChecks[i].requestTags, 0, sizeof(pendingMeshChecks[i].requestTags));
       if (initialSent) pendingMeshChecks[i].requestTags[0] = requestTag;
@@ -316,10 +324,12 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool ma
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     if (!pendingMeshChecks[i].active) {
       pendingMeshChecks[i].active = true;
+      pendingMeshChecks[i].timedOut = false;
       pendingMeshChecks[i].senderHash = senderHash;
       pendingMeshChecks[i].serviceIdx = serviceIdx;
       pendingMeshChecks[i].startedMs = millis();
       pendingMeshChecks[i].sentMs = millis();
+      pendingMeshChecks[i].lateAcceptUntilMs = 0;
       pendingMeshChecks[i].timeoutMs = timeoutMs;
       pendingMeshChecks[i].usedDirectPath = usedDirectPath;
       pendingMeshChecks[i].manual = manual;
@@ -339,10 +349,12 @@ static void registerPendingMeshCheck(uint8_t senderHash, int serviceIdx, bool ma
     }
   }
   pendingMeshChecks[oldestIdx].active = true;
+  pendingMeshChecks[oldestIdx].timedOut = false;
   pendingMeshChecks[oldestIdx].senderHash = senderHash;
   pendingMeshChecks[oldestIdx].serviceIdx = serviceIdx;
   pendingMeshChecks[oldestIdx].startedMs = millis();
   pendingMeshChecks[oldestIdx].sentMs = millis();
+  pendingMeshChecks[oldestIdx].lateAcceptUntilMs = 0;
   pendingMeshChecks[oldestIdx].timeoutMs = timeoutMs;
   pendingMeshChecks[oldestIdx].usedDirectPath = usedDirectPath;
   pendingMeshChecks[oldestIdx].manual = manual;
@@ -361,9 +373,10 @@ static bool hasPendingMeshCheckForService(int serviceIdx, bool manualOnly = fals
 
 static void cancelPendingMeshChecksForService(int serviceIdx, bool serviceRemoved = false) {
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
-    if (!pendingMeshChecks[i].active) continue;
+    if (!pendingMeshChecks[i].active && !pendingMeshChecks[i].timedOut) continue;
     if (pendingMeshChecks[i].serviceIdx == serviceIdx) {
       pendingMeshChecks[i].active = false;
+      pendingMeshChecks[i].timedOut = false;
     } else if (serviceRemoved && pendingMeshChecks[i].serviceIdx > serviceIdx) {
       pendingMeshChecks[i].serviceIdx--;
     }
@@ -376,8 +389,15 @@ static int consumePendingMeshCheck(uint8_t senderHash, const uint8_t* response, 
   if (response == nullptr || responseLen < sizeof(uint32_t)) return -1;
   uint32_t responseTag;
   memcpy(&responseTag, response, sizeof(responseTag));
+  unsigned long nowMs = millis();
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
-    if (pendingMeshChecks[i].active && pendingMeshChecks[i].senderHash == senderHash) {
+    if (!pendingMeshChecks[i].active && !pendingMeshChecks[i].timedOut) continue;
+    if (pendingMeshChecks[i].senderHash != senderHash) continue;
+    if (pendingMeshChecks[i].timedOut &&
+        (long)(nowMs - pendingMeshChecks[i].lateAcceptUntilMs) > 0) {
+      pendingMeshChecks[i].timedOut = false;
+      continue;
+    }
       bool tagMatched = false;
       for (uint8_t attempt = 0; attempt < pendingMeshChecks[i].attempts; attempt++) {
         if (pendingMeshChecks[i].requestTags[attempt] == responseTag) {
@@ -389,8 +409,9 @@ static int consumePendingMeshCheck(uint8_t senderHash, const uint8_t* response, 
       int idx = pendingMeshChecks[i].serviceIdx;
       if (wasManual != nullptr) *wasManual = pendingMeshChecks[i].manual;
       pendingMeshChecks[i].active = false;
+      pendingMeshChecks[i].timedOut = false;
+      pendingMeshChecks[i].lateAcceptUntilMs = 0;
       return idx;
-    }
   }
   return -1;
 }
@@ -4873,9 +4894,15 @@ static void processPendingMeshChecks() {
   unsigned long nowMs = millis();
   for (int i = 0; i < MAX_PENDING_MESH_CHECKS; i++) {
     PendingMeshNodeCheck& pending = pendingMeshChecks[i];
+    if (pending.timedOut && (long)(nowMs - pending.lateAcceptUntilMs) > 0) {
+      pending.timedOut = false;
+      pending.manual = false;
+      pending.lateAcceptUntilMs = 0;
+    }
     if (!pending.active || (unsigned long)(nowMs - pending.sentMs) < pending.timeoutMs) continue;
     if (pending.serviceIdx < 0 || pending.serviceIdx >= serviceCount) {
       pending.active = false;
+      pending.timedOut = false;
       continue;
     }
 
@@ -4883,10 +4910,13 @@ static void processPendingMeshChecks() {
     if (pending.attempts >= MESH_STATUS_MAX_ATTEMPTS ||
         (unsigned long)(nowMs - pending.startedMs) >= MESH_STATUS_TOTAL_TIMEOUT_MS) {
       pending.active = false;
+      pending.timedOut = true;
+      pending.manual = false;
+      pending.lateAcceptUntilMs = nowMs + MESH_STATUS_LATE_RESPONSE_WINDOW_MS;
       svc.lastError = "MeshCore response timeout after " + String(pending.attempts) + " attempts";
       updateServiceStatus(svc, false);
-      Serial.printf("[MeshNode] Status request timed out for '%s' after %u attempts\n",
-                    svc.name.c_str(), pending.attempts);
+      Serial.printf("[MeshNode] Status request timed out for '%s' after %u attempts; accepting late replies for %lus\n",
+                    svc.name.c_str(), pending.attempts, (unsigned long)(MESH_STATUS_LATE_RESPONSE_WINDOW_MS / 1000UL));
       continue;
     }
 
